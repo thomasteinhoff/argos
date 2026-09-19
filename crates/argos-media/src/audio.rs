@@ -198,6 +198,7 @@ impl OpusAudioDecoder {
 pub struct AudioPlayback {
     tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -205,18 +206,21 @@ impl AudioPlayback {
     pub fn start(volume: f32) -> Result<Self, String> {
         let (tx, rx) = sync_channel::<Vec<f32>>(32);
         let stop = Arc::new(AtomicBool::new(false));
+        let muted = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let thread_muted = muted.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         let join = thread::Builder::new()
             .name("argos-audio-playback".to_string())
-            .spawn(move || playback_loop(rx, thread_stop, ready_tx, volume))
+            .spawn(move || playback_loop(rx, thread_stop, thread_muted, ready_tx, volume))
             .map_err(|error| error.to_string())?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 tx,
                 stop,
+                muted,
                 join: Some(join),
             }),
             Ok(Err(error)) => Err(error),
@@ -226,6 +230,14 @@ impl AudioPlayback {
 
     pub fn push(&self, frame: Vec<f32>) {
         let _ = self.tx.try_send(frame);
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
     }
 }
 
@@ -241,6 +253,7 @@ impl Drop for AudioPlayback {
 fn playback_loop(
     rx: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     volume: f32,
 ) {
@@ -248,7 +261,7 @@ fn playback_loop(
         let _ = ready.send(Err(format!("COM init failed: {error}")));
         return;
     }
-    if let Err(error) = run_playback(&rx, &stop, volume, &ready) {
+    if let Err(error) = run_playback(&rx, &stop, &muted, volume, &ready) {
         let _ = ready.send(Err(error));
     }
 }
@@ -256,6 +269,7 @@ fn playback_loop(
 fn run_playback(
     rx: &Receiver<Vec<f32>>,
     stop: &AtomicBool,
+    muted: &AtomicBool,
     volume: f32,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -307,8 +321,13 @@ fn run_playback(
         while queue.len() < needed {
             match rx.try_recv() {
                 Ok(frame) => {
+                    let gain = if muted.load(Ordering::Relaxed) {
+                        0.0
+                    } else {
+                        volume
+                    };
                     for sample in frame {
-                        queue.extend((sample * volume).to_le_bytes());
+                        queue.extend((sample * gain).to_le_bytes());
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {

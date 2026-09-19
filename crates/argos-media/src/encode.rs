@@ -10,10 +10,19 @@ pub struct H264Encoder {
 
 impl H264Encoder {
     pub fn new() -> Result<Self, String> {
+        Self::new_at(30.0)
+    }
+
+    pub fn new_at(fps: f32) -> Result<Self, String> {
+        let (fps, bitrate) = if fps >= 45.0 {
+            (60.0, 60_000_000)
+        } else {
+            (30.0, 30_000_000)
+        };
         let config = EncoderConfig::new()
             .usage_type(UsageType::CameraVideoRealTime)
-            .bitrate(BitRate::from_bps(8_000_000))
-            .max_frame_rate(FrameRate::from_hz(30.0))
+            .bitrate(BitRate::from_bps(bitrate))
+            .max_frame_rate(FrameRate::from_hz(fps))
             .complexity(Complexity::Low)
             .skip_frames(false)
             .scene_change_detect(false)

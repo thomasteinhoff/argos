@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use xcap::Monitor;
 
-const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
+const DEFAULT_CAPTURE_INTERVAL_MICROS: u64 = 33_000;
 
 #[derive(Clone)]
 pub struct MonitorInfo {
@@ -26,6 +26,7 @@ pub struct CaptureSession {
     rx: Receiver<Frame>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    interval: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -36,12 +37,18 @@ impl CaptureSession {
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            interval: Arc::new(AtomicU64::new(DEFAULT_CAPTURE_INTERVAL_MICROS)),
             join: None,
         }
     }
 
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
+    }
+
+    pub fn set_interval(&self, interval: Duration) {
+        self.interval
+            .store(interval.as_micros().max(1) as u64, Ordering::Relaxed);
     }
 
     pub fn start(&mut self, source: &MonitorInfo) -> Result<(), String> {
@@ -52,6 +59,7 @@ impl CaptureSession {
         let (tx, rx) = sync_channel::<Frame>(1);
         let stop = self.stop.clone();
         let active = self.active.clone();
+        let interval = self.interval.clone();
         self.join = Some(thread::spawn(move || {
             let Ok(monitors) = Monitor::all() else {
                 return;
@@ -66,7 +74,7 @@ impl CaptureSession {
                 return;
             };
             let _ = recorder.start();
-            pump(recorder, frames, tx, stop, active);
+            pump(recorder, frames, tx, stop, active, interval);
         }));
         self.rx = rx;
         Ok(())
@@ -87,22 +95,24 @@ fn pump(
     tx: SyncSender<Frame>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    interval: Arc<AtomicU64>,
 ) {
-    let mut last = Instant::now() - CAPTURE_INTERVAL;
+    let mut last = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
         if !active.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(20));
             last = Instant::now();
             continue;
         }
+        let target = Duration::from_micros(interval.load(Ordering::Relaxed).max(1));
         let elapsed = last.elapsed();
-        if elapsed < CAPTURE_INTERVAL {
-            thread::sleep(CAPTURE_INTERVAL - elapsed);
+        if elapsed < target {
+            thread::sleep(target - elapsed);
         }
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match frames.recv_timeout(CAPTURE_INTERVAL) {
+        match frames.recv_timeout(target) {
             Ok(frame) => {
                 last = Instant::now();
                 let outgoing = Frame {

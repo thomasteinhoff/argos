@@ -26,29 +26,11 @@ impl<'a> Iterator for AnnexBIter<'a> {
         if self.pos >= self.data.len() {
             return None;
         }
-        let mut start = self.pos;
-        while start + 3 <= self.data.len() {
-            if self.data[start] == 0 && self.data[start + 1] == 0 && self.data[start + 2] == 1 {
-                break;
-            }
-            start += 1;
-        }
-        if start + 3 > self.data.len() {
-            self.pos = self.data.len();
-            return None;
-        }
-        let code_len = if start + 4 <= self.data.len() && self.data[start + 3] == 0 {
-            4
-        } else {
-            3
-        };
-        let body_start = start + code_len;
-        let mut end = body_start;
-        while end + 3 <= self.data.len() {
-            if self.data[end] == 0 && self.data[end + 1] == 0 && self.data[end + 2] == 1 {
-                break;
-            }
-            end += 1;
+        let code = next_start_code(self.data, self.pos)?;
+        let body_start = code.end;
+        let mut end = self.data.len();
+        if let Some(next) = next_start_code(self.data, body_start) {
+            end = next.start;
         }
         self.pos = end;
         let nalu = &self.data[body_start..end];
@@ -58,6 +40,28 @@ impl<'a> Iterator for AnnexBIter<'a> {
             Some(nalu)
         }
     }
+}
+
+struct StartCode {
+    start: usize,
+    end: usize,
+}
+
+fn next_start_code(data: &[u8], mut pos: usize) -> Option<StartCode> {
+    if pos > 0 {
+        pos -= 1;
+    }
+    while pos + 3 <= data.len() {
+        if data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1 {
+            let four_byte = pos > 0 && data[pos - 1] == 0;
+            return Some(StartCode {
+                start: if four_byte { pos - 1 } else { pos },
+                end: if four_byte { pos + 3 } else { pos + 3 },
+            });
+        }
+        pos += 1;
+    }
+    None
 }
 
 pub struct Packetizer {
@@ -128,4 +132,91 @@ impl Packetizer {
         self.sequence_number = self.sequence_number.wrapping_add(1);
         header
     }
+}
+
+#[derive(Default)]
+pub struct Depacketizer {
+    frame: Vec<Vec<u8>>,
+    fragment: Vec<u8>,
+    fragment_type: u8,
+    ts: Option<u32>,
+    sequence: Option<u16>,
+}
+
+impl Depacketizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, packet: &Packet) -> Option<Vec<Vec<u8>>> {
+        let ts = packet.header.timestamp;
+        let seq = packet.header.sequence_number;
+        if self.ts != Some(ts) {
+            self.frame.clear();
+            self.fragment.clear();
+            self.ts = Some(ts);
+            self.sequence = None;
+        } else if let Some(previous) = self.sequence {
+            if previous.wrapping_add(1) != seq {
+                self.frame.clear();
+                self.fragment.clear();
+            }
+        }
+        self.sequence = Some(seq);
+
+        match packet.payload.first().map(|byte| byte & 0x1f) {
+            Some(28) => self.push_fragment(packet),
+            Some(_) => self.frame.push(packet.payload.to_vec()),
+            None => {}
+        }
+
+        if packet.header.marker && !self.frame.is_empty() {
+            self.ts = None;
+            self.sequence = None;
+            Some(std::mem::take(&mut self.frame))
+        } else {
+            None
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.frame.clear();
+        self.fragment.clear();
+        self.ts = None;
+        self.sequence = None;
+    }
+
+    fn push_fragment(&mut self, packet: &Packet) {
+        let Some(&fu_indicator) = packet.payload.first() else {
+            return;
+        };
+        let Some(&fu_header) = packet.payload.get(1) else {
+            return;
+        };
+        let start = fu_header & 0x80 != 0;
+        let end = fu_header & 0x40 != 0;
+        if start {
+            self.fragment.clear();
+            self.fragment_type = fu_header & 0x1f;
+        }
+        if packet.payload.len() > 2 {
+            self.fragment.extend_from_slice(&packet.payload[2..]);
+        }
+        if end && !self.fragment.is_empty() {
+            let mut nalu = Vec::with_capacity(self.fragment.len() + 1);
+            nalu.push((fu_indicator & 0xe0) | self.fragment_type);
+            nalu.extend_from_slice(&self.fragment);
+            self.fragment.clear();
+            self.frame.push(nalu);
+        }
+    }
+}
+
+pub fn access_unit_to_annexb(nalus: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for nalu in nalus {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nalu);
+    }
+    out
 }

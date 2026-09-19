@@ -17,7 +17,10 @@ impl H264Encoder {
         }
         let source = RgbaSliceU8::new(rgba, (width as usize, height as usize));
         let yuv = YUVBuffer::from_rgba8_source(source);
-        let bitstream = self.encoder.encode(&yuv).map_err(|error| error.to_string())?;
+        let bitstream = self
+            .encoder
+            .encode(&yuv)
+            .map_err(|error| error.to_string())?;
         Ok(bitstream.to_vec())
     }
 

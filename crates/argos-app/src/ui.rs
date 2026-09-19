@@ -29,6 +29,34 @@ struct ShareSession {
     error: Option<String>,
     encoder: H264Encoder,
     frame_timestamp: u32,
+    frames_sent: u64,
+    encode_errors: u64,
+}
+
+struct ViewStats {
+    packets: u64,
+    aus: u64,
+    decoded: u64,
+    decode_errors: u64,
+    decode_none: u64,
+    first_width: u32,
+    first_height: u32,
+    first_error: Option<String>,
+}
+
+impl Default for ViewStats {
+    fn default() -> Self {
+        Self {
+            packets: 0,
+            aus: 0,
+            decoded: 0,
+            decode_errors: 0,
+            decode_none: 0,
+            first_width: 0,
+            first_height: 0,
+            first_error: None,
+        }
+    }
 }
 
 struct ViewSession {
@@ -36,6 +64,7 @@ struct ViewSession {
     answer_code: Option<String>,
     error: Option<String>,
     latest: Arc<Mutex<Option<DecodedFrame>>>,
+    stats: Arc<Mutex<ViewStats>>,
     texture: Option<Preview>,
 }
 
@@ -49,6 +78,7 @@ pub struct ArgosApp {
     selected_monitor: usize,
     capture: Option<CaptureSession>,
     preview: Option<Preview>,
+    preview_active: bool,
     fps_frames: u64,
     fps_last: Instant,
     fps: f32,
@@ -69,6 +99,7 @@ impl ArgosApp {
             selected_monitor: 0,
             capture: None,
             preview: None,
+            preview_active: false,
             fps_frames: 0,
             fps_last: Instant::now(),
             fps: 0.0,
@@ -191,16 +222,18 @@ impl ArgosApp {
 
     fn toggle_preview(&mut self) {
         self.preview_error = None;
-        if self.capture.is_some() {
-            self.capture = None;
+        if self.preview_active {
+            self.preview_active = false;
             self.preview = None;
-            self.fps = 0.0;
-            self.fps_frames = 0;
             return;
         }
-        if let Err(error) = self.start_capture() {
-            self.preview_error = Some(error);
+        if self.capture.is_none() {
+            if let Err(error) = self.start_capture() {
+                self.preview_error = Some(error);
+                return;
+            }
         }
+        self.preview_active = true;
     }
 
     fn code_widget(ui: &mut egui::Ui, code: &str, rows: usize) {
@@ -250,6 +283,8 @@ impl ArgosApp {
             error: None,
             encoder,
             frame_timestamp: 0,
+            frames_sent: 0,
+            encode_errors: 0,
         });
     }
 
@@ -280,8 +315,11 @@ impl ArgosApp {
             return;
         }
         let latest = Arc::new(Mutex::new(None));
-        let callback: Arc<dyn Fn(&Packet) + Send + Sync> =
-            Arc::new(Self::receive_callback(Arc::clone(&latest)));
+        let stats = Arc::new(Mutex::new(ViewStats::default()));
+        let callback: Arc<dyn Fn(&Packet) + Send + Sync> = Arc::new(Self::receive_callback(
+            Arc::clone(&latest),
+            Arc::clone(&stats),
+        ));
         let udp = vec!["0.0.0.0:0".to_string()];
         let viewer = match session::block_on(session::Viewer::new(udp, callback)) {
             Ok(viewer) => Arc::new(viewer),
@@ -302,6 +340,7 @@ impl ArgosApp {
             answer_code,
             error: None,
             latest,
+            stats,
             texture: None,
         });
     }
@@ -315,6 +354,7 @@ impl ArgosApp {
 
     fn receive_callback(
         latest: Arc<Mutex<Option<DecodedFrame>>>,
+        stats: Arc<Mutex<ViewStats>>,
     ) -> impl Fn(&Packet) + Send + Sync {
         struct Pipeline {
             depacketizer: h264::Depacketizer,
@@ -325,19 +365,53 @@ impl ArgosApp {
             decoder: H264Decoder::new().ok(),
         }));
         move |packet: &Packet| {
+            {
+                let Ok(mut stats) = stats.lock() else {
+                    return;
+                };
+                stats.packets += 1;
+            }
             let Ok(mut pipeline) = pipeline.lock() else {
                 return;
             };
             let Some(nalus) = pipeline.depacketizer.push(packet) else {
                 return;
             };
+            {
+                let Ok(mut stats) = stats.lock() else {
+                    return;
+                };
+                stats.aus += 1;
+            }
             let Some(decoder) = pipeline.decoder.as_mut() else {
                 return;
             };
             let access_unit = h264::access_unit_to_annexb(&nalus);
-            if let Ok(Some(frame)) = decoder.decode(&access_unit) {
-                if let Ok(mut slot) = latest.lock() {
-                    *slot = Some(frame);
+            match decoder.decode(&access_unit) {
+                Ok(Some(frame)) => {
+                    if let Ok(mut stats) = stats.lock() {
+                        if stats.first_width == 0 {
+                            stats.first_width = frame.width;
+                            stats.first_height = frame.height;
+                        }
+                        stats.decoded += 1;
+                    }
+                    if let Ok(mut slot) = latest.lock() {
+                        *slot = Some(frame);
+                    }
+                }
+                Ok(None) => {
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.decode_none += 1;
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut stats) = stats.lock() {
+                        if stats.first_error.is_none() {
+                            stats.first_error = Some(error);
+                        }
+                        stats.decode_errors += 1;
+                    }
                 }
             }
         }
@@ -347,34 +421,40 @@ impl ArgosApp {
         let Some(frame) = self.capture.as_ref().and_then(CaptureSession::latest) else {
             return;
         };
-        self.fps_frames += 1;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.fps_last);
-        if elapsed >= Duration::from_secs(1) {
-            self.fps = self.fps_frames as f32 / elapsed.as_secs_f32();
-            self.fps_frames = 0;
-            self.fps_last = now;
-        }
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            &frame.rgba,
-        );
-        match self.preview.as_mut() {
-            Some(preview) if preview.width == frame.width && preview.height == frame.height => {
-                preview.texture.set(image, egui::TextureOptions::LINEAR);
+        let want_image = self.preview_active || self.share.is_some();
+        if self.preview_active {
+            self.fps_frames += 1;
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.fps_last);
+            if elapsed >= Duration::from_secs(1) {
+                self.fps = self.fps_frames as f32 / elapsed.as_secs_f32();
+                self.fps_frames = 0;
+                self.fps_last = now;
             }
-            _ => {
-                self.preview = Some(Preview {
-                    texture: ctx.load_texture("preview", image, egui::TextureOptions::LINEAR),
-                    width: frame.width,
-                    height: frame.height,
-                });
+        }
+        if want_image {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            match self.preview.as_mut() {
+                Some(preview) if preview.width == frame.width && preview.height == frame.height => {
+                    preview.texture.set(image, egui::TextureOptions::LINEAR);
+                }
+                _ => {
+                    self.preview = Some(Preview {
+                        texture: ctx.load_texture("preview", image, egui::TextureOptions::LINEAR),
+                        width: frame.width,
+                        height: frame.height,
+                    });
+                }
             }
         }
         if let Some(share) = self.share.as_mut() {
             if share.sharer.is_connected() {
                 match share.encoder.encode(&frame.rgba, frame.width, frame.height) {
                     Ok(bitstream) => {
+                        share.frames_sent += 1;
                         let timestamp = share.frame_timestamp;
                         share.frame_timestamp = timestamp.wrapping_add(3000);
                         let sharer = Arc::clone(&share.sharer);
@@ -384,7 +464,10 @@ impl ArgosApp {
                             share.error = Some(error);
                         }
                     }
-                    Err(error) => share.error = Some(error),
+                    Err(error) => {
+                        share.encode_errors += 1;
+                        share.error = Some(error);
+                    }
                 }
             }
         }
@@ -416,12 +499,21 @@ impl ArgosApp {
     }
 
     fn render_image(ui: &mut egui::Ui, preview: &Preview) {
-        let available = ui.available_size();
-        if available.x <= 0.0 || available.y <= 0.0 {
+        let target = egui::vec2(preview.width as f32, preview.height as f32);
+        if target.x <= 0.0 || target.y <= 0.0 {
             return;
         }
-        let scale = (available.x / preview.width as f32).min(available.y / preview.height as f32);
-        let size = egui::vec2(preview.width as f32 * scale, preview.height as f32 * scale);
+        let max = egui::vec2(1024.0, 576.0);
+        let cap = (max.x / target.x).min(max.y / target.y).min(1.0);
+        let mut scale = cap;
+        let available = ui.available_size();
+        if available.x > 1.0 && available.y > 1.0 {
+            scale = scale
+                .min(available.x / target.x)
+                .min(available.y / target.y);
+        }
+        scale = scale.max((360.0 / target.y).min(1.0).min(cap));
+        let size = egui::vec2(target.x * scale, target.y * scale);
         ui.image((preview.texture.id(), size));
     }
 
@@ -458,7 +550,7 @@ impl ArgosApp {
             });
 
         ui.add_space(10.0);
-        let preview_label = if self.capture.is_some() {
+        let preview_label = if self.preview_active {
             "Stop preview"
         } else {
             "Preview"
@@ -470,7 +562,7 @@ impl ArgosApp {
             ui.label(RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)));
         }
 
-        if self.capture.is_some() {
+        if self.preview_active && self.capture.is_some() {
             if let Some(preview) = &self.preview {
                 ui.label(format!(
                     "Preview {}x{} @ {:.0} fps",
@@ -488,6 +580,10 @@ impl ArgosApp {
         if let Some(share) = self.share.as_mut() {
             ui.label("Audio: will be added in a later milestone");
             ui.label(format!("Status: {}", share.sharer.status()));
+            ui.label(format!(
+                "Diagnostics: {} frames encoded & sent, {} encode errors",
+                share.frames_sent, share.encode_errors
+            ));
             if let Some(code) = &share.offer_code {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Connection code").strong());
@@ -531,6 +627,27 @@ impl ArgosApp {
         if let Some(view) = self.view.as_mut() {
             ui.heading("Watching");
             ui.label(format!("Status: {}", view.viewer.status()));
+            {
+                let stats = view.stats.lock().ok();
+                if let Some(stats) = stats {
+                    ui.label(format!(
+                        "Diagnostics: {} packets, {} frames assembled, {} decoded (first {}x{}), {} no-picture, {} decode errors",
+                        stats.packets,
+                        stats.aus,
+                        stats.decoded,
+                        stats.first_width,
+                        stats.first_height,
+                        stats.decode_none,
+                        stats.decode_errors
+                    ));
+                    if let Some(first_error) = &stats.first_error {
+                        ui.label(
+                            RichText::new(format!("First decode error: {first_error}"))
+                                .color(Color32::from_rgb(220, 120, 120)),
+                        );
+                    }
+                }
+            }
             if let Some(code) = &view.answer_code {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Your reply code").strong());
@@ -544,6 +661,13 @@ impl ArgosApp {
             if let Some(preview) = &view.texture {
                 ui.label(format!("Stream {}x{}", preview.width, preview.height));
                 Self::render_image(ui, preview);
+            } else if view.stats.lock().map(|s| s.packets).unwrap_or(0) > 0 {
+                ui.label(
+                    RichText::new("Receiving stream data but no decoded picture yet…")
+                        .color(Color32::from_rgb(220, 200, 120)),
+                );
+            } else {
+                ui.label(RichText::new("Waiting for stream data…").color(Color32::GRAY));
             }
             ui.add_space(8.0);
             if ui.button("Stop watching").clicked() {
@@ -581,9 +705,13 @@ impl ArgosApp {
     }
 
     fn content(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| match self.mode {
-            Mode::Share => self.share_panel(ui),
-            Mode::View => self.view_panel(ui),
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.mode {
+                    Mode::Share => self.share_panel(ui),
+                    Mode::View => self.view_panel(ui),
+                });
         });
     }
 

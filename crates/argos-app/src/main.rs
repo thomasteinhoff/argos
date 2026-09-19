@@ -1,4 +1,5 @@
 mod config;
+mod radmin;
 mod ui;
 
 use eframe::egui;

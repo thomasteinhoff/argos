@@ -52,7 +52,7 @@ pub struct Lan {
     events: Receiver<LanEvent>,
     name: Arc<Mutex<String>>,
     sharing: Arc<AtomicBool>,
-    local: Option<Ipv4Addr>,
+    local: Arc<Mutex<Option<Ipv4Addr>>>,
     stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
 }
@@ -66,6 +66,7 @@ impl Lan {
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let name = Arc::new(Mutex::new(name));
         let sharing = Arc::new(AtomicBool::new(false));
+        let local = Arc::new(Mutex::new(find_vpn_address()));
         let stop = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = channel();
 
@@ -75,6 +76,7 @@ impl Lan {
         let discovery_peers = Arc::clone(&peers);
         let discovery_name = Arc::clone(&name);
         let discovery_sharing = Arc::clone(&sharing);
+        let discovery_local = Arc::clone(&local);
         let discovery_stop = Arc::clone(&stop);
         let discovery_id = id.clone();
         joins.push(
@@ -86,6 +88,7 @@ impl Lan {
                         discovery_peers,
                         discovery_name,
                         discovery_sharing,
+                        discovery_local,
                         discovery_stop,
                         discovery_id,
                         signal_port,
@@ -112,7 +115,7 @@ impl Lan {
             events,
             name,
             sharing,
-            local: find_vpn_address(),
+            local,
             stop,
             joins,
         })
@@ -123,7 +126,7 @@ impl Lan {
     }
 
     pub fn local_address(&self) -> Option<Ipv4Addr> {
-        self.local
+        self.local.lock().ok().and_then(|local| *local)
     }
 
     pub fn set_name(&self, name: String) {
@@ -282,6 +285,7 @@ fn discovery_loop(
     peers: Arc<Mutex<HashMap<String, LanPeer>>>,
     name: Arc<Mutex<String>>,
     sharing: Arc<AtomicBool>,
+    local: Arc<Mutex<Option<Ipv4Addr>>>,
     stop: Arc<AtomicBool>,
     id: String,
     signal_port: u16,
@@ -292,6 +296,10 @@ fn discovery_loop(
 
     while !stop.load(Ordering::Relaxed) {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
+            let detected = find_vpn_address();
+            if let Ok(mut current) = local.lock() {
+                *current = detected;
+            }
             let current_name = name.lock().map(|n| n.clone()).unwrap_or_default();
             let message = Message {
                 kind: "hello".to_string(),

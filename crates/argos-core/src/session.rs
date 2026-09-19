@@ -85,9 +85,13 @@ impl PeerConnectionEventHandler for SessionHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        if state == RTCPeerConnectionState::Connected {
-            if let Ok(mut current) = self.state.lock() {
-                current.connected = true;
+        if let Ok(mut current) = self.state.lock() {
+            match state {
+                RTCPeerConnectionState::Connected => current.connected = true,
+                RTCPeerConnectionState::Disconnected
+                | RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Closed => current.connected = false,
+                _ => {}
             }
         }
     }

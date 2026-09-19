@@ -44,6 +44,7 @@ struct ShareSession {
 
 struct ViewStats {
     packets: u64,
+    bytes: u64,
     aus: u64,
     decoded: u64,
     decode_errors: u64,
@@ -55,12 +56,16 @@ struct ViewStats {
     audio_decoded: u64,
     audio_errors: u64,
     audio_error: Option<String>,
+    base_seq: Option<u16>,
+    highest_seq: Option<u16>,
+    lost: u64,
 }
 
 impl Default for ViewStats {
     fn default() -> Self {
         Self {
             packets: 0,
+            bytes: 0,
             aus: 0,
             decoded: 0,
             decode_errors: 0,
@@ -72,8 +77,42 @@ impl Default for ViewStats {
             audio_decoded: 0,
             audio_errors: 0,
             audio_error: None,
+            base_seq: None,
+            highest_seq: None,
+            lost: 0,
         }
     }
+}
+
+struct Quality {
+    last: Instant,
+    last_decoded: u64,
+    last_bytes: u64,
+    last_lost: u64,
+    last_received: u64,
+    fps: f32,
+    mbps: f32,
+    loss: f32,
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self {
+            last: Instant::now(),
+            last_decoded: 0,
+            last_bytes: 0,
+            last_lost: 0,
+            last_received: 0,
+            fps: 0.0,
+            mbps: 0.0,
+            loss: 0.0,
+        }
+    }
+}
+
+struct Reconnect {
+    attempts: u32,
+    last_request: Instant,
 }
 
 struct ViewSession {
@@ -85,6 +124,10 @@ struct ViewSession {
     texture: Option<Preview>,
     audio_playback: Option<Arc<AudioPlayback>>,
     audio_error: Option<String>,
+    quality: Quality,
+    was_connected: bool,
+    reconnect: Option<Reconnect>,
+    lan_peer: Option<String>,
 }
 
 pub struct ArgosApp {
@@ -110,6 +153,8 @@ pub struct ArgosApp {
     lan_error: Option<String>,
     pending_request: Option<(String, String)>,
     pending_view: Option<String>,
+    radmin_exe: Option<std::path::PathBuf>,
+    radmin_error: Option<String>,
 }
 
 impl ArgosApp {
@@ -139,6 +184,8 @@ impl ArgosApp {
             lan_error,
             pending_request: None,
             pending_view: None,
+            radmin_exe: crate::radmin::find_exe(),
+            radmin_error: None,
             config,
             mode: Mode::View,
             show_settings: false,
@@ -379,6 +426,9 @@ impl ArgosApp {
             self.view_error = Some("paste a connection code from the sharer first".to_string());
             return;
         }
+        if let Some(existing) = self.view.take() {
+            let _ = session::block_on(existing.viewer.close());
+        }
         let latest = Arc::new(Mutex::new(None));
         let stats = Arc::new(Mutex::new(ViewStats::default()));
         let (audio_playback, audio_error) = match AudioPlayback::start(1.0) {
@@ -423,6 +473,10 @@ impl ArgosApp {
             texture: None,
             audio_playback,
             audio_error,
+            quality: Quality::default(),
+            was_connected: false,
+            reconnect: None,
+            lan_peer,
         });
     }
 
@@ -450,12 +504,19 @@ impl ArgosApp {
                         .as_ref()
                         .map(|share| share.sharer.is_connected())
                         .unwrap_or(false);
-                    if !busy && self.pending_request.is_none() {
+                    let reconnecting = self
+                        .share
+                        .as_ref()
+                        .and_then(|share| share.lan_peer.as_deref())
+                        == Some(id.as_str());
+                    if reconnecting && !busy {
+                        self.start_share(Some(id));
+                    } else if !busy && self.pending_request.is_none() {
                         self.pending_request = Some((id, name));
                     }
                 }
                 lan::LanEvent::Offer { id, sdp } => {
-                    if self.pending_view.as_deref() == Some(id.as_str()) && self.view.is_none() {
+                    if self.pending_view.as_deref() == Some(id.as_str()) {
                         self.pending_view = None;
                         self.start_view(sdp, Some(id));
                     }
@@ -557,6 +618,25 @@ impl ArgosApp {
                     }
                 }
                 return;
+            }
+            {
+                let Ok(mut stats) = stats.lock() else {
+                    return;
+                };
+                stats.bytes += packet.payload.len() as u64;
+                let seq = packet.header.sequence_number;
+                match stats.highest_seq {
+                    None => {
+                        stats.base_seq = Some(seq);
+                        stats.highest_seq = Some(seq);
+                    }
+                    Some(highest) => {
+                        if seq != highest && seq.wrapping_sub(highest) < 0x8000 {
+                            stats.lost += seq.wrapping_sub(highest) as u64 - 1;
+                            stats.highest_seq = Some(seq);
+                        }
+                    }
+                }
             }
             let Ok(mut pipeline) = pipeline.lock() else {
                 return;
@@ -700,6 +780,39 @@ impl ArgosApp {
         let Some(view) = self.view.as_mut() else {
             return;
         };
+        let snapshot = view
+            .stats
+            .lock()
+            .ok()
+            .map(|s| (s.packets, s.decoded, s.bytes, s.lost, s.audio_packets));
+        if view.viewer.is_connected() {
+            view.was_connected = true;
+            view.reconnect = None;
+        }
+        if let Some((packets, decoded, bytes, lost, audio_packets)) = snapshot {
+            let now = Instant::now();
+            let elapsed = now.duration_since(view.quality.last).as_secs_f32();
+            if elapsed >= 0.5 {
+                let received = packets.saturating_sub(audio_packets);
+                let d_frames = decoded.saturating_sub(view.quality.last_decoded);
+                let d_bytes = bytes.saturating_sub(view.quality.last_bytes);
+                let d_lost = lost.saturating_sub(view.quality.last_lost);
+                let d_received = received.saturating_sub(view.quality.last_received);
+                view.quality.fps = d_frames as f32 / elapsed;
+                view.quality.mbps = d_bytes as f32 * 8.0 / elapsed / 1_000_000.0;
+                let total = d_received + d_lost;
+                view.quality.loss = if total > 0 {
+                    d_lost as f32 / total as f32 * 100.0
+                } else {
+                    0.0
+                };
+                view.quality.last = now;
+                view.quality.last_decoded = decoded;
+                view.quality.last_bytes = bytes;
+                view.quality.last_lost = lost;
+                view.quality.last_received = received;
+            }
+        }
         let Some(frame) = view.latest.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
@@ -718,6 +831,46 @@ impl ArgosApp {
                     height: frame.height,
                 });
             }
+        }
+    }
+
+    fn poll_reconnect(&mut self) {
+        let now = Instant::now();
+        let action = {
+            let Some(view) = self.view.as_mut() else {
+                return;
+            };
+            if !view.was_connected || view.viewer.is_connected() {
+                return;
+            }
+            let Some(peer) = view.lan_peer.clone() else {
+                return;
+            };
+            if view.reconnect.is_none() {
+                view.reconnect = Some(Reconnect {
+                    attempts: 0,
+                    last_request: now,
+                });
+            }
+            let state = view.reconnect.as_mut().expect("reconnect state");
+            if state.attempts >= 5 {
+                if view.error.is_none() {
+                    view.error = Some("Connection lost — reconnect attempts exhausted".to_string());
+                }
+                None
+            } else if now.duration_since(state.last_request) >= Duration::from_secs(3) {
+                state.last_request = now;
+                state.attempts += 1;
+                Some(peer)
+            } else {
+                None
+            }
+        };
+        if let Some(peer) = action {
+            if let Some(lan) = &self.lan {
+                lan.send_request(&peer, &self.config.name);
+            }
+            self.pending_view = Some(peer);
         }
     }
 
@@ -740,20 +893,74 @@ impl ArgosApp {
         ui.image((preview.texture.id(), size));
     }
 
+    fn network_status(&mut self, ui: &mut egui::Ui) {
+        match self.lan.as_ref().and_then(|lan| lan.local_address()) {
+            Some(ip) => {
+                ui.label(RichText::new(format!("This PC on your network: {ip}")).weak());
+            }
+            None => {
+                ui.label(
+                    RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
+                        .color(Color32::from_rgb(220, 200, 120)),
+                );
+                if self.radmin_exe.is_some() {
+                    if ui.button("Launch Radmin VPN").clicked() {
+                        self.launch_radmin();
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Install Radmin VPN to share with friends online.").weak(),
+                    );
+                }
+                if let Some(error) = &self.radmin_error {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                }
+            }
+        }
+        if let Some(error) = &self.lan_error {
+            ui.label(RichText::new(format!("Network discovery off: {error}")).weak());
+        }
+    }
+
+    fn launch_radmin(&mut self) {
+        match crate::radmin::launch() {
+            Ok(()) => self.radmin_error = None,
+            Err(error) => self.radmin_error = Some(error),
+        }
+    }
+
+    fn quality_line(ui: &mut egui::Ui, view: &ViewSession) {
+        let quality = &view.quality;
+        let color = if quality.mbps <= 0.0 {
+            Color32::GRAY
+        } else if quality.loss > 5.0 || quality.fps < 15.0 {
+            Color32::from_rgb(220, 120, 120)
+        } else if quality.loss > 1.0 || quality.fps < 24.0 {
+            Color32::from_rgb(220, 200, 120)
+        } else {
+            Color32::from_rgb(150, 220, 150)
+        };
+        let resolution = view
+            .texture
+            .as_ref()
+            .map(|preview| format!("{}x{} · ", preview.width, preview.height))
+            .unwrap_or_default();
+        ui.label(
+            RichText::new(format!(
+                "{resolution}{:.0} fps · {:.1} Mbps · {:.1}% loss",
+                quality.fps, quality.mbps, quality.loss
+            ))
+            .color(color)
+            .size(16.0),
+        );
+    }
+
     fn share_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Share your screen");
         ui.add_space(4.0);
         ui.label("One companion connects to you directly, peer to peer.");
         ui.label("No accounts. No servers. Nothing is routed through us.");
-        if let Some(lan) = &self.lan {
-            let address = lan
-                .local_address()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "no Radmin VPN address found".to_string());
-            ui.label(RichText::new(format!("This PC on your network: {address}")).weak());
-        } else if let Some(error) = &self.lan_error {
-            ui.label(RichText::new(format!("Network discovery off: {error}")).weak());
-        }
+        self.network_status(ui);
         ui.add_space(12.0);
 
         if self.monitors.is_empty() {
@@ -811,21 +1018,22 @@ impl ArgosApp {
         let mut request_stop = false;
         if let Some(share) = self.share.as_mut() {
             let audio_label = match (&share.audio_capture, &share.audio_encoder) {
-                (Some(_), Some(_)) => format!(
-                    "Audio: system sound shared ({} frames sent)",
-                    share.audio_frames_sent
-                ),
+                (Some(_), Some(_)) => "Audio: system sound shared".to_string(),
                 _ => "Audio: not available on this device".to_string(),
             };
+            ui.label(format!("Status: {}", share.sharer.status()));
             ui.label(audio_label);
             if let Some(error) = &share.audio_error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }
-            ui.label(format!("Status: {}", share.sharer.status()));
-            ui.label(format!(
-                "Diagnostics: {} frames encoded & sent, {} encode errors",
-                share.frames_sent, share.encode_errors
-            ));
+            egui::CollapsingHeader::new("Diagnostics")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "{} frames encoded & sent, {} encode errors, {} audio frames sent",
+                        share.frames_sent, share.encode_errors, share.audio_frames_sent
+                    ));
+                });
             if let Some(code) = &share.offer_code {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Connection code").strong());
@@ -875,52 +1083,55 @@ impl ArgosApp {
         if let Some(view) = self.view.as_mut() {
             ui.heading("Watching");
             ui.label(format!("Status: {}", view.viewer.status()));
-            {
-                let stats = view.stats.lock().ok();
-                if let Some(stats) = stats {
-                    ui.label(format!(
-                        "Diagnostics: {} packets, {} frames assembled, {} decoded (first {}x{}), {} no-picture, {} decode errors",
-                        stats.packets,
-                        stats.aus,
-                        stats.decoded,
-                        stats.first_width,
-                        stats.first_height,
-                        stats.decode_none,
-                        stats.decode_errors
-                    ));
-                    if let Some(first_error) = &stats.first_error {
-                        ui.label(
-                            RichText::new(format!("First decode error: {first_error}"))
-                                .color(Color32::from_rgb(220, 120, 120)),
-                        );
-                    }
-                }
-            }
-            if let Some(error) = &view.audio_error {
+            Self::quality_line(ui, view);
+            if view.reconnect.is_some() {
                 ui.label(
-                    RichText::new(format!("Audio unavailable: {error}"))
-                        .color(Color32::from_rgb(220, 120, 120)),
+                    RichText::new("Connection lost — reconnecting…")
+                        .color(Color32::from_rgb(220, 200, 120)),
                 );
             }
-            {
-                let playing = view.audio_playback.is_some();
-                let stats = view.stats.lock().ok();
-                if let Some(stats) = stats {
-                    ui.label(format!(
-                        "Audio ({}): {} packets, {} decoded, {} errors",
-                        if playing { "on" } else { "off" },
-                        stats.audio_packets,
-                        stats.audio_decoded,
-                        stats.audio_errors
-                    ));
-                    if let Some(error) = &stats.audio_error {
+            egui::CollapsingHeader::new("Diagnostics")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Ok(stats) = view.stats.lock() {
+                        ui.label(format!(
+                            "Video: {} packets, {} frames assembled, {} decoded (first {}x{}), {} no-picture, {} decode errors",
+                            stats.packets,
+                            stats.aus,
+                            stats.decoded,
+                            stats.first_width,
+                            stats.first_height,
+                            stats.decode_none,
+                            stats.decode_errors
+                        ));
+                        if let Some(first_error) = &stats.first_error {
+                            ui.label(
+                                RichText::new(format!("First decode error: {first_error}"))
+                                    .color(Color32::from_rgb(220, 120, 120)),
+                            );
+                        }
+                        let playing = view.audio_playback.is_some();
+                        ui.label(format!(
+                            "Audio ({}): {} packets, {} decoded, {} errors",
+                            if playing { "on" } else { "off" },
+                            stats.audio_packets,
+                            stats.audio_decoded,
+                            stats.audio_errors
+                        ));
+                        if let Some(error) = &stats.audio_error {
+                            ui.label(
+                                RichText::new(format!("First audio error: {error}"))
+                                    .color(Color32::from_rgb(220, 120, 120)),
+                            );
+                        }
+                    }
+                    if let Some(error) = &view.audio_error {
                         ui.label(
-                            RichText::new(format!("First audio error: {error}"))
+                            RichText::new(format!("Audio unavailable: {error}"))
                                 .color(Color32::from_rgb(220, 120, 120)),
                         );
                     }
-                }
-            }
+                });
             if let Some(code) = &view.answer_code {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Your reply code").strong());
@@ -967,13 +1178,7 @@ impl ArgosApp {
             ui.separator();
             ui.label(RichText::new("On your network").weak());
             ui.add_space(4.0);
-            if let Some(lan) = &self.lan {
-                let address = lan
-                    .local_address()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                ui.label(RichText::new(format!("This PC: {address}")).weak());
-            }
+            self.network_status(ui);
             let peers = self.lan.as_ref().map(|lan| lan.peers()).unwrap_or_default();
             if self.lan.is_none() {
                 ui.label(RichText::new("Peer discovery is unavailable").weak());
@@ -1057,6 +1262,7 @@ impl eframe::App for ArgosApp {
         }
         if self.view.is_some() {
             self.poll_view(ctx);
+            self.poll_reconnect();
             ctx.request_repaint();
         }
         self.content(ctx);

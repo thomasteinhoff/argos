@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 xcap = "0.9.8"
+openh264 = "0.9.8"

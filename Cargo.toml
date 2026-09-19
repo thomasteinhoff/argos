@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/argos-app",
+    "crates/argos-core",
+    "crates/argos-media",
+    "crates/argos-viewer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+eframe = "0.32"
+confy = "0.6"
+serde = { version = "1", features = ["derive"] }

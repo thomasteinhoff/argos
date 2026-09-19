@@ -1,0 +1,4 @@
+[package]
+name = "argos-media"
+version.workspace = true
+edition.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "argos-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe.workspace = true
+confy.workspace = true
+serde.workspace = true

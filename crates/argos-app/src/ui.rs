@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
-use argos_core::{h264, session, Packet};
+use argos_core::{h264, lan, session, Packet};
 use argos_media::audio::{
     AudioCapture, AudioPlayback, OpusAudioDecoder, OpusAudioEncoder, FRAME_SAMPLES,
 };
@@ -39,6 +39,7 @@ struct ShareSession {
     audio_error: Option<String>,
     audio_timestamp: u32,
     audio_frames_sent: u64,
+    lan_peer: Option<String>,
 }
 
 struct ViewStats {
@@ -105,11 +106,19 @@ pub struct ArgosApp {
     share_error: Option<String>,
     view: Option<ViewSession>,
     view_error: Option<String>,
+    lan: Option<lan::Lan>,
+    lan_error: Option<String>,
+    pending_request: Option<(String, String)>,
+    pending_view: Option<String>,
 }
 
 impl ArgosApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let config = config::load();
+        let (lan, lan_error) = match lan::Lan::start(config.name.clone()) {
+            Ok(lan) => (Some(lan), None),
+            Err(error) => (None, Some(error)),
+        };
         Self {
             name_input: config.name.clone(),
             code_input: String::new(),
@@ -126,6 +135,10 @@ impl ArgosApp {
             share_error: None,
             view: None,
             view_error: None,
+            lan,
+            lan_error,
+            pending_request: None,
+            pending_view: None,
             config,
             mode: Mode::View,
             show_settings: false,
@@ -201,8 +214,11 @@ impl ArgosApp {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         let name = self.name_input.trim().to_string();
-                        self.config.name = name;
+                        self.config.name = name.clone();
                         config::save(&self.config);
+                        if let Some(lan) = &self.lan {
+                            lan.set_name(name);
+                        }
                         self.show_settings = false;
                     }
                     if ui.button("Cancel").clicked() {
@@ -264,8 +280,11 @@ impl ArgosApp {
         );
     }
 
-    fn start_share(&mut self) {
+    fn start_share(&mut self, lan_peer: Option<String>) {
         self.share_error = None;
+        if let Some(existing) = self.share.take() {
+            let _ = session::block_on(existing.sharer.close());
+        }
         if self.capture.is_none() {
             if let Err(error) = self.start_capture() {
                 self.share_error = Some(error);
@@ -280,12 +299,21 @@ impl ArgosApp {
                 return;
             }
         };
-        let offer_code = match session::block_on(sharer.create_offer()) {
-            Ok(code) => Some(code),
+        let offer = match session::block_on(sharer.create_offer()) {
+            Ok(code) => code,
             Err(error) => {
                 self.share_error = Some(error);
                 return;
             }
+        };
+        let offer_code = match &lan_peer {
+            Some(peer) => {
+                if let Some(lan) = &self.lan {
+                    lan.send_offer(peer, offer);
+                }
+                None
+            }
+            None => Some(offer),
         };
         let encoder = match H264Encoder::new() {
             Ok(encoder) => encoder,
@@ -302,6 +330,9 @@ impl ArgosApp {
                     (None, None, error)
                 }
             };
+        if let Some(lan) = &self.lan {
+            lan.set_sharing(true);
+        }
         self.share = Some(ShareSession {
             sharer,
             offer_code,
@@ -316,6 +347,7 @@ impl ArgosApp {
             audio_error,
             audio_timestamp: 0,
             audio_frames_sent: 0,
+            lan_peer,
         });
     }
 
@@ -335,12 +367,14 @@ impl ArgosApp {
         if let Some(share) = self.share.take() {
             let _ = session::block_on(share.sharer.close());
         }
+        if let Some(lan) = &self.lan {
+            lan.set_sharing(false);
+        }
         self.share_error = None;
     }
 
-    fn start_view(&mut self) {
+    fn start_view(&mut self, offer: String, lan_peer: Option<String>) {
         self.view_error = None;
-        let offer = self.code_input.trim().to_string();
         if offer.is_empty() {
             self.view_error = Some("paste a connection code from the sharer first".to_string());
             return;
@@ -364,12 +398,21 @@ impl ArgosApp {
                 return;
             }
         };
-        let answer_code = match session::block_on(viewer.answer_offer(&offer)) {
-            Ok(code) => Some(code),
+        let answer = match session::block_on(viewer.answer_offer(&offer)) {
+            Ok(code) => code,
             Err(error) => {
                 self.view_error = Some(error);
                 return;
             }
+        };
+        let answer_code = match &lan_peer {
+            Some(peer) => {
+                if let Some(lan) = &self.lan {
+                    lan.send_answer(peer, answer);
+                }
+                None
+            }
+            None => Some(answer),
         };
         self.view = Some(ViewSession {
             viewer,
@@ -387,7 +430,79 @@ impl ArgosApp {
         if let Some(view) = self.view.take() {
             let _ = session::block_on(view.viewer.close());
         }
+        self.pending_view = None;
         self.view_error = None;
+    }
+
+    fn poll_lan_events(&mut self) {
+        let Some(lan) = self.lan.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Some(event) = lan.try_event() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                lan::LanEvent::Request { id, name } => {
+                    let busy = self
+                        .share
+                        .as_ref()
+                        .map(|share| share.sharer.is_connected())
+                        .unwrap_or(false);
+                    if !busy && self.pending_request.is_none() {
+                        self.pending_request = Some((id, name));
+                    }
+                }
+                lan::LanEvent::Offer { id, sdp } => {
+                    if self.pending_view.as_deref() == Some(id.as_str()) && self.view.is_none() {
+                        self.pending_view = None;
+                        self.start_view(sdp, Some(id));
+                    }
+                }
+                lan::LanEvent::Answer { id, sdp } => {
+                    if let Some(share) = self.share.as_mut() {
+                        if share.lan_peer.as_deref() == Some(id.as_str()) {
+                            match session::block_on(share.sharer.set_answer(&sdp)) {
+                                Ok(()) => share.error = None,
+                                Err(error) => share.error = Some(error),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn request_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name)) = self.pending_request.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new("View request")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("{name} wants to view your screen."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Allow").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Deny").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.pending_request = None;
+                self.start_share(Some(id));
+            }
+            Some(false) => self.pending_request = None,
+            None => {}
+        }
     }
 
     fn receive_callback(
@@ -630,6 +745,15 @@ impl ArgosApp {
         ui.add_space(4.0);
         ui.label("One companion connects to you directly, peer to peer.");
         ui.label("No accounts. No servers. Nothing is routed through us.");
+        if let Some(lan) = &self.lan {
+            let address = lan
+                .local_address()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "no Radmin VPN address found".to_string());
+            ui.label(RichText::new(format!("This PC on your network: {address}")).weak());
+        } else if let Some(error) = &self.lan_error {
+            ui.label(RichText::new(format!("Network discovery off: {error}")).weak());
+        }
         ui.add_space(12.0);
 
         if self.monitors.is_empty() {
@@ -707,18 +831,23 @@ impl ArgosApp {
                 ui.label(RichText::new("Connection code").strong());
                 ui.label("Give this to the viewer. They answer, then paste their reply below.");
                 Self::code_widget(ui, code, 3);
+            } else if share.lan_peer.is_some() {
+                ui.add_space(8.0);
+                ui.label("Waiting for the viewer to connect over your network…");
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut share.answer_input)
-                        .hint_text("Paste the viewer's answer code")
-                        .desired_width(300.0),
-                );
-                if ui.button("Connect").clicked() {
-                    Self::accept_answer(share);
-                }
-            });
+            if share.lan_peer.is_none() {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut share.answer_input)
+                            .hint_text("Paste the viewer's answer code")
+                            .desired_width(300.0),
+                    );
+                    if ui.button("Connect").clicked() {
+                        Self::accept_answer(share);
+                    }
+                });
+            }
             if let Some(error) = &share.error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }
@@ -728,7 +857,7 @@ impl ArgosApp {
             }
         } else {
             if ui.button("Start sharing").clicked() {
-                self.start_share();
+                self.start_share(None);
             }
             if let Some(error) = &self.share_error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
@@ -742,6 +871,7 @@ impl ArgosApp {
     fn view_panel(&mut self, ui: &mut egui::Ui) {
         let mut request_connect = false;
         let mut request_stop = false;
+        let mut watch: Option<String> = None;
         if let Some(view) = self.view.as_mut() {
             ui.heading("Watching");
             ui.label(format!("Status: {}", view.viewer.status()));
@@ -835,12 +965,47 @@ impl ArgosApp {
             }
             ui.add_space(16.0);
             ui.separator();
-            ui.label(RichText::new("Recent").weak());
+            ui.label(RichText::new("On your network").weak());
             ui.add_space(4.0);
-            ui.label(RichText::new("No contacts yet").weak());
+            if let Some(lan) = &self.lan {
+                let address = lan
+                    .local_address()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                ui.label(RichText::new(format!("This PC: {address}")).weak());
+            }
+            let peers = self.lan.as_ref().map(|lan| lan.peers()).unwrap_or_default();
+            if self.lan.is_none() {
+                ui.label(RichText::new("Peer discovery is unavailable").weak());
+            } else if peers.is_empty() {
+                ui.label(RichText::new("Looking for friends…").weak());
+            }
+            for peer in peers {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&peer.name));
+                    if peer.sharing {
+                        if ui.button("Watch").clicked() {
+                            watch = Some(peer.id.clone());
+                        }
+                    } else {
+                        ui.label(RichText::new("not sharing").weak());
+                    }
+                });
+            }
+            if self.pending_view.is_some() {
+                ui.label(
+                    RichText::new("Requesting to watch…").color(Color32::from_rgb(220, 200, 120)),
+                );
+            }
         }
         if request_connect {
-            self.start_view();
+            self.start_view(self.code_input.trim().to_string(), None);
+        }
+        if let Some(id) = watch {
+            if let Some(lan) = &self.lan {
+                lan.send_request(&id, &self.config.name);
+            }
+            self.pending_view = Some(id);
         }
         if request_stop {
             self.stop_view();
@@ -879,6 +1044,7 @@ impl ArgosApp {
 impl eframe::App for ArgosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_visuals(egui::Visuals::dark());
+        self.poll_lan_events();
         self.top_bar(ctx);
         self.side_bar(ctx);
         if self.capture.is_some() {
@@ -894,8 +1060,14 @@ impl eframe::App for ArgosApp {
             ctx.request_repaint();
         }
         self.content(ctx);
+        if self.lan.is_some() && self.capture.is_none() && self.view.is_none() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if self.show_settings {
             self.settings_window(ctx);
+        }
+        if self.pending_request.is_some() {
+            self.request_window(ctx);
         }
     }
 }

@@ -5,6 +5,7 @@ use openh264::OpenH264API;
 pub struct H264Encoder {
     encoder: Encoder,
     planes: Vec<u8>,
+    target_height: Option<u32>,
 }
 
 impl H264Encoder {
@@ -22,16 +23,32 @@ impl H264Encoder {
         Ok(Self {
             encoder,
             planes: Vec::new(),
+            target_height: None,
         })
+    }
+
+    pub fn set_target_height(&mut self, height: Option<u32>) {
+        self.target_height = height;
+    }
+
+    pub fn target_dims(width: usize, height: usize, target_height: Option<u32>) -> (usize, usize) {
+        match target_height {
+            Some(target) if (target as usize) >= 2 && (target as usize) < height => {
+                let out_height = (target as usize) & !1;
+                let out_width = ((width * out_height / height) & !1).max(2);
+                (out_width, out_height)
+            }
+            _ => (width, height),
+        }
     }
 
     pub fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
         if width % 2 != 0 || height % 2 != 0 {
             return Err("frame dimensions must be even".to_string());
         }
-        let width = width as usize;
-        let height = height as usize;
-        if rgba.len() != width * height * 4 {
+        let src_width = width as usize;
+        let src_height = height as usize;
+        if rgba.len() != src_width * src_height * 4 {
             return Err(format!(
                 "rgba buffer length {} does not match {}x{}",
                 rgba.len(),
@@ -39,7 +56,12 @@ impl H264Encoder {
                 height
             ));
         }
-        rgba_to_i420(rgba, width, height, &mut self.planes);
+        let (width, height) = Self::target_dims(src_width, src_height, self.target_height);
+        if width == src_width && height == src_height {
+            rgba_to_i420(rgba, width, height, &mut self.planes);
+        } else {
+            rgba_to_i420_scaled(rgba, src_width, src_height, width, height, &mut self.planes);
+        }
 
         let y_len = width * height;
         let uv_len = (width / 2) * (height / 2);
@@ -107,6 +129,68 @@ pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, planes: &mut Vec<u
             let idx = y_row * half + x_col;
             u[idx] = chroma_u(ar, ag, ab);
             v[idx] = chroma_v(ar, ag, ab);
+        }
+    }
+}
+
+pub fn rgba_to_i420_scaled(
+    rgba: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst_width: usize,
+    dst_height: usize,
+    planes: &mut Vec<u8>,
+) {
+    let y_len = dst_width * dst_height;
+    let uv_len = (dst_width / 2) * (dst_height / 2);
+    planes.clear();
+    planes.resize(y_len + uv_len + uv_len, 0);
+    let (y, rest) = planes.split_at_mut(y_len);
+    let (u, v) = rest.split_at_mut(uv_len);
+    let half = dst_width / 2;
+
+    for block_y in 0..dst_height / 2 {
+        for block_x in 0..half {
+            let mut chroma = [0i32; 3];
+            for oy in 0..2 {
+                let dst_y = block_y * 2 + oy;
+                let src_y0 = dst_y * src_height / dst_height;
+                let src_y1 = ((dst_y + 1) * src_height / dst_height)
+                    .max(src_y0 + 1)
+                    .min(src_height);
+                for ox in 0..2 {
+                    let dst_x = block_x * 2 + ox;
+                    let src_x0 = dst_x * src_width / dst_width;
+                    let src_x1 = ((dst_x + 1) * src_width / dst_width)
+                        .max(src_x0 + 1)
+                        .min(src_width);
+                    let mut r_sum = 0u32;
+                    let mut g_sum = 0u32;
+                    let mut b_sum = 0u32;
+                    let mut count = 0u32;
+                    for sy in src_y0..src_y1 {
+                        let row = sy * src_width * 4;
+                        for sx in src_x0..src_x1 {
+                            let base = row + sx * 4;
+                            r_sum += rgba[base] as u32;
+                            g_sum += rgba[base + 1] as u32;
+                            b_sum += rgba[base + 2] as u32;
+                            count += 1;
+                        }
+                    }
+                    let count = count.max(1) as i32;
+                    let r = r_sum as i32 / count;
+                    let g = g_sum as i32 / count;
+                    let b = b_sum as i32 / count;
+                    y[dst_y * dst_width + dst_x] = luma(r, g, b);
+                    chroma[0] += r;
+                    chroma[1] += g;
+                    chroma[2] += b;
+                }
+            }
+            let idx = block_y * half + block_x;
+            u[idx] = chroma_u(chroma[0] / 4, chroma[1] / 4, chroma[2] / 4);
+            v[idx] = chroma_v(chroma[0] / 4, chroma[1] / 4, chroma[2] / 4);
         }
     }
 }
@@ -186,5 +270,48 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(max_diff <= 1, "max difference {max_diff}");
+    }
+
+    #[test]
+    fn scaled_conversion_averages_source_blocks() {
+        use super::{luma, rgba_to_i420_scaled};
+        let src_width = 8;
+        let src_height = 4;
+        let mut rgba = vec![0u8; src_width * src_height * 4];
+        for (i, byte) in rgba.iter_mut().enumerate() {
+            *byte = ((i * 53 + 7) % 251) as u8;
+        }
+        let dst_width = 4;
+        let dst_height = 2;
+        let mut planes = Vec::new();
+        rgba_to_i420_scaled(
+            &rgba,
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+            &mut planes,
+        );
+        assert_eq!(planes.len(), dst_width * dst_height * 3 / 2);
+
+        for dst_y in 0..dst_height {
+            for dst_x in 0..dst_width {
+                let mut sum = [0i32; 3];
+                for oy in 0..2 {
+                    for ox in 0..2 {
+                        let base = ((dst_y * 2 + oy) * src_width + dst_x * 2 + ox) * 4;
+                        sum[0] += rgba[base] as i32;
+                        sum[1] += rgba[base + 1] as i32;
+                        sum[2] += rgba[base + 2] as i32;
+                    }
+                }
+                let expected = luma(sum[0] / 4, sum[1] / 4, sum[2] / 4);
+                let actual = planes[dst_y * dst_width + dst_x];
+                assert!(
+                    (actual as i32 - expected as i32).abs() <= 1,
+                    "luma mismatch at {dst_x},{dst_y}: {actual} vs {expected}"
+                );
+            }
+        }
     }
 }

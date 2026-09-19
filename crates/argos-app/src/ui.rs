@@ -151,6 +151,7 @@ pub struct ArgosApp {
     preview_error: Option<String>,
     share: Option<ShareSession>,
     share_error: Option<String>,
+    share_height: Option<u32>,
     live: bool,
     view: Option<ViewSession>,
     view_error: Option<String>,
@@ -182,6 +183,7 @@ impl ArgosApp {
             preview_error: None,
             share: None,
             share_error: None,
+            share_height: Some(720),
             live: false,
             view: None,
             view_error: None,
@@ -300,6 +302,15 @@ impl ArgosApp {
         format!("{} ({}x{}){}", info.name, info.width, info.height, primary)
     }
 
+    fn quality_label(height: Option<u32>) -> &'static str {
+        match height {
+            Some(720) => "720p",
+            Some(540) => "540p",
+            Some(360) => "360p",
+            _ => "Native",
+        }
+    }
+
     fn start_capture(&mut self) -> Result<Option<MonitorInfo>, String> {
         let Some(source) = self.monitors.get(self.selected_monitor) else {
             return Ok(None);
@@ -374,13 +385,14 @@ impl ArgosApp {
             }
             None => Some(offer),
         };
-        let encoder = match H264Encoder::new() {
+        let mut encoder = match H264Encoder::new() {
             Ok(encoder) => encoder,
             Err(error) => {
                 self.share_error = Some(error);
                 return;
             }
         };
+        encoder.set_target_height(self.share_height);
         let (audio_capture, audio_encoder, audio_error) =
             match (AudioCapture::start(), OpusAudioEncoder::new()) {
                 (Ok(capture), Ok(encoder)) => (Some(capture), Some(encoder), None),
@@ -1024,6 +1036,29 @@ impl ArgosApp {
                     }
                 }
             });
+
+        let mut share_height = self.share_height;
+        egui::ComboBox::from_label("Stream quality")
+            .selected_text(Self::quality_label(share_height))
+            .show_ui(ui, |ui| {
+                for (label, height) in [
+                    ("Native", None),
+                    ("720p", Some(720)),
+                    ("540p", Some(540)),
+                    ("360p", Some(360)),
+                ] {
+                    if ui.selectable_label(share_height == height, label).clicked() {
+                        share_height = height;
+                    }
+                }
+            });
+        if share_height != self.share_height {
+            self.share_height = share_height;
+            if let Some(share) = self.share.as_mut() {
+                share.encoder.set_target_height(share_height);
+                share.encoder.force_keyframe();
+            }
+        }
 
         ui.add_space(6.0);
         let preview_label = if self.preview_active {

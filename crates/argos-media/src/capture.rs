@@ -1,9 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use xcap::Monitor;
+
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Clone)]
 pub struct MonitorInfo {
@@ -22,6 +25,7 @@ pub struct Frame {
 pub struct CaptureSession {
     rx: Receiver<Frame>,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -31,8 +35,13 @@ impl CaptureSession {
         Self {
             rx,
             stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
             join: None,
         }
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
     }
 
     pub fn start(&mut self, source: &MonitorInfo) -> Result<(), String> {
@@ -42,6 +51,7 @@ impl CaptureSession {
         let wanted = source.name.clone();
         let (tx, rx) = sync_channel::<Frame>(1);
         let stop = self.stop.clone();
+        let active = self.active.clone();
         self.join = Some(thread::spawn(move || {
             let Ok(monitors) = Monitor::all() else {
                 return;
@@ -56,7 +66,7 @@ impl CaptureSession {
                 return;
             };
             let _ = recorder.start();
-            pump(recorder, frames, tx, stop);
+            pump(recorder, frames, tx, stop, active);
         }));
         self.rx = rx;
         Ok(())
@@ -76,20 +86,38 @@ fn pump(
     frames: Receiver<xcap::Frame>,
     tx: SyncSender<Frame>,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 ) {
+    let mut last = Instant::now() - CAPTURE_INTERVAL;
     while !stop.load(Ordering::Relaxed) {
-        let Ok(frame) = frames.recv() else {
+        if !active.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(20));
+            last = Instant::now();
+            continue;
+        }
+        let elapsed = last.elapsed();
+        if elapsed < CAPTURE_INTERVAL {
+            thread::sleep(CAPTURE_INTERVAL - elapsed);
+        }
+        if stop.load(Ordering::Relaxed) {
             break;
-        };
-        let outgoing = Frame {
-            width: frame.width,
-            height: frame.height,
-            rgba: frame.raw,
-        };
-        match tx.try_send(outgoing) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+        }
+        match frames.recv_timeout(CAPTURE_INTERVAL) {
+            Ok(frame) => {
+                last = Instant::now();
+                let outgoing = Frame {
+                    width: frame.width,
+                    height: frame.height,
+                    rgba: frame.raw,
+                };
+                match tx.try_send(outgoing) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = recorder.stop();

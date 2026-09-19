@@ -5,7 +5,9 @@ use std::time::Duration;
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_H264};
+use rtc::peer_connection::configuration::media_engine::{
+    MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS,
+};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::rtp::packet::Packet;
@@ -27,7 +29,9 @@ use crate::h264::{self, Packetizer};
 use crate::signal;
 
 pub const VIDEO_PT: u8 = 96;
+pub const AUDIO_PT: u8 = 111;
 const VIDEO_SSRC: u32 = 0x5a5a_77e1;
+const AUDIO_SSRC: u32 = 0x5a5a_77e2;
 const MTU: usize = 1200;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -113,6 +117,16 @@ fn h264_codec() -> RTCRtpCodec {
     }
 }
 
+fn opus_codec() -> RTCRtpCodec {
+    RTCRtpCodec {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+        rtcp_feedback: vec![],
+    }
+}
+
 fn setting_engine() -> rtc::peer_connection::configuration::setting_engine::SettingEngine {
     SettingEngineBuilder::new()
         .with_include_loopback_candidate(true)
@@ -133,6 +147,16 @@ async fn build_pc(
                 ..Default::default()
             },
             RtpCodecKind::Video,
+        )
+        .map_err(|error| error.to_string())?;
+    engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: opus_codec(),
+                payload_type: AUDIO_PT,
+                ..Default::default()
+            },
+            RtpCodecKind::Audio,
         )
         .map_err(|error| error.to_string())?;
     let registry = register_default_interceptors(Registry::new(), &mut engine)
@@ -173,7 +197,9 @@ async fn wait_for_gathering(state: &Mutex<HandlerState>) -> Result<(), String> {
 pub struct Sharer {
     pc: Arc<dyn PeerConnection>,
     track: Arc<TrackLocalStaticRTP>,
+    audio_track: Arc<TrackLocalStaticRTP>,
     packetizer: Mutex<Packetizer>,
+    audio_packetizer: Mutex<Packetizer>,
     state: Arc<Mutex<HandlerState>>,
 }
 
@@ -198,10 +224,29 @@ impl Sharer {
         pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|error| error.to_string())?;
+        let audio_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
+            "argos-stream".to_string(),
+            "argos-audio".to_string(),
+            "argos-audio".to_string(),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(AUDIO_SSRC),
+                    ..Default::default()
+                },
+                codec: opus_codec(),
+                ..Default::default()
+            }],
+        )));
+        pc.add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             pc,
             track,
+            audio_track,
             packetizer: Mutex::new(Packetizer::new(VIDEO_SSRC, VIDEO_PT, MTU)),
+            audio_packetizer: Mutex::new(Packetizer::new(AUDIO_SSRC, AUDIO_PT, MTU)),
             state,
         })
     }
@@ -259,6 +304,23 @@ impl Sharer {
         Ok(())
     }
 
+    pub async fn send_audio(&self, opus: &[u8], timestamp: u32) -> Result<(), String> {
+        let packets = {
+            let mut packetizer = self
+                .audio_packetizer
+                .lock()
+                .map_err(|_| "audio packetizer lock poisoned".to_string())?;
+            packetizer.packetize(opus, timestamp, true)
+        };
+        for packet in packets {
+            self.audio_track
+                .write_rtp(packet)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> &'static str {
         let current = self.state.lock().ok();
         match current.as_deref() {
@@ -291,6 +353,15 @@ impl Viewer {
         let pc = build_pc(state.clone(), Some(on_packet), udp_addrs).await?;
         pc.add_transceiver_from_kind(
             RtpCodecKind::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        pc.add_transceiver_from_kind(
+            RtpCodecKind::Audio,
             Some(RTCRtpTransceiverInit {
                 direction: RTCRtpTransceiverDirection::Recvonly,
                 ..Default::default()

@@ -6,3 +6,5 @@ edition.workspace = true
 [dependencies]
 xcap = "0.9.8"
 openh264 = "0.9.8"
+wasapi = "0.24.0"
+opus-rs = "0.1.33"

@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use argos_core::{h264, session, Packet};
+use argos_media::audio::{
+    AudioCapture, AudioPlayback, OpusAudioDecoder, OpusAudioEncoder, FRAME_SAMPLES,
+};
 use argos_media::capture::{self, CaptureSession, MonitorInfo};
 use argos_media::decode::{DecodedFrame, H264Decoder};
 use argos_media::encode::H264Encoder;
@@ -31,6 +34,11 @@ struct ShareSession {
     frame_timestamp: u32,
     frames_sent: u64,
     encode_errors: u64,
+    audio_capture: Option<AudioCapture>,
+    audio_encoder: Option<OpusAudioEncoder>,
+    audio_error: Option<String>,
+    audio_timestamp: u32,
+    audio_frames_sent: u64,
 }
 
 struct ViewStats {
@@ -42,6 +50,10 @@ struct ViewStats {
     first_width: u32,
     first_height: u32,
     first_error: Option<String>,
+    audio_packets: u64,
+    audio_decoded: u64,
+    audio_errors: u64,
+    audio_error: Option<String>,
 }
 
 impl Default for ViewStats {
@@ -55,6 +67,10 @@ impl Default for ViewStats {
             first_width: 0,
             first_height: 0,
             first_error: None,
+            audio_packets: 0,
+            audio_decoded: 0,
+            audio_errors: 0,
+            audio_error: None,
         }
     }
 }
@@ -66,6 +82,8 @@ struct ViewSession {
     latest: Arc<Mutex<Option<DecodedFrame>>>,
     stats: Arc<Mutex<ViewStats>>,
     texture: Option<Preview>,
+    audio_playback: Option<Arc<AudioPlayback>>,
+    audio_error: Option<String>,
 }
 
 pub struct ArgosApp {
@@ -276,6 +294,14 @@ impl ArgosApp {
                 return;
             }
         };
+        let (audio_capture, audio_encoder, audio_error) =
+            match (AudioCapture::start(), OpusAudioEncoder::new()) {
+                (Ok(capture), Ok(encoder)) => (Some(capture), Some(encoder), None),
+                (capture, encoder) => {
+                    let error = capture.err().or_else(|| encoder.err());
+                    (None, None, error)
+                }
+            };
         self.share = Some(ShareSession {
             sharer,
             offer_code,
@@ -285,6 +311,11 @@ impl ArgosApp {
             frame_timestamp: 0,
             frames_sent: 0,
             encode_errors: 0,
+            audio_capture,
+            audio_encoder,
+            audio_error,
+            audio_timestamp: 0,
+            audio_frames_sent: 0,
         });
     }
 
@@ -316,9 +347,14 @@ impl ArgosApp {
         }
         let latest = Arc::new(Mutex::new(None));
         let stats = Arc::new(Mutex::new(ViewStats::default()));
+        let (audio_playback, audio_error) = match AudioPlayback::start(1.0) {
+            Ok(playback) => (Some(Arc::new(playback)), None),
+            Err(error) => (None, Some(error)),
+        };
         let callback: Arc<dyn Fn(&Packet) + Send + Sync> = Arc::new(Self::receive_callback(
             Arc::clone(&latest),
             Arc::clone(&stats),
+            audio_playback.clone(),
         ));
         let udp = vec!["0.0.0.0:0".to_string()];
         let viewer = match session::block_on(session::Viewer::new(udp, callback)) {
@@ -342,6 +378,8 @@ impl ArgosApp {
             latest,
             stats,
             texture: None,
+            audio_playback,
+            audio_error,
         });
     }
 
@@ -355,14 +393,17 @@ impl ArgosApp {
     fn receive_callback(
         latest: Arc<Mutex<Option<DecodedFrame>>>,
         stats: Arc<Mutex<ViewStats>>,
+        audio_playback: Option<Arc<AudioPlayback>>,
     ) -> impl Fn(&Packet) + Send + Sync {
         struct Pipeline {
             depacketizer: h264::Depacketizer,
             decoder: Option<H264Decoder>,
+            audio_decoder: Option<OpusAudioDecoder>,
         }
         let pipeline = Arc::new(Mutex::new(Pipeline {
             depacketizer: h264::Depacketizer::new(),
             decoder: H264Decoder::new().ok(),
+            audio_decoder: OpusAudioDecoder::new().ok(),
         }));
         move |packet: &Packet| {
             {
@@ -370,6 +411,37 @@ impl ArgosApp {
                     return;
                 };
                 stats.packets += 1;
+            }
+            if packet.header.payload_type == session::AUDIO_PT {
+                if let Ok(mut stats) = stats.lock() {
+                    stats.audio_packets += 1;
+                }
+                let Some(playback) = &audio_playback else {
+                    return;
+                };
+                let Ok(mut pipeline) = pipeline.lock() else {
+                    return;
+                };
+                let Some(decoder) = pipeline.audio_decoder.as_mut() else {
+                    return;
+                };
+                match decoder.decode(&packet.payload) {
+                    Ok(samples) => {
+                        playback.push(samples);
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.audio_decoded += 1;
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut stats) = stats.lock() {
+                            if stats.audio_error.is_none() {
+                                stats.audio_error = Some(error);
+                            }
+                            stats.audio_errors += 1;
+                        }
+                    }
+                }
+                return;
             }
             let Ok(mut pipeline) = pipeline.lock() else {
                 return;
@@ -470,6 +542,42 @@ impl ArgosApp {
                     }
                 }
             }
+        }
+    }
+
+    fn poll_share_audio(&mut self) {
+        let Some(share) = self.share.as_mut() else {
+            return;
+        };
+        if !share.sharer.is_connected() {
+            return;
+        }
+        loop {
+            let Some(frame) = share
+                .audio_capture
+                .as_ref()
+                .and_then(AudioCapture::try_frame)
+            else {
+                break;
+            };
+            let Some(encoder) = share.audio_encoder.as_mut() else {
+                break;
+            };
+            let packet = match encoder.encode(&frame) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    share.audio_error = Some(error);
+                    break;
+                }
+            };
+            let timestamp = share.audio_timestamp;
+            share.audio_timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+            let sharer = Arc::clone(&share.sharer);
+            if let Err(error) = session::block_on(sharer.send_audio(&packet, timestamp)) {
+                share.audio_error = Some(error);
+                break;
+            }
+            share.audio_frames_sent += 1;
         }
     }
 
@@ -578,7 +686,17 @@ impl ArgosApp {
         ui.add_space(12.0);
         let mut request_stop = false;
         if let Some(share) = self.share.as_mut() {
-            ui.label("Audio: will be added in a later milestone");
+            let audio_label = match (&share.audio_capture, &share.audio_encoder) {
+                (Some(_), Some(_)) => format!(
+                    "Audio: system sound shared ({} frames sent)",
+                    share.audio_frames_sent
+                ),
+                _ => "Audio: not available on this device".to_string(),
+            };
+            ui.label(audio_label);
+            if let Some(error) = &share.audio_error {
+                ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+            }
             ui.label(format!("Status: {}", share.sharer.status()));
             ui.label(format!(
                 "Diagnostics: {} frames encoded & sent, {} encode errors",
@@ -643,6 +761,31 @@ impl ArgosApp {
                     if let Some(first_error) = &stats.first_error {
                         ui.label(
                             RichText::new(format!("First decode error: {first_error}"))
+                                .color(Color32::from_rgb(220, 120, 120)),
+                        );
+                    }
+                }
+            }
+            if let Some(error) = &view.audio_error {
+                ui.label(
+                    RichText::new(format!("Audio unavailable: {error}"))
+                        .color(Color32::from_rgb(220, 120, 120)),
+                );
+            }
+            {
+                let playing = view.audio_playback.is_some();
+                let stats = view.stats.lock().ok();
+                if let Some(stats) = stats {
+                    ui.label(format!(
+                        "Audio ({}): {} packets, {} decoded, {} errors",
+                        if playing { "on" } else { "off" },
+                        stats.audio_packets,
+                        stats.audio_decoded,
+                        stats.audio_errors
+                    ));
+                    if let Some(error) = &stats.audio_error {
+                        ui.label(
+                            RichText::new(format!("First audio error: {error}"))
                                 .color(Color32::from_rgb(220, 120, 120)),
                         );
                     }
@@ -740,6 +883,10 @@ impl eframe::App for ArgosApp {
         self.side_bar(ctx);
         if self.capture.is_some() {
             self.poll_capture(ctx);
+            ctx.request_repaint();
+        }
+        if self.share.is_some() {
+            self.poll_share_audio();
             ctx.request_repaint();
         }
         if self.view.is_some() {

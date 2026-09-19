@@ -35,6 +35,8 @@ const AUDIO_SSRC: u32 = 0x5a5a_77e2;
 const MTU: usize = 1200;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub type PacketCallback = Arc<dyn Fn(&Packet) + Send + Sync>;
+
 pub fn runtime() -> Arc<dyn Runtime> {
     static RUNTIME: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
     Arc::clone(RUNTIME.get_or_init(|| default_runtime().expect("no runtime feature enabled")))
@@ -44,7 +46,7 @@ fn tokio() -> &'static tokio::runtime::Runtime {
     static TOKIO: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     TOKIO.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()
             .expect("failed to build tokio runtime")
@@ -71,7 +73,7 @@ struct HandlerState {
 
 struct SessionHandler {
     state: Arc<Mutex<HandlerState>>,
-    on_packet: Option<Arc<dyn Fn(&Packet) + Send + Sync>>,
+    on_packet: Option<PacketCallback>,
 }
 
 #[async_trait::async_trait]
@@ -139,7 +141,7 @@ fn setting_engine() -> rtc::peer_connection::configuration::setting_engine::Sett
 
 async fn build_pc(
     state: Arc<Mutex<HandlerState>>,
-    on_packet: Option<Arc<dyn Fn(&Packet) + Send + Sync>>,
+    on_packet: Option<PacketCallback>,
     udp_addrs: Vec<String>,
 ) -> Result<Arc<dyn PeerConnection>, String> {
     let mut engine = MediaEngine::default();
@@ -148,7 +150,6 @@ async fn build_pc(
             RTCRtpCodecParameters {
                 rtp_codec: h264_codec(),
                 payload_type: VIDEO_PT,
-                ..Default::default()
             },
             RtpCodecKind::Video,
         )
@@ -158,7 +159,6 @@ async fn build_pc(
             RTCRtpCodecParameters {
                 rtp_codec: opus_codec(),
                 payload_type: AUDIO_PT,
-                ..Default::default()
             },
             RtpCodecKind::Audio,
         )
@@ -349,10 +349,7 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    pub async fn new(
-        udp_addrs: Vec<String>,
-        on_packet: Arc<dyn Fn(&Packet) + Send + Sync>,
-    ) -> Result<Self, String> {
+    pub async fn new(udp_addrs: Vec<String>, on_packet: PacketCallback) -> Result<Self, String> {
         let state = Arc::new(Mutex::new(HandlerState::default()));
         let pc = build_pc(state.clone(), Some(on_packet), udp_addrs).await?;
         pc.add_transceiver_from_kind(

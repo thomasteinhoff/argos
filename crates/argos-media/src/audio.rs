@@ -92,8 +92,8 @@ fn run_capture(
         .map_err(|error| error.to_string())?;
 
     let format = WaveFormat::new(
-        (BYTES_PER_SAMPLE * 8) as usize,
-        (BYTES_PER_SAMPLE * 8) as usize,
+        BYTES_PER_SAMPLE * 8,
+        BYTES_PER_SAMPLE * 8,
         &SampleType::Float,
         SAMPLE_RATE as usize,
         CHANNELS,
@@ -282,8 +282,8 @@ fn run_playback(
         .map_err(|error| error.to_string())?;
 
     let format = WaveFormat::new(
-        (BYTES_PER_SAMPLE * 8) as usize,
-        (BYTES_PER_SAMPLE * 8) as usize,
+        BYTES_PER_SAMPLE * 8,
+        BYTES_PER_SAMPLE * 8,
         &SampleType::Float,
         SAMPLE_RATE as usize,
         CHANNELS,

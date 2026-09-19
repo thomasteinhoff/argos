@@ -148,7 +148,7 @@ impl Lan {
             .filter(|peer| peer.last_seen.elapsed() < PEER_TIMEOUT)
             .cloned()
             .collect();
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.sort_by_cached_key(|peer| peer.name.to_lowercase());
         list
     }
 

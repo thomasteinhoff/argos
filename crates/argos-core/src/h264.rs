@@ -48,15 +48,13 @@ struct StartCode {
 }
 
 fn next_start_code(data: &[u8], mut pos: usize) -> Option<StartCode> {
-    if pos > 0 {
-        pos -= 1;
-    }
+    pos = pos.saturating_sub(1);
     while pos + 3 <= data.len() {
         if data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1 {
             let four_byte = pos > 0 && data[pos - 1] == 0;
             return Some(StartCode {
                 start: if four_byte { pos - 1 } else { pos },
-                end: if four_byte { pos + 3 } else { pos + 3 },
+                end: pos + 3,
             });
         }
         pos += 1;

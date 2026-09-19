@@ -1,4 +1,6 @@
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
@@ -27,16 +29,93 @@ struct Preview {
     height: u32,
 }
 
+enum EncodeMsg {
+    Frame {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Quality {
+        height: Option<u32>,
+    },
+}
+
+#[derive(Default)]
+struct EncodeStats {
+    frames_sent: u64,
+    encode_ms: f32,
+    encode_errors: u64,
+    error: Option<String>,
+}
+
+fn encode_worker(
+    rx: Receiver<EncodeMsg>,
+    sharer: Arc<session::Sharer>,
+    mut encoder: H264Encoder,
+    stats: Arc<Mutex<EncodeStats>>,
+) {
+    let mut timestamp = 0u32;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            EncodeMsg::Quality { height } => {
+                encoder.set_target_height(height);
+                encoder.force_keyframe();
+            }
+            EncodeMsg::Frame {
+                rgba,
+                width,
+                height,
+            } => {
+                let started = Instant::now();
+                match encoder.encode(&rgba, width, height) {
+                    Ok(bitstream) => {
+                        let ms = started.elapsed().as_secs_f32() * 1000.0;
+                        let ts = timestamp;
+                        timestamp = ts.wrapping_add(3000);
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.encode_ms = if stats.frames_sent == 0 {
+                                ms
+                            } else {
+                                stats.encode_ms * 0.8 + ms * 0.2
+                            };
+                        }
+                        match session::block_on(sharer.send_frame(&bitstream, ts)) {
+                            Ok(()) => {
+                                if let Ok(mut stats) = stats.lock() {
+                                    stats.frames_sent += 1;
+                                }
+                            }
+                            Err(error) => {
+                                if let Ok(mut stats) = stats.lock() {
+                                    if stats.error.is_none() {
+                                        stats.error = Some(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut stats) = stats.lock() {
+                            stats.encode_errors += 1;
+                            if stats.error.is_none() {
+                                stats.error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct ShareSession {
     sharer: Arc<session::Sharer>,
     offer_code: Option<String>,
     answer_input: String,
     error: Option<String>,
-    encoder: H264Encoder,
-    frame_timestamp: u32,
-    frames_sent: u64,
-    encode_errors: u64,
-    encode_ms: f32,
+    tx: SyncSender<EncodeMsg>,
+    join: Option<JoinHandle<()>>,
+    stats: Arc<Mutex<EncodeStats>>,
     last_encode: Instant,
     audio_capture: Option<AudioCapture>,
     audio_encoder: Option<OpusAudioEncoder>,
@@ -46,6 +125,7 @@ struct ShareSession {
     lan_peer: Option<String>,
 }
 
+#[derive(Default)]
 struct ViewStats {
     packets: u64,
     bytes: u64,
@@ -63,29 +143,6 @@ struct ViewStats {
     base_seq: Option<u16>,
     highest_seq: Option<u16>,
     lost: u64,
-}
-
-impl Default for ViewStats {
-    fn default() -> Self {
-        Self {
-            packets: 0,
-            bytes: 0,
-            aus: 0,
-            decoded: 0,
-            decode_errors: 0,
-            decode_none: 0,
-            first_width: 0,
-            first_height: 0,
-            first_error: None,
-            audio_packets: 0,
-            audio_decoded: 0,
-            audio_errors: 0,
-            audio_error: None,
-            base_seq: None,
-            highest_seq: None,
-            lost: 0,
-        }
-    }
 }
 
 struct Quality {
@@ -359,8 +416,14 @@ impl ArgosApp {
 
     fn attach_sharer(&mut self, lan_peer: Option<String>) {
         self.share_error = None;
-        if let Some(existing) = self.share.take() {
-            let _ = session::block_on(existing.sharer.close());
+        if let Some(mut existing) = self.share.take() {
+            let sharer = Arc::clone(&existing.sharer);
+            let join = existing.join.take();
+            drop(existing);
+            if let Some(join) = join {
+                let _ = join.join();
+            }
+            session::block_on(sharer.close());
         }
         if self.capture.is_none() {
             if let Err(error) = self.start_capture() {
@@ -392,14 +455,33 @@ impl ArgosApp {
             }
             None => Some(offer),
         };
-        let mut encoder = match H264Encoder::new_at(self.frame_rate as f32) {
+        let encoder_result = H264Encoder::new_at(self.frame_rate as f32).map(|mut encoder| {
+            encoder.set_target_height(self.share_height);
+            encoder
+        });
+        let encoder = match encoder_result {
             Ok(encoder) => encoder,
             Err(error) => {
+                session::block_on(sharer.close());
                 self.share_error = Some(error);
                 return;
             }
         };
-        encoder.set_target_height(self.share_height);
+        let (tx, rx) = sync_channel::<EncodeMsg>(4);
+        let stats = Arc::new(Mutex::new(EncodeStats::default()));
+        let worker_stats = Arc::clone(&stats);
+        let worker_sharer = Arc::clone(&sharer);
+        let join = match thread::Builder::new()
+            .name("argos-encode".to_string())
+            .spawn(move || encode_worker(rx, worker_sharer, encoder, worker_stats))
+        {
+            Ok(join) => join,
+            Err(error) => {
+                session::block_on(sharer.close());
+                self.share_error = Some(error.to_string());
+                return;
+            }
+        };
         let (audio_capture, audio_encoder, audio_error) =
             match (AudioCapture::start(), OpusAudioEncoder::new()) {
                 (Ok(capture), Ok(encoder)) => (Some(capture), Some(encoder), None),
@@ -418,11 +500,9 @@ impl ArgosApp {
             offer_code,
             answer_input: String::new(),
             error: None,
-            encoder,
-            frame_timestamp: 0,
-            frames_sent: 0,
-            encode_errors: 0,
-            encode_ms: 0.0,
+            tx,
+            join: Some(join),
+            stats,
             last_encode: Instant::now(),
             audio_capture,
             audio_encoder,
@@ -448,8 +528,14 @@ impl ArgosApp {
     }
 
     fn stop_live(&mut self) {
-        if let Some(share) = self.share.take() {
-            let _ = session::block_on(share.sharer.close());
+        if let Some(mut share) = self.share.take() {
+            let sharer = Arc::clone(&share.sharer);
+            let join = share.join.take();
+            drop(share);
+            if let Some(join) = join {
+                let _ = join.join();
+            }
+            session::block_on(sharer.close());
         }
         self.live = false;
         if let Some(lan) = &self.lan {
@@ -497,7 +583,7 @@ impl ArgosApp {
             return;
         }
         if let Some(existing) = self.view.take() {
-            let _ = session::block_on(existing.viewer.close());
+            session::block_on(existing.viewer.close());
         }
         let latest = Arc::new(Mutex::new(None));
         let stats = Arc::new(Mutex::new(ViewStats::default()));
@@ -562,7 +648,7 @@ impl ArgosApp {
 
     fn stop_view(&mut self) {
         if let Some(view) = self.view.take() {
-            let _ = session::block_on(view.viewer.close());
+            session::block_on(view.viewer.close());
         }
         self.pending_view = None;
         self.view_error = None;
@@ -780,30 +866,17 @@ impl ArgosApp {
         if let Some(share) = self.share.as_mut() {
             if share.sharer.is_connected() && now.duration_since(share.last_encode) >= interval {
                 share.last_encode = now;
-                let started = Instant::now();
-                match share.encoder.encode(&frame.rgba, frame.width, frame.height) {
-                    Ok(bitstream) => {
-                        let ms = started.elapsed().as_secs_f32() * 1000.0;
-                        share.encode_ms = if share.frames_sent == 0 {
-                            ms
-                        } else {
-                            share.encode_ms * 0.8 + ms * 0.2
-                        };
-                        share.frames_sent += 1;
-                        let timestamp = share.frame_timestamp;
-                        share.frame_timestamp = timestamp.wrapping_add(3000);
-                        let sharer = Arc::clone(&share.sharer);
-                        if let Err(error) =
-                            session::block_on(sharer.send_frame(&bitstream, timestamp))
-                        {
-                            share.error = Some(error);
-                        }
-                    }
-                    Err(error) => {
-                        share.encode_errors += 1;
+                if let Ok(mut stats) = share.stats.lock() {
+                    if let Some(error) = stats.error.take() {
                         share.error = Some(error);
                     }
                 }
+                let msg = EncodeMsg::Frame {
+                    rgba: frame.rgba,
+                    width: frame.width,
+                    height: frame.height,
+                };
+                let _ = share.tx.try_send(msg);
             }
         }
     }
@@ -815,14 +888,11 @@ impl ArgosApp {
         if !share.sharer.is_connected() {
             return;
         }
-        loop {
-            let Some(frame) = share
-                .audio_capture
-                .as_ref()
-                .and_then(AudioCapture::try_frame)
-            else {
-                break;
-            };
+        while let Some(frame) = share
+            .audio_capture
+            .as_ref()
+            .and_then(AudioCapture::try_frame)
+        {
             let Some(encoder) = share.audio_encoder.as_mut() else {
                 break;
             };
@@ -1089,8 +1159,9 @@ impl ArgosApp {
         if share_height != self.share_height {
             self.share_height = share_height;
             if let Some(share) = self.share.as_mut() {
-                share.encoder.set_target_height(share_height);
-                share.encoder.force_keyframe();
+                let _ = share.tx.try_send(EncodeMsg::Quality {
+                    height: share_height,
+                });
             }
         }
 
@@ -1266,12 +1337,16 @@ impl ArgosApp {
                                     }
                                 });
                             }
+                            let (frames_sent, encode_ms, encode_errors) = share
+                                .stats
+                                .lock()
+                                .map(|stats| {
+                                    (stats.frames_sent, stats.encode_ms, stats.encode_errors)
+                                })
+                                .unwrap_or((0, 0.0, 0));
                             ui.label(format!(
                                 "{} frames sent, {:.1} ms/frame, {} encode errors, {} audio frames",
-                                share.frames_sent,
-                                share.encode_ms,
-                                share.encode_errors,
-                                share.audio_frames_sent
+                                frames_sent, encode_ms, encode_errors, share.audio_frames_sent
                             ));
                         }
                         ui.add(

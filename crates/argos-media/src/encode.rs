@@ -52,7 +52,7 @@ impl H264Encoder {
     }
 
     pub fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err("frame dimensions must be even".to_string());
         }
         let src_width = width as usize;

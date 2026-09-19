@@ -89,6 +89,12 @@ impl CaptureSession {
     }
 }
 
+impl Default for CaptureSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn pump(
     recorder: xcap::VideoRecorder,
     frames: Receiver<xcap::Frame>,

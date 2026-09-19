@@ -7,3 +7,4 @@ edition.workspace = true
 eframe.workspace = true
 confy.workspace = true
 serde.workspace = true
+argos-media = { path = "../argos-media" }

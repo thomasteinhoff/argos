@@ -2,3 +2,6 @@
 name = "argos-media"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+xcap = "0.9.8"

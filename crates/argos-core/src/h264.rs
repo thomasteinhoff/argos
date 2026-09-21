@@ -148,6 +148,7 @@ pub struct Depacketizer {
     fragment_type: u8,
     ts: Option<u32>,
     sequence: Option<u16>,
+    synced: bool,
 }
 
 impl Depacketizer {
@@ -178,9 +179,20 @@ impl Depacketizer {
         }
 
         if packet.header.marker && !self.frame.is_empty() {
+            let access_unit = std::mem::take(&mut self.frame);
             self.ts = None;
             self.sequence = None;
-            Some(std::mem::take(&mut self.frame))
+            // Decoding cannot begin until an IDR keyframe arrives: earlier
+            // access units (bare SPS/PPS, or P-frames after a loss) fail in
+            // OpenH264 with "no parameter sets". After a decode error the
+            // caller resets us, which gates re-sync to the next keyframe.
+            if access_unit.iter().any(|nalu| nalu_type(nalu) == 5) {
+                self.synced = true;
+            }
+            if !self.synced {
+                return None;
+            }
+            Some(access_unit)
         } else {
             None
         }
@@ -191,6 +203,7 @@ impl Depacketizer {
         self.fragment.clear();
         self.ts = None;
         self.sequence = None;
+        self.synced = false;
     }
 
     fn push_fragment(&mut self, packet: &Packet) {
@@ -242,5 +255,37 @@ mod tests {
     #[test]
     fn timestamp_interval_guards_against_zero_fps() {
         assert_eq!(timestamp_interval(0), RTP_CLOCK_RATE);
+    }
+
+    #[test]
+    fn depacketizer_gates_on_keyframe() {
+        use super::{Depacketizer, Packetizer};
+        let mut packetizer = Packetizer::new(0x5a5a_77e1, 96, 1200);
+        let idr = [0x65u8, 0x88, 0x84, 0x01, 0x02, 0x03];
+        let p_frame = [0x41u8, 0x9a, 0x01, 0x02, 0x03];
+
+        let mut depacketizer = Depacketizer::new();
+        // P-frames are withheld until the first keyframe arrives.
+        for packet in packetizer.packetize(&p_frame, 3000, true) {
+            assert!(depacketizer.push(&packet).is_none());
+        }
+        // The first keyframe unlocks the decoder.
+        let mut got = None;
+        for packet in packetizer.packetize(&idr, 6000, true) {
+            got = depacketizer.push(&packet);
+        }
+        assert!(got.is_some());
+        // After the keyframe, P-frames pass through normally...
+        let mut got = None;
+        for packet in packetizer.packetize(&p_frame, 9000, true) {
+            got = depacketizer.push(&packet);
+        }
+        assert!(got.is_some());
+        // ...until a reset (e.g. a decode error) makes the receiver wait for
+        // the next keyframe again.
+        depacketizer.reset();
+        for packet in packetizer.packetize(&p_frame, 12_000, true) {
+            assert!(depacketizer.push(&packet).is_none());
+        }
     }
 }

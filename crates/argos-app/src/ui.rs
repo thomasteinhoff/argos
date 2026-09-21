@@ -59,6 +59,7 @@ fn encode_worker(
     // 90_000 / fps (3000 at 30 FPS, 1500 at 60 FPS).
     let timestamp_interval = h264::timestamp_interval(frame_rate);
     let mut timestamp = 0u32;
+    let mut last_keyframe = Instant::now();
     while let Ok(msg) = rx.recv() {
         match msg {
             EncodeMsg::Quality { height } => {
@@ -70,6 +71,12 @@ fn encode_worker(
                 width,
                 height,
             } => {
+                // Force a keyframe periodically so receivers can re-sync after
+                // packet loss without relying on RTCP keyframe requests.
+                if last_keyframe.elapsed() >= Duration::from_secs(2) {
+                    encoder.force_keyframe();
+                    last_keyframe = Instant::now();
+                }
                 let started = Instant::now();
                 match encoder.encode(&rgba, width, height) {
                     Ok(bitstream) => {
@@ -820,6 +827,11 @@ impl ArgosApp {
                     }
                 }
                 Err(error) => {
+                    // The decoder lost sync (e.g. a keyframe was lost): drop
+                    // everything until the next keyframe rather than feeding
+                    // it error-prone frames; the depacketizer's sync gate
+                    // handles that once reset.
+                    pipeline.depacketizer.reset();
                     if let Ok(mut stats) = stats.lock() {
                         if stats.first_error.is_none() {
                             stats.first_error = Some(error);

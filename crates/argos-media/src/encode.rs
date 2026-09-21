@@ -14,10 +14,16 @@ impl H264Encoder {
     }
 
     pub fn new_at(fps: f32) -> Result<Self, String> {
+        // Sane bitrate targets for desktop screen content at the stream
+        // quality (720p by default). 30-60 Mbps is far beyond useful for
+        // screen sharing: it makes the software encoder frame-bound (the fps
+        // collapses) and floods the network with tens of thousands of RTP
+        // packets per second, which drops keyframes on WiFi and desyncs the
+        // receiver's decoder.
         let (fps, bitrate) = if fps >= 45.0 {
-            (60.0, 60_000_000)
+            (60.0, 6_000_000)
         } else {
-            (30.0, 30_000_000)
+            (30.0, 4_000_000)
         };
         let config = EncoderConfig::new()
             .usage_type(UsageType::CameraVideoRealTime)

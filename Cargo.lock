@@ -269,6 +269,7 @@ dependencies = [
  "openh264",
  "opus-rs",
  "wasapi",
+ "windows 0.62.2",
  "xcap",
 ]
 

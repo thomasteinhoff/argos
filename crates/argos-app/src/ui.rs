@@ -916,6 +916,13 @@ impl ArgosApp {
         let Some(share) = self.share.as_mut() else {
             return;
         };
+        if let Some(error) = share
+            .audio_capture
+            .as_ref()
+            .and_then(AudioCapture::try_error)
+        {
+            share.audio_error = Some(error);
+        }
         if !share.sharer.is_connected() {
             return;
         }
@@ -1243,6 +1250,9 @@ impl ArgosApp {
             };
             ui.label(format!("Status: {}", share.sharer.status()));
             ui.label(RichText::new(audio_label).weak());
+            if let Some(error) = &share.audio_error {
+                ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+            }
             if let Some(error) = &share.error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }

@@ -4,7 +4,6 @@ use rtc::rtp::packet::Packet;
 
 const FU_A: u8 = 28;
 
-<<<<<<< HEAD
 /// Video RTP clock rate (Hz) used for H.264 RTP timestamps.
 pub const RTP_CLOCK_RATE: u32 = 90_000;
 
@@ -14,8 +13,6 @@ pub fn timestamp_interval(fps: u32) -> u32 {
     RTP_CLOCK_RATE / fps.max(1)
 }
 
-=======
->>>>>>> origin/main
 pub fn nalu_type(nalu: &[u8]) -> u8 {
     nalu.first().map(|header| header & 0x1f).unwrap_or(0)
 }
@@ -230,7 +227,6 @@ pub fn access_unit_to_annexb(nalus: &[Vec<u8>]) -> Vec<u8> {
     }
     out
 }
-<<<<<<< HEAD
 
 #[cfg(test)]
 mod tests {
@@ -248,5 +244,3 @@ mod tests {
         assert_eq!(timestamp_interval(0), RTP_CLOCK_RATE);
     }
 }
-=======
->>>>>>> origin/main

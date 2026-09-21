@@ -1,14 +1,20 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+<<<<<<< HEAD
 use std::sync::mpsc::{
     channel, sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError,
 };
 use std::sync::{Arc, Mutex};
+=======
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
+>>>>>>> origin/main
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use xcap::Monitor;
 
 const DEFAULT_CAPTURE_INTERVAL_MICROS: u64 = 33_000;
+<<<<<<< HEAD
 /// How long a streak of capture failures may last before the session is
 /// reported as failed. Transient failures (e.g. DXGI access loss when the
 /// desktop composition changes) recover on their own; a streak longer than
@@ -24,6 +30,8 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const INACTIVE_SLEEP: Duration = Duration::from_millis(20);
 const STOP_POLL: Duration = Duration::from_millis(20);
+=======
+>>>>>>> origin/main
 
 #[derive(Clone)]
 pub struct MonitorInfo {
@@ -44,10 +52,13 @@ pub struct CaptureSession {
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     interval: Arc<AtomicU64>,
+<<<<<<< HEAD
     /// Set only when the capture fails fatally (or the capture thread
     /// panics). Recoverable interruptions are retried internally and do not
     /// surface here.
     error: Arc<Mutex<Option<String>>>,
+=======
+>>>>>>> origin/main
     join: Option<JoinHandle<()>>,
 }
 
@@ -59,7 +70,10 @@ impl CaptureSession {
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             interval: Arc::new(AtomicU64::new(DEFAULT_CAPTURE_INTERVAL_MICROS)),
+<<<<<<< HEAD
             error: Arc::new(Mutex::new(None)),
+=======
+>>>>>>> origin/main
             join: None,
         }
     }
@@ -73,12 +87,15 @@ impl CaptureSession {
             .store(interval.as_micros().max(1) as u64, Ordering::Relaxed);
     }
 
+<<<<<<< HEAD
     /// Reason the capture failed fatally, if it did. `None` while the capture
     /// is running or is recovering from a transient interruption.
     pub fn error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|slot| slot.clone())
     }
 
+=======
+>>>>>>> origin/main
     pub fn start(&mut self, source: &MonitorInfo) -> Result<(), String> {
         if self.join.is_some() {
             return Err("capture already running".to_string());
@@ -88,6 +105,7 @@ impl CaptureSession {
         let stop = self.stop.clone();
         let active = self.active.clone();
         let interval = self.interval.clone();
+<<<<<<< HEAD
         let error = Arc::new(Mutex::new(None));
         self.error = Arc::clone(&error);
         let error_reporter = Arc::clone(&error);
@@ -120,6 +138,24 @@ impl CaptureSession {
                 })
                 .map_err(|error| error.to_string())?,
         );
+=======
+        self.join = Some(thread::spawn(move || {
+            let Ok(monitors) = Monitor::all() else {
+                return;
+            };
+            let Some(monitor) = monitors
+                .into_iter()
+                .find(|candidate| candidate.name().ok().as_deref() == Some(wanted.as_str()))
+            else {
+                return;
+            };
+            let Ok((recorder, frames)) = monitor.video_recorder() else {
+                return;
+            };
+            let _ = recorder.start();
+            pump(recorder, frames, tx, stop, active, interval);
+        }));
+>>>>>>> origin/main
         self.rx = rx;
         Ok(())
     }
@@ -139,6 +175,7 @@ impl Default for CaptureSession {
     }
 }
 
+<<<<<<< HEAD
 /// (Re)connect the video recorder for the given monitor name. This is the
 /// documented recovery from DXGI "access lost" failures: drop the old
 /// duplication and create a fresh one for the same output.
@@ -185,6 +222,21 @@ fn pump_once(
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => break true,
             }
+=======
+fn pump(
+    recorder: xcap::VideoRecorder,
+    frames: Receiver<xcap::Frame>,
+    tx: SyncSender<Frame>,
+    stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    interval: Arc<AtomicU64>,
+) {
+    let mut last = Instant::now() - Duration::from_secs(1);
+    while !stop.load(Ordering::Relaxed) {
+        if !active.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(20));
+            last = Instant::now();
+>>>>>>> origin/main
             continue;
         }
         let target = Duration::from_micros(interval.load(Ordering::Relaxed).max(1));
@@ -193,7 +245,11 @@ fn pump_once(
             thread::sleep(target - elapsed);
         }
         if stop.load(Ordering::Relaxed) {
+<<<<<<< HEAD
             break false;
+=======
+            break;
+>>>>>>> origin/main
         }
         match frames.recv_timeout(target) {
             Ok(frame) => {
@@ -206,6 +262,7 @@ fn pump_once(
                 match tx.try_send(outgoing) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+<<<<<<< HEAD
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break false,
                 }
             }
@@ -308,6 +365,16 @@ fn set_capture_error(error: &Arc<Mutex<Option<String>>>, message: String) {
             *slot = Some(message);
         }
     }
+=======
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = recorder.stop();
+>>>>>>> origin/main
 }
 
 impl Drop for CaptureSession {

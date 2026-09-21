@@ -53,11 +53,15 @@ fn encode_worker(
     sharer: Arc<session::Sharer>,
     mut encoder: H264Encoder,
     stats: Arc<Mutex<EncodeStats>>,
+<<<<<<< HEAD
     frame_rate: u32,
 ) {
     // Video RTP uses a 90 kHz clock: each frame advances the RTP timestamp by
     // 90_000 / fps (3000 at 30 FPS, 1500 at 60 FPS).
     let timestamp_interval = h264::timestamp_interval(frame_rate);
+=======
+) {
+>>>>>>> origin/main
     let mut timestamp = 0u32;
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -75,7 +79,11 @@ fn encode_worker(
                     Ok(bitstream) => {
                         let ms = started.elapsed().as_secs_f32() * 1000.0;
                         let ts = timestamp;
+<<<<<<< HEAD
                         timestamp = ts.wrapping_add(timestamp_interval);
+=======
+                        timestamp = ts.wrapping_add(3000);
+>>>>>>> origin/main
                         if let Ok(mut stats) = stats.lock() {
                             stats.encode_ms = if stats.frames_sent == 0 {
                                 ms
@@ -475,10 +483,16 @@ impl ArgosApp {
         let stats = Arc::new(Mutex::new(EncodeStats::default()));
         let worker_stats = Arc::clone(&stats);
         let worker_sharer = Arc::clone(&sharer);
+<<<<<<< HEAD
         let worker_fps = self.frame_rate;
         let join = match thread::Builder::new()
             .name("argos-encode".to_string())
             .spawn(move || encode_worker(rx, worker_sharer, encoder, worker_stats, worker_fps))
+=======
+        let join = match thread::Builder::new()
+            .name("argos-encode".to_string())
+            .spawn(move || encode_worker(rx, worker_sharer, encoder, worker_stats))
+>>>>>>> origin/main
         {
             Ok(join) => join,
             Err(error) => {
@@ -840,6 +854,7 @@ impl ArgosApp {
         if !self.preview_active && !encode_due {
             return;
         }
+<<<<<<< HEAD
         // Surface capture-side failures (recoverable retries are kept internal
         // to the capture thread) even when no frame is pending right now.
         let capture_error = self.capture.as_ref().and_then(CaptureSession::error);
@@ -855,6 +870,9 @@ impl ArgosApp {
             }
         }
         let Some(frame) = frame else {
+=======
+        let Some(frame) = self.capture.as_ref().and_then(CaptureSession::latest) else {
+>>>>>>> origin/main
             return;
         };
         if self.preview_active {

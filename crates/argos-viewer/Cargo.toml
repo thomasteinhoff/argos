@@ -1,0 +1,4 @@
+[package]
+name = "argos-viewer"
+version.workspace = true
+edition.workspace = true

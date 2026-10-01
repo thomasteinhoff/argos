@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+argos-core = { path = "../argos-core" }
 xcap = "0.9.8"
 openh264 = "0.9.8"
 wasapi = "0.24.0"

@@ -26,6 +26,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{default_runtime, Runtime};
 
 use crate::h264::{self, Packetizer};
+use crate::metrics::{SenderMetrics, StageTimer};
 use crate::signal;
 
 pub const VIDEO_PT: u8 = 96;
@@ -283,9 +284,15 @@ impl Sharer {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn send_frame(&self, bitstream: &[u8], timestamp: u32) -> Result<(), String> {
-        let nalus: Vec<&[u8]> = h264::AnnexBIter::new(bitstream).collect();
+    pub async fn send_frame(
+        &self,
+        bitstream: &[u8],
+        timestamp: u32,
+        metrics: &SenderMetrics,
+    ) -> Result<(), String> {
         let packets = {
+            let _packetize = StageTimer::new(&metrics.packetize);
+            let nalus: Vec<&[u8]> = h264::AnnexBIter::new(bitstream).collect();
             let mut packetizer = self
                 .packetizer
                 .lock()
@@ -299,16 +306,24 @@ impl Sharer {
                 })
                 .collect::<Vec<Packet>>()
         };
+        let _write = StageTimer::new(&metrics.write);
         for packet in packets {
-            self.track
-                .write_rtp(packet)
-                .await
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = self.track.write_rtp(packet).await {
+                metrics.write_errors.incr();
+                return Err(error.to_string());
+            }
         }
         Ok(())
     }
 
-    pub async fn send_audio(&self, opus: &[u8], timestamp: u32) -> Result<(), String> {
+    pub async fn send_audio(
+        &self,
+        opus: &[u8],
+        timestamp: u32,
+        metrics: &SenderMetrics,
+    ) -> Result<(), String> {
+        metrics.audio_frames.incr();
+        metrics.audio_bytes.add(opus.len() as u64);
         let packets = {
             let mut packetizer = self
                 .audio_packetizer
@@ -317,10 +332,10 @@ impl Sharer {
             packetizer.packetize(opus, timestamp, true)
         };
         for packet in packets {
-            self.audio_track
-                .write_rtp(packet)
-                .await
-                .map_err(|error| error.to_string())?;
+            if let Err(error) = self.audio_track.write_rtp(packet).await {
+                metrics.audio_errors.incr();
+                return Err(error.to_string());
+            }
         }
         Ok(())
     }

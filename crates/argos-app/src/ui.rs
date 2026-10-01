@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics, StageTimer};
 use argos_core::{h264, lan, session, Packet};
 use argos_media::audio::{
     AudioCapture, AudioPlayback, OpusAudioDecoder, OpusAudioEncoder, FRAME_SAMPLES,
@@ -14,6 +15,10 @@ use argos_media::decode::{DecodedFrame, H264Decoder};
 use argos_media::encode::H264Encoder;
 
 use crate::config::{self, AppConfig};
+
+/// How often the sharer forces an intra frame so a receiver that lost a packet
+/// can resynchronise without an RTCP keyframe request.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, PartialEq, Eq)]
 enum Screen {
@@ -53,6 +58,7 @@ fn encode_worker(
     sharer: Arc<session::Sharer>,
     mut encoder: H264Encoder,
     stats: Arc<Mutex<EncodeStats>>,
+    metrics: Arc<SenderMetrics>,
     frame_rate: u32,
 ) {
     // Video RTP uses a 90 kHz clock: each frame advances the RTP timestamp by
@@ -73,27 +79,47 @@ fn encode_worker(
             } => {
                 // Force a keyframe periodically so receivers can re-sync after
                 // packet loss without relying on RTCP keyframe requests.
-                if last_keyframe.elapsed() >= Duration::from_secs(2) {
+                let mut pending_keyframe = false;
+                if last_keyframe.elapsed() >= KEYFRAME_INTERVAL {
                     encoder.force_keyframe();
                     last_keyframe = Instant::now();
+                    pending_keyframe = true;
                 }
-                let started = Instant::now();
-                match encoder.encode(&rgba, width, height) {
+                // Conversion and encoding are timed separately: they have very
+                // different costs and very different fixes. The conversion is
+                // our own scalar code and, when it scales, does five integer
+                // divisions per output pixel; the encode is openh264.
+                let converted = {
+                    let _convert = StageTimer::new(&metrics.convert);
+                    encoder.convert(&rgba, width, height)
+                };
+                let bitstream = match converted {
+                    Ok(dims) => {
+                        let _encode = StageTimer::new(&metrics.encode);
+                        encoder.encode_planes(dims.0, dims.1)
+                    }
+                    Err(error) => Err(error),
+                };
+                match bitstream {
                     Ok(bitstream) => {
-                        let ms = started.elapsed().as_secs_f32() * 1000.0;
                         let ts = timestamp;
                         timestamp = ts.wrapping_add(timestamp_interval);
-                        if let Ok(mut stats) = stats.lock() {
-                            stats.encode_ms = if stats.frames_sent == 0 {
-                                ms
-                            } else {
-                                stats.encode_ms * 0.8 + ms * 0.2
-                            };
+                        let size = bitstream.len() as u64;
+                        metrics.encoded_bytes.add(size);
+                        if pending_keyframe {
+                            // The frame following a forced intra is an IDR, so
+                            // this is the size of the burst that goes out on the
+                            // wire. If this number is large, it is a plausible
+                            // cause of the loss it is meant to help recover from.
+                            metrics.keyframes.incr();
+                            metrics.last_keyframe_bytes.set(size);
                         }
-                        match session::block_on(sharer.send_frame(&bitstream, ts)) {
+                        match session::block_on(sharer.send_frame(&bitstream, ts, &metrics)) {
                             Ok(()) => {
+                                metrics.encoded.record();
                                 if let Ok(mut stats) = stats.lock() {
                                     stats.frames_sent += 1;
+                                    stats.encode_ms = metrics.encode.mean_ms();
                                 }
                             }
                             Err(error) => {
@@ -106,6 +132,7 @@ fn encode_worker(
                         }
                     }
                     Err(error) => {
+                        metrics.encode_errors.incr();
                         if let Ok(mut stats) = stats.lock() {
                             stats.encode_errors += 1;
                             if stats.error.is_none() {
@@ -127,6 +154,8 @@ struct ShareSession {
     tx: SyncSender<EncodeMsg>,
     join: Option<JoinHandle<()>>,
     stats: Arc<Mutex<EncodeStats>>,
+    /// Stage timings and drop counts shared with the capture thread.
+    metrics: Arc<SenderMetrics>,
     last_encode: Instant,
     audio_capture: Option<AudioCapture>,
     audio_encoder: Option<OpusAudioEncoder>,
@@ -193,6 +222,9 @@ struct ViewSession {
     error: Option<String>,
     latest: Arc<Mutex<Option<DecodedFrame>>>,
     stats: Arc<Mutex<ViewStats>>,
+    /// Lock-free counters and stage timings for this receive session, shared
+    /// with the transport's packet callback.
+    metrics: Arc<ReceiverMetrics>,
     texture: Option<Preview>,
     audio_playback: Option<Arc<AudioPlayback>>,
     audio_error: Option<String>,
@@ -207,6 +239,14 @@ pub struct ArgosApp {
     config: AppConfig,
     screen: Screen,
     show_settings: bool,
+    /// Always-on-top pipeline readout, toggled with Ctrl+D. Exists because the
+    /// interesting numbers (stage means, peak stalls, drop rates) are the ones
+    /// that explain a freeze, and they have to be readable *while* it freezes.
+    show_metrics: bool,
+    /// Start of the current measurement window. Reset with the overlay's
+    /// "Reset" button so a mean covers a known span rather than the whole
+    /// session, which is what makes an intermittent stall visible.
+    metrics_since: Instant,
     name_input: String,
     code_input: String,
     monitors: Vec<MonitorInfo>,
@@ -266,6 +306,8 @@ impl ArgosApp {
             config,
             screen: Screen::Home,
             show_settings: false,
+            show_metrics: false,
+            metrics_since: Instant::now(),
         }
     }
 
@@ -483,10 +525,23 @@ impl ArgosApp {
         let worker_stats = Arc::clone(&stats);
         let worker_sharer = Arc::clone(&sharer);
         let worker_fps = self.frame_rate;
+        let worker_metrics = self
+            .capture
+            .as_ref()
+            .map(|capture| Arc::clone(capture.metrics()))
+            .unwrap_or_default();
         let join = match thread::Builder::new()
             .name("argos-encode".to_string())
-            .spawn(move || encode_worker(rx, worker_sharer, encoder, worker_stats, worker_fps))
-        {
+            .spawn(move || {
+                encode_worker(
+                    rx,
+                    worker_sharer,
+                    encoder,
+                    worker_stats,
+                    worker_metrics,
+                    worker_fps,
+                )
+            }) {
             Ok(join) => join,
             Err(error) => {
                 session::block_on(sharer.close());
@@ -515,6 +570,11 @@ impl ArgosApp {
             tx,
             join: Some(join),
             stats,
+            metrics: self
+                .capture
+                .as_ref()
+                .map(|capture| Arc::clone(capture.metrics()))
+                .unwrap_or_default(),
             last_encode: Instant::now(),
             audio_capture,
             audio_encoder,
@@ -599,6 +659,7 @@ impl ArgosApp {
         }
         let latest = Arc::new(Mutex::new(None));
         let stats = Arc::new(Mutex::new(ViewStats::default()));
+        let metrics = Arc::new(ReceiverMetrics::default());
         let (audio_playback, audio_error) = match AudioPlayback::start(1.0) {
             Ok(playback) => (Some(Arc::new(playback)), None),
             Err(error) => (None, Some(error)),
@@ -606,6 +667,7 @@ impl ArgosApp {
         let callback: Arc<dyn Fn(&Packet) + Send + Sync> = Arc::new(Self::receive_callback(
             Arc::clone(&latest),
             Arc::clone(&stats),
+            Arc::clone(&metrics),
             audio_playback.clone(),
         ));
         let udp = vec!["0.0.0.0:0".to_string()];
@@ -639,6 +701,7 @@ impl ArgosApp {
             error: None,
             latest,
             stats,
+            metrics,
             texture: None,
             audio_playback,
             audio_error,
@@ -723,6 +786,7 @@ impl ArgosApp {
     fn receive_callback(
         latest: Arc<Mutex<Option<DecodedFrame>>>,
         stats: Arc<Mutex<ViewStats>>,
+        metrics: Arc<ReceiverMetrics>,
         audio_playback: Option<Arc<AudioPlayback>>,
     ) -> impl Fn(&Packet) + Send + Sync {
         struct Pipeline {
@@ -736,13 +800,20 @@ impl ArgosApp {
             audio_decoder: OpusAudioDecoder::new().ok(),
         }));
         move |packet: &Packet| {
-            {
-                let Ok(mut stats) = stats.lock() else {
-                    return;
-                };
-                stats.packets += 1;
-            }
+            // Total time inside the callback. If this mean approaches the packet
+            // arrival interval, the callback is the bottleneck and the receiver
+            // cannot keep up no matter how much spare CPU the decoder has.
+            let _receive = StageTimer::new(&metrics.receive);
+            // Counters are atomics, not the `stats` mutex. At 500+ video packets
+            // a second this callback was taking that lock three or four times
+            // per packet, and the UI thread reads it every frame; the contention
+            // was itself a source of jitter. `ViewStats` still records the
+            // session-long numbers the existing panels show.
+            metrics.packets.incr();
+            metrics.bytes.add(packet.payload.len() as u64);
             if packet.header.payload_type == session::AUDIO_PT {
+                metrics.audio_packets.incr();
+                metrics.audio_bytes.add(packet.payload.len() as u64);
                 if let Ok(mut stats) = stats.lock() {
                     stats.audio_packets += 1;
                 }
@@ -758,11 +829,13 @@ impl ArgosApp {
                 match decoder.decode(&packet.payload) {
                     Ok(samples) => {
                         playback.push(samples);
+                        metrics.audio_decoded.record();
                         if let Ok(mut stats) = stats.lock() {
                             stats.audio_decoded += 1;
                         }
                     }
                     Err(error) => {
+                        metrics.audio_errors.incr();
                         if let Ok(mut stats) = stats.lock() {
                             if stats.audio_error.is_none() {
                                 stats.audio_error = Some(error);
@@ -777,6 +850,7 @@ impl ArgosApp {
                 let Ok(mut stats) = stats.lock() else {
                     return;
                 };
+                stats.packets += 1;
                 stats.bytes += packet.payload.len() as u64;
                 let seq = packet.header.sequence_number;
                 match stats.highest_seq {
@@ -786,7 +860,13 @@ impl ArgosApp {
                     }
                     Some(highest) => {
                         if seq != highest && seq.wrapping_sub(highest) < 0x8000 {
-                            stats.lost += seq.wrapping_sub(highest) as u64 - 1;
+                            let gap = seq.wrapping_sub(highest) as u64 - 1;
+                            stats.lost += gap;
+                            // A gap here means the packet never arrived, and with
+                            // no retransmission buffer in the transport the frame
+                            // it belonged to is unrecoverable. This is the number
+                            // that explains a stalled viewer.
+                            metrics.sequence_losses.add(gap);
                             stats.highest_seq = Some(seq);
                         }
                     }
@@ -795,20 +875,22 @@ impl ArgosApp {
             let Ok(mut pipeline) = pipeline.lock() else {
                 return;
             };
-            let Some(nalus) = pipeline.depacketizer.push(packet) else {
+            let nalus = {
+                let _depacketize = StageTimer::new(&metrics.depacketize);
+                pipeline.depacketizer.push(packet)
+            };
+            let Some(nalus) = nalus else {
                 return;
             };
-            {
-                let Ok(mut stats) = stats.lock() else {
-                    return;
-                };
+            metrics.access_units.incr();
+            if let Ok(mut stats) = stats.lock() {
                 stats.aus += 1;
             }
             let Some(decoder) = pipeline.decoder.as_mut() else {
                 return;
             };
             let access_unit = h264::access_unit_to_annexb(&nalus);
-            match decoder.decode(&access_unit) {
+            match decoder.decode(&access_unit, &metrics) {
                 Ok(Some(frame)) => {
                     if let Ok(mut stats) = stats.lock() {
                         if stats.first_width == 0 {
@@ -817,11 +899,21 @@ impl ArgosApp {
                         }
                         stats.decoded += 1;
                     }
+                    // Only the newest frame matters. If the UI has not consumed
+                    // the previous one, it is stale by definition, so replacing
+                    // it is the correct behaviour and the drop is counted so the
+                    // present rate can be compared against the decode rate.
                     if let Ok(mut slot) = latest.lock() {
+                        if slot.is_some() {
+                            metrics.presented.drop_frame();
+                        } else {
+                            metrics.presented.record();
+                        }
                         *slot = Some(frame);
                     }
                 }
                 Ok(None) => {
+                    metrics.no_picture.incr();
                     if let Ok(mut stats) = stats.lock() {
                         stats.decode_none += 1;
                     }
@@ -832,6 +924,7 @@ impl ArgosApp {
                     // it error-prone frames; the depacketizer's sync gate
                     // handles that once reset.
                     pipeline.depacketizer.reset();
+                    metrics.decode_errors.incr();
                     if let Ok(mut stats) = stats.lock() {
                         if stats.first_error.is_none() {
                             stats.first_error = Some(error);
@@ -916,16 +1009,28 @@ impl ArgosApp {
         let Some(share) = self.share.as_mut() else {
             return;
         };
-        if let Some(error) = share
+        // The capture worker retries a dead device on its own and only reports the
+        // failures it wants surfaced, so taking them here cannot hide a later
+        // one behind an earlier.
+        if let Some(notice) = share
             .audio_capture
             .as_ref()
             .and_then(AudioCapture::try_error)
         {
-            share.audio_error = Some(error);
+            share.audio_error = Some(notice);
+        }
+        // A worker that has been recovering on its own should stop saying so.
+        if share
+            .audio_capture
+            .as_ref()
+            .is_some_and(AudioCapture::is_alive)
+        {
+            share.audio_error = None;
         }
         if !share.sharer.is_connected() {
             return;
         }
+        let metrics = Arc::clone(&share.metrics);
         while let Some(frame) = share
             .audio_capture
             .as_ref()
@@ -944,7 +1049,7 @@ impl ArgosApp {
             let timestamp = share.audio_timestamp;
             share.audio_timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
             let sharer = Arc::clone(&share.sharer);
-            if let Err(error) = session::block_on(sharer.send_audio(&packet, timestamp)) {
+            if let Err(error) = session::block_on(sharer.send_audio(&packet, timestamp, &metrics)) {
                 share.audio_error = Some(error);
                 break;
             }
@@ -1244,12 +1349,24 @@ impl ArgosApp {
 
         ui.add_space(6.0);
         if let Some(share) = self.share.as_mut() {
+            // Presence of the objects only proves the thread started. The state
+            // handle is what says whether a device is actually being serviced
+            // right now, which is the question the panel is really asking.
             let audio_label = match (&share.audio_capture, &share.audio_encoder) {
-                (Some(_), Some(_)) => "Audio: system sound shared",
+                (Some(capture), Some(_)) if capture.is_alive() => "Audio: system sound shared",
+                (Some(_), Some(_)) => "Audio: reconnecting to the sound device",
                 _ => "Audio: not available",
             };
             ui.label(format!("Status: {}", share.sharer.status()));
-            ui.label(RichText::new(audio_label).weak());
+            if share
+                .audio_capture
+                .as_ref()
+                .is_some_and(AudioCapture::is_alive)
+            {
+                ui.label(RichText::new(audio_label).weak());
+            } else {
+                ui.label(RichText::new(audio_label).color(Color32::from_rgb(220, 200, 120)));
+            }
             if let Some(error) = &share.audio_error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }
@@ -1347,6 +1464,17 @@ impl ArgosApp {
                     ui.label(
                         RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)),
                     );
+                }
+                // Reported here as well as in the Watching panel: a viewer whose
+                // speaker died during setup never reaches that panel, and an
+                // unconnected viewer has no other way to find out.
+                if let Some(view) = self.view.as_ref() {
+                    if let Some(error) = &view.audio_error {
+                        ui.label(
+                            RichText::new(format!("Audio unavailable: {error}"))
+                                .color(Color32::from_rgb(220, 120, 120)),
+                        );
+                    }
                 }
 
                 ui.add_space(8.0);
@@ -1499,6 +1627,21 @@ impl ArgosApp {
                 if ui.button(label).clicked() {
                     playback.set_muted(!muted);
                 }
+                // `Some(playback)` says the thread was started, not that the
+                // speaker is still being driven. A worker stuck in its retry
+                // backoff leaves the session silent with nothing else to show
+                // for it.
+                if !playback.is_alive() {
+                    ui.label(
+                        RichText::new("Audio: reconnecting to the speaker")
+                            .color(Color32::from_rgb(220, 200, 120)),
+                    );
+                }
+                if let Some(error) = playback.try_error() {
+                    view.audio_error = Some(error);
+                } else if playback.is_alive() {
+                    view.audio_error = None;
+                }
             }
             if view.reconnect.is_some() {
                 ui.label(
@@ -1526,7 +1669,13 @@ impl ArgosApp {
                                     .color(Color32::from_rgb(220, 120, 120)),
                             );
                         }
-                        let playing = view.audio_playback.is_some();
+                        // "on" must mean the speaker is actually being driven. Presence of the
+                        // object only means the thread was started, which is how
+                        // a dead audio thread used to look healthy.
+                        let playing = view
+                            .audio_playback
+                            .as_ref()
+                            .is_some_and(|playback| playback.is_alive());
                         ui.label(format!(
                             "Audio ({}): {} packets, {} decoded, {} errors",
                             if playing { "on" } else { "off" },
@@ -1586,6 +1735,299 @@ impl ArgosApp {
         );
     }
 
+    /// One line of the stage-timing table. The peak column is the important
+    /// one: a mean over a long window stays flat through an intermittent stall,
+    /// while a single 400 ms hitch is the whole story.
+    fn stage_row(ui: &mut egui::Ui, name: &str, stage: &Ema) {
+        ui.monospace(format!(
+            "  {name:<11} {:>7.2} ms avg  {:>8.2} ms peak  {:>7} samples",
+            stage.mean_ms(),
+            stage.peak_ms(),
+            stage.samples()
+        ));
+    }
+
+    fn counter_row(ui: &mut egui::Ui, name: &str, value: String) {
+        ui.monospace(format!("  {name:<11} {value}"));
+    }
+
+    /// Rows for one audio device worker.
+    ///
+    /// The drift figure is the one that matters over a long session: a buffer
+    /// that is slowly emptying looks fine right up until every period is
+    /// silence, and the level itself is what says whether that is happening.
+    fn audio_rows(ui: &mut egui::Ui, name: &str, audio: &AudioMetrics, secs: f32) {
+        ui.label(RichText::new(name).strong());
+        Self::stage_row(ui, "  device io", &audio.device_io);
+        Self::stage_row(ui, "  convert", &audio.convert);
+        Self::stage_row(ui, "  codec", &audio.codec);
+        Self::counter_row(
+            ui,
+            "  periods",
+            format!(
+                "{} ({:.1}/s)",
+                audio.periods.get(),
+                audio.periods.get() as f32 / secs
+            ),
+        );
+        Self::counter_row(
+            ui,
+            "  underruns",
+            format!(
+                "{} ({} periods silent)",
+                audio.underruns.dropped(),
+                audio.underruns.dropped()
+            ),
+        );
+        Self::counter_row(
+            ui,
+            "  overruns",
+            format!(
+                "{} ({} periods clipped)",
+                audio.overruns.dropped(),
+                audio.overruns.dropped()
+            ),
+        );
+        Self::counter_row(
+            ui,
+            "  drift",
+            format!(
+                "{} samples ({:.1}/s), {} device errors, {} restarts",
+                audio.drift_samples.get(),
+                audio.drift_samples.get() as f32 / secs,
+                audio.device_errors.get(),
+                audio.restarts.get()
+            ),
+        );
+    }
+
+    /// The always-visible pipeline readout (Ctrl+D).
+    ///
+    /// Deliberately a floating window rather than a section in the sidebar: it
+    /// has to stay readable while the video is stalling, which is exactly when
+    /// the sidebar is not what anyone is looking at.
+    fn metrics_window(&mut self, ctx: &egui::Context) {
+        let mut reset = false;
+        let mut close = false;
+        let window = egui::Window::new("Pipeline")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 40.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!(
+                        "window {:.0} s",
+                        self.metrics_since.elapsed().as_secs_f32()
+                    )));
+                    if ui.small_button("Reset").clicked() {
+                        reset = true;
+                    }
+                    if ui.small_button("Close").clicked() {
+                        close = true;
+                    }
+                });
+                ui.separator();
+
+                if let Some(share) = self.share.as_ref() {
+                    let m = &share.metrics;
+                    let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
+                    if let Some(capture) = share.audio_capture.as_ref() {
+                        Self::audio_rows(ui, "Capture", capture.state().metrics(), secs);
+                    }
+                    ui.label(RichText::new("Sending").strong());
+                    Self::stage_row(ui, "acquire", &m.acquire);
+                    Self::stage_row(ui, "convert", &m.convert);
+                    Self::stage_row(ui, "encode", &m.encode);
+                    Self::stage_row(ui, "packetize", &m.packetize);
+                    Self::stage_row(ui, "write", &m.write);
+                    ui.separator();
+                    Self::counter_row(
+                        ui,
+                        "captured",
+                        format!(
+                            "{} ({:.1} fps, {} dropped)",
+                            m.captured.frames(),
+                            m.captured.frames() as f32 / secs,
+                            m.captured.dropped()
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "encoded",
+                        format!(
+                            "{} ({:.1} fps, {} dropped)",
+                            m.encoded.frames(),
+                            m.encoded.frames() as f32 / secs,
+                            m.encoded.dropped()
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "bitrate",
+                        format!(
+                            "{:.2} Mbps, {} keyframes, last IDR {} KiB",
+                            m.encoded_bytes.get() as f32 * 8.0 / secs / 1_000_000.0,
+                            m.keyframes.get(),
+                            m.last_keyframe_bytes.get() / 1024
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "errors",
+                        format!(
+                            "{} encode, {} video write, {} audio write",
+                            m.encode_errors.get(),
+                            m.write_errors.get(),
+                            m.audio_errors.get()
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "audio out",
+                        format!(
+                            "{} frames ({:.1}/s), {} KiB",
+                            m.audio_frames.get(),
+                            m.audio_frames.get() as f32 / secs,
+                            m.audio_bytes.get() / 1024
+                        ),
+                    );
+                }
+
+                if let Some(view) = self.view.as_ref() {
+                    if self.share.is_some() {
+                        ui.separator();
+                    }
+                    let m = &view.metrics;
+                    let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
+                    if let Some(playback) = view.audio_playback.as_ref() {
+                        Self::audio_rows(ui, "Speaker", playback.state().metrics(), secs);
+                    }
+                    ui.label(RichText::new("Receiving").strong());
+                    Self::stage_row(ui, "callback", &m.receive);
+                    Self::stage_row(ui, "depacketize", &m.depacketize);
+                    Self::stage_row(ui, "decode", &m.decode);
+                    Self::stage_row(ui, "present", &m.present);
+                    ui.separator();
+                    Self::counter_row(
+                        ui,
+                        "packets",
+                        format!(
+                            "{} ({:.0}/s), {} lost, {:.2} Mbps",
+                            m.packets.get(),
+                            m.packets.get() as f32 / secs,
+                            m.sequence_losses.get(),
+                            m.bytes.get() as f32 * 8.0 / secs / 1_000_000.0
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "frames",
+                        format!(
+                            "{} decoded ({:.1} fps), {} replaced before display, {} no-picture",
+                            m.decoded.frames(),
+                            m.decoded.frames() as f32 / secs,
+                            m.presented.dropped(),
+                            m.no_picture.get()
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "errors",
+                        format!(
+                            "{} decode, {} audio",
+                            m.decode_errors.get(),
+                            m.audio_errors.get()
+                        ),
+                    );
+                    Self::counter_row(
+                        ui,
+                        "audio in",
+                        format!(
+                            "{} packets ({:.1}/s), {} decoded, {} dropped by device",
+                            m.audio_packets.get(),
+                            m.audio_packets.get() as f32 / secs,
+                            m.audio_decoded.frames(),
+                            m.audio_decoded.dropped()
+                        ),
+                    );
+                }
+
+                if self.share.is_none() && self.view.is_none() {
+                    ui.label(RichText::new("Idle — nothing is streaming.").weak());
+                }
+            });
+        if window.is_none() {
+            self.show_metrics = false;
+        }
+        if close {
+            self.show_metrics = false;
+        }
+        if reset {
+            self.metrics_since = Instant::now();
+            if let Some(metrics) = self.share.as_ref().map(|share| &share.metrics) {
+                Self::reset_sender(metrics);
+            }
+            if let Some(metrics) = self.view.as_ref().map(|view| &view.metrics) {
+                Self::reset_receiver(metrics);
+            }
+        }
+    }
+
+    fn reset_sender(metrics: &SenderMetrics) {
+        for stage in [
+            &metrics.acquire,
+            &metrics.readback,
+            &metrics.convert,
+            &metrics.encode,
+            &metrics.packetize,
+            &metrics.write,
+        ] {
+            stage.reset();
+        }
+        for frames in [&metrics.captured, &metrics.queued, &metrics.encoded] {
+            frames.reset();
+        }
+        for counter in [
+            &metrics.encoded_bytes,
+            &metrics.last_keyframe_bytes,
+            &metrics.keyframes,
+            &metrics.encode_errors,
+            &metrics.write_errors,
+            &metrics.audio_frames,
+            &metrics.audio_bytes,
+            &metrics.audio_errors,
+        ] {
+            counter.reset();
+        }
+    }
+
+    fn reset_receiver(metrics: &ReceiverMetrics) {
+        for stage in [
+            &metrics.depacketize,
+            &metrics.decode,
+            &metrics.present,
+            &metrics.receive,
+        ] {
+            stage.reset();
+        }
+        for frames in [&metrics.audio_decoded, &metrics.decoded, &metrics.presented] {
+            frames.reset();
+        }
+        for counter in [
+            &metrics.packets,
+            &metrics.bytes,
+            &metrics.audio_bytes,
+            &metrics.audio_packets,
+            &metrics.audio_errors,
+            &metrics.sequence_losses,
+            &metrics.access_units,
+            &metrics.no_picture,
+            &metrics.decode_errors,
+        ] {
+            counter.reset();
+        }
+    }
+
     fn content(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
@@ -1621,6 +2063,9 @@ impl ArgosApp {
 
 impl eframe::App for ArgosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input_mut(|input| input.key_pressed(egui::Key::D) && input.modifiers.ctrl) {
+            self.show_metrics = !self.show_metrics;
+        }
         ctx.set_visuals(egui::Visuals::dark());
         self.poll_lan_events();
         self.top_bar(ctx);
@@ -1649,6 +2094,13 @@ impl eframe::App for ArgosApp {
             });
         }
         self.content(ctx);
+        if self.show_metrics {
+            // The overlay is the only thing that redraws while nothing else
+            // would, so a stall that has already stopped the pipeline still
+            // refreshes the numbers that explain it.
+            self.metrics_window(ctx);
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if self.lan.is_some() && self.capture.is_none() && self.view.is_none() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }

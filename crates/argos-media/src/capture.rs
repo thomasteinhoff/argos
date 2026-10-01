@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use argos_core::metrics::SenderMetrics;
 use xcap::Monitor;
 
 const DEFAULT_CAPTURE_INTERVAL_MICROS: u64 = 33_000;
@@ -48,6 +49,9 @@ pub struct CaptureSession {
     /// panics). Recoverable interruptions are retried internally and do not
     /// surface here.
     error: Arc<Mutex<Option<String>>>,
+    /// Shared with the capture thread so the UI can read stage timings and drop
+    /// counts without touching the frame channel.
+    metrics: Arc<SenderMetrics>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -60,8 +64,14 @@ impl CaptureSession {
             active: Arc::new(AtomicBool::new(true)),
             interval: Arc::new(AtomicU64::new(DEFAULT_CAPTURE_INTERVAL_MICROS)),
             error: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(SenderMetrics::default()),
             join: None,
         }
+    }
+
+    /// Stage timings and drop counters for this session.
+    pub fn metrics(&self) -> &Arc<SenderMetrics> {
+        &self.metrics
     }
 
     pub fn set_active(&self, active: bool) {
@@ -92,12 +102,13 @@ impl CaptureSession {
         self.error = Arc::clone(&error);
         let error_reporter = Arc::clone(&error);
         let stop_reporter = Arc::clone(&stop);
+        let metrics = Arc::clone(&self.metrics);
         self.join = Some(
             thread::Builder::new()
                 .name("argos-capture".to_string())
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pump(wanted, tx, stop, active, interval, error)
+                        pump(wanted, tx, stop, active, interval, error, metrics)
                     }));
                     if let Err(payload) = outcome {
                         // A panicking capture thread used to die silently (the
@@ -169,6 +180,7 @@ fn pump_once(
     stop: &Arc<AtomicBool>,
     active: &Arc<AtomicBool>,
     interval: &Arc<AtomicU64>,
+    metrics: &SenderMetrics,
 ) -> bool {
     let mut last = Instant::now() - Duration::from_secs(1);
     let died = loop {
@@ -195,8 +207,15 @@ fn pump_once(
         if stop.load(Ordering::Relaxed) {
             break false;
         }
+        // `AcquireNextFrame` runs inside the backend's own thread and includes
+        // its full GPU readback, so this window covers both the wait for a frame
+        // and the readback itself. It is the number that reveals whether
+        // capture is starved (sitting near the interval) or over-producing
+        // (busy-waiting on a zero-capacity handoff).
+        let waiting = Instant::now();
         match frames.recv_timeout(target) {
             Ok(frame) => {
+                metrics.acquire.record(waiting.elapsed());
                 last = Instant::now();
                 let outgoing = Frame {
                     width: frame.width,
@@ -204,12 +223,17 @@ fn pump_once(
                     rgba: frame.raw,
                 };
                 match tx.try_send(outgoing) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                    Ok(()) => metrics.captured.record(),
+                    // The consumer (UI preview + encode queue) did not take the
+                    // last frame in time. This is the earliest signal that the
+                    // pipeline downstream of capture is too slow, and it is the
+                    // one that matters: a rising drop rate here means frames are
+                    // being thrown away before they are ever encoded.
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => metrics.captured.drop_frame(),
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break false,
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => metrics.acquire.record(waiting.elapsed()),
             Err(RecvTimeoutError::Disconnected) => break true,
         }
     };
@@ -229,6 +253,7 @@ fn pump(
     active: Arc<AtomicBool>,
     interval: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
+    metrics: Arc<SenderMetrics>,
 ) {
     let mut failed_since: Option<Instant> = None;
     let mut connected_at: Option<Instant> = None;
@@ -253,7 +278,7 @@ fn pump(
         };
         connected_at = Some(Instant::now());
         backoff = RETRY_BACKOFF;
-        let recorder_died = pump_once(recorder, frames, &tx, &stop, &active, &interval);
+        let recorder_died = pump_once(recorder, frames, &tx, &stop, &active, &interval, &metrics);
         if stop.load(Ordering::Relaxed) || !recorder_died {
             // Stopped, or the session was torn down by the UI. Not a failure.
             return;

@@ -58,6 +58,23 @@ impl H264Encoder {
     }
 
     pub fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let (width, height) = self.convert(rgba, width, height)?;
+        self.encode_planes(width, height)
+    }
+
+    /// Converts an RGBA frame into the encoder's I420 planes and returns the
+    /// dimensions actually encoded.
+    ///
+    /// Split out from [`Self::encode`] so the colour conversion can be timed
+    /// separately from the H.264 encode. These are very different costs with
+    /// very different fixes: the conversion is our own scalar code, and when it
+    /// needs to scale it does five integer divisions per output pixel.
+    pub fn convert(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(usize, usize), String> {
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err("frame dimensions must be even".to_string());
         }
@@ -77,7 +94,11 @@ impl H264Encoder {
         } else {
             rgba_to_i420_scaled(rgba, src_width, src_height, width, height, &mut self.planes);
         }
+        Ok((width, height))
+    }
 
+    /// Encodes the I420 planes produced by the last [`Self::convert`] call.
+    pub fn encode_planes(&mut self, width: usize, height: usize) -> Result<Vec<u8>, String> {
         let y_len = width * height;
         let uv_len = (width / 2) * (height / 2);
         let yuv = YUVSlices::new(

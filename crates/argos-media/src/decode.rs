@@ -1,3 +1,4 @@
+use argos_core::metrics::{ReceiverMetrics, StageTimer};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use openh264::Error;
@@ -18,21 +19,37 @@ impl H264Decoder {
         Ok(Self { decoder })
     }
 
-    pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, String> {
-        match self.decoder.decode(access_unit) {
-            Ok(Some(frame)) => {
-                let (width, height) = frame.dimensions();
-                let mut rgba = vec![0u8; width * height * 4];
-                frame.write_rgba8(&mut rgba);
-                Ok(Some(DecodedFrame {
-                    rgba,
-                    width: width as u32,
-                    height: height as u32,
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(error) => Err(decode_error_message(&error)),
+    pub fn decode(
+        &mut self,
+        access_unit: &[u8],
+        metrics: &ReceiverMetrics,
+    ) -> Result<Option<DecodedFrame>, String> {
+        // The H.264 decode and the YUV-to-RGBA expansion are timed separately.
+        // `write_rgba8` touches all width*height*4 output bytes, so at 1080p it
+        // costs about as much as the decode itself, and allocating that buffer
+        // per frame is a third cost hiding between them. Different fixes need
+        // different numbers, so they are measured apart.
+        let decoded = {
+            let _decode = StageTimer::new(&metrics.decode);
+            self.decoder
+                .decode(access_unit)
+                .map_err(|error| decode_error_message(&error))?
+        };
+        let Some(frame) = decoded else {
+            return Ok(None);
+        };
+        let (width, height) = frame.dimensions();
+        let mut rgba = vec![0u8; width * height * 4];
+        {
+            let _present = StageTimer::new(&metrics.present);
+            frame.write_rgba8(&mut rgba);
         }
+        metrics.decoded.record();
+        Ok(Some(DecodedFrame {
+            rgba,
+            width: width as u32,
+            height: height as u32,
+        }))
     }
 }
 

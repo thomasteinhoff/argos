@@ -9,6 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 
+#[cfg(test)]
+mod tests;
+
 pub const DISCOVERY_PORT: u16 = 45892;
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const PEER_TIMEOUT: Duration = Duration::from_secs(8);
@@ -22,10 +25,37 @@ pub struct LanPeer {
     pub last_seen: Instant,
 }
 
+#[derive(Debug)]
 pub enum LanEvent {
-    Request { id: String, name: String },
-    Offer { id: String, sdp: String },
-    Answer { id: String, sdp: String },
+    Request {
+        id: String,
+        name: String,
+    },
+    Offer {
+        id: String,
+        sdp: String,
+    },
+    Answer {
+        id: String,
+        sdp: String,
+    },
+    /// The viewer lost packets and needs a fresh intra frame.
+    ///
+    /// The rtc transport offers no way to ask for this: both codecs negotiate
+    /// an empty `rtcp_feedback`, the event handler has no RTCP callback, and
+    /// the RTP sender has no retransmission buffer. The app's own LAN channel
+    /// is the only path that works, and on a mostly-LAN session it is the path
+    /// with the least latency anyway.
+    Keyframe {
+        id: String,
+    },
+    /// The viewer's measurement of the link, so the sharer can adjust quality.
+    /// It cannot see its own link; this is the only evidence it gets.
+    Report {
+        id: String,
+        loss: f32,
+        fps: f32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,6 +72,12 @@ struct Message {
     sharing: bool,
     #[serde(default)]
     sdp: String,
+    /// Link loss as a percentage, in the `report` message.
+    #[serde(default)]
+    loss: f32,
+    /// Decoded frames per second, in the `report` message.
+    #[serde(default)]
+    fps: f32,
 }
 
 pub struct Lan {
@@ -179,6 +215,8 @@ impl Lan {
             port: self.signal_port,
             sharing: false,
             sdp: String::new(),
+            loss: 0.0,
+            fps: 0.0,
         }
     }
 
@@ -197,6 +235,24 @@ impl Lan {
     pub fn send_answer(&self, id: &str, sdp: String) {
         let mut message = self.message("answer", id);
         message.sdp = sdp;
+        self.send_to_peer(id, message);
+    }
+
+    /// Asks a sharer for an immediate intra frame.
+    ///
+    /// Best-effort. UDP, and the request is only useful while the sharer is
+    /// already connected to the same peer, so a lost message costs at most one
+    /// `KEYFRAME_INTERVAL` of waiting.
+    pub fn send_keyframe(&self, id: &str) {
+        let message = self.message("keyframe", id);
+        self.send_to_peer(id, message);
+    }
+
+    /// Reports this end's view of the link to a sharer.
+    pub fn send_report(&self, id: &str, loss: f32, fps: f32) {
+        let mut message = self.message("report", id);
+        message.loss = loss;
+        message.fps = fps;
         self.send_to_peer(id, message);
     }
 }
@@ -309,6 +365,8 @@ fn discovery_loop(
                 port: signal_port,
                 sharing: sharing.load(Ordering::Relaxed),
                 sdp: String::new(),
+                loss: 0.0,
+                fps: 0.0,
             };
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
@@ -357,6 +415,48 @@ fn discovery_loop(
     }
 }
 
+/// Maps a decoded datagram to the event the app reacts to.
+///
+/// Split out from [`signal_loop`] because the string-to-event mapping is the
+/// whole contract between two machines and nothing else in the type system
+/// holds it together: rename a kind on the sending side and the sharer goes
+/// quiet with no error anywhere. The `report` arm carries a validation rule
+/// that only exists because of that same distance — it is not obviously
+/// necessary at the call site, so it needs a test to stay.
+fn dispatch(message: Message) -> Option<LanEvent> {
+    match message.kind.as_str() {
+        "request" => Some(LanEvent::Request {
+            id: message.id,
+            name: message.name,
+        }),
+        "offer" => Some(LanEvent::Offer {
+            id: message.id,
+            sdp: message.sdp,
+        }),
+        "answer" => Some(LanEvent::Answer {
+            id: message.id,
+            sdp: message.sdp,
+        }),
+        "keyframe" => Some(LanEvent::Keyframe { id: message.id }),
+        "report" => {
+            // A datagram whose measurements are absent rather than zero
+            // deserialises to the defaults, giving "no loss, no frames" — a
+            // fabricated healthy link that would walk the sharer's ladder up on
+            // evidence nobody sent. Non-finite values never get this far: they
+            // serialise as `null` and fail to parse.
+            if !message.loss.is_finite() || !message.fps.is_finite() {
+                return None;
+            }
+            Some(LanEvent::Report {
+                id: message.id,
+                loss: message.loss.clamp(0.0, 100.0),
+                fps: message.fps.clamp(0.0, 1000.0),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn signal_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
@@ -376,26 +476,8 @@ fn signal_loop(
                 if message.id == id || message.to != id {
                     continue;
                 }
-                match message.kind.as_str() {
-                    "request" => {
-                        let _ = events.send(LanEvent::Request {
-                            id: message.id,
-                            name: message.name,
-                        });
-                    }
-                    "offer" => {
-                        let _ = events.send(LanEvent::Offer {
-                            id: message.id,
-                            sdp: message.sdp,
-                        });
-                    }
-                    "answer" => {
-                        let _ = events.send(LanEvent::Answer {
-                            id: message.id,
-                            sdp: message.sdp,
-                        });
-                    }
-                    _ => {}
+                if let Some(event) = dispatch(message) {
+                    let _ = events.send(event);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

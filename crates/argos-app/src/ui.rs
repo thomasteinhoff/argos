@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -6,6 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics, StageTimer};
+use argos_core::quality::{Controller as QualityController, Decision, Report};
 use argos_core::{h264, lan, session, Packet};
 use argos_media::audio::{
     AudioCapture, AudioPlayback, OpusAudioDecoder, OpusAudioEncoder, FRAME_SAMPLES,
@@ -16,9 +18,41 @@ use argos_media::encode::H264Encoder;
 
 use crate::config::{self, AppConfig};
 
-/// How often the sharer forces an intra frame so a receiver that lost a packet
-/// can resynchronise without an RTCP keyframe request.
-const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+/// Fallback interval for periodic intra frames.
+///
+/// This used to be 2 s and was the sharer's *only* recovery mechanism, because
+/// the rtc transport offers no RTCP feedback path (see `session.rs`). It is now
+/// a backstop behind on-demand requests over the LAN channel: every keyframe is
+/// a burst on a Radmin tunnel, and a burst is what causes loss in the first
+/// place. `KEYFRAME_REQUEST_INTERVAL` is the same quantity seen from the other
+/// side.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Floor between keyframes forced on a viewer's request.
+///
+/// A keyframe costs a full-frame burst. Honouring every request from a viewer
+/// on a bad link would turn a recovery mechanism into a denial of service, so
+/// this rate-limits a peer regardless of how often it asks.
+const KEYFRAME_REQUEST_FLOOR: Duration = Duration::from_millis(500);
+
+/// How often the viewer may ask for a keyframe.
+///
+/// Two seconds is comfortably inside the `KEYFRAME_INTERVAL` fallback, so a
+/// viewer waiting on an intra frame gets one sooner rather than at the interval
+/// anyway — which would make the whole mechanism pointless.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the viewer reports its view of the link to the sharer. Matches the
+/// resolution of the receiver's own fps/loss measurement.
+const REPORT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Loss above this, in a single measurement window, makes the viewer ask for a
+/// keyframe.
+///
+/// Deliberately well below the adaptive controller's 3% down-threshold: this is
+/// a different job. A keyframe is cheap insurance and recovers in one frame,
+/// whereas stepping resolution down costs quality and takes seconds to undo.
+const LOSS_BURST: f32 = 2.0;
 
 #[derive(Clone, PartialEq, Eq)]
 enum Screen {
@@ -59,28 +93,47 @@ fn encode_worker(
     mut encoder: H264Encoder,
     stats: Arc<Mutex<EncodeStats>>,
     metrics: Arc<SenderMetrics>,
-    frame_rate: u32,
+    force_keyframe: Arc<AtomicBool>,
 ) {
-    // Video RTP uses a 90 kHz clock: each frame advances the RTP timestamp by
-    // 90_000 / fps (3000 at 30 FPS, 1500 at 60 FPS).
-    let timestamp_interval = h264::timestamp_interval(frame_rate);
-    let mut timestamp = 0u32;
+    // RTP timestamps come from elapsed wall time, not from the frame rate.
+    // The counter form (`timestamp += 90_000 / fps`) claims a fixed interval
+    // per frame, which is false for any frame that is late, coalesced or
+    // dropped — so the sender's clock outruns real time and the receiver has to
+    // discard good frames to stay in sync. The frame rate now lives only in the
+    // encoder's own configuration, set before this thread starts.
+    let clock = h264::Clock::new();
     let mut last_keyframe = Instant::now();
+    // Set when an intra frame has been asked for but not yet encoded. The flag
+    // outlives the request, because the frame that carries the intra arrives
+    // later — and that frame's size is the number worth measuring, not the
+    // request's.
+    let mut pending_keyframe = false;
     while let Ok(msg) = rx.recv() {
         match msg {
             EncodeMsg::Quality { height } => {
                 encoder.set_target_height(height);
+                // A resolution change is unviewable until the next intra frame,
+                // so this one is never optional.
                 encoder.force_keyframe();
+                last_keyframe = Instant::now();
+                pending_keyframe = true;
             }
             EncodeMsg::Frame {
                 rgba,
                 width,
                 height,
             } => {
-                // Force a keyframe periodically so receivers can re-sync after
-                // packet loss without relying on RTCP keyframe requests.
-                let mut pending_keyframe = false;
-                if last_keyframe.elapsed() >= KEYFRAME_INTERVAL {
+                // A viewer asking for recovery. An atomic flag rather than a
+                // message: the frame queue below is small and fills up exactly
+                // when the machine is struggling, and a dropped request would
+                // strand a viewer waiting for an intra frame it was promised.
+                // Requests that arrive faster than the floor are coalesced — one
+                // intra frame serves every request in the interval.
+                let requested = force_keyframe.swap(false, Ordering::Relaxed);
+                // Backstop for a request that never arrived: the LAN channel is
+                // UDP, and a manual-code session has no channel at all.
+                let overdue = last_keyframe.elapsed() >= KEYFRAME_INTERVAL;
+                if (requested && last_keyframe.elapsed() >= KEYFRAME_REQUEST_FLOOR) || overdue {
                     encoder.force_keyframe();
                     last_keyframe = Instant::now();
                     pending_keyframe = true;
@@ -102,8 +155,10 @@ fn encode_worker(
                 };
                 match bitstream {
                     Ok(bitstream) => {
-                        let ts = timestamp;
-                        timestamp = ts.wrapping_add(timestamp_interval);
+                        // Sampled at send time, not at receipt: the clock is
+                        // measuring how long this frame waited, which is exactly
+                        // the latency a receiver has to absorb.
+                        let ts = clock.ticks(Instant::now());
                         let size = bitstream.len() as u64;
                         metrics.encoded_bytes.add(size);
                         if pending_keyframe {
@@ -113,6 +168,7 @@ fn encode_worker(
                             // cause of the loss it is meant to help recover from.
                             metrics.keyframes.incr();
                             metrics.last_keyframe_bytes.set(size);
+                            pending_keyframe = false;
                         }
                         match session::block_on(sharer.send_frame(&bitstream, ts, &metrics)) {
                             Ok(()) => {
@@ -163,6 +219,18 @@ struct ShareSession {
     audio_timestamp: u32,
     audio_frames_sent: u64,
     lan_peer: Option<String>,
+    /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
+    /// Pure state machine: see `argos_core::quality`.
+    quality: QualityController,
+    /// Last height this controller asked for, so a repeat decision is not
+    /// re-sent to the encoder.
+    applied_height: Option<u32>,
+    /// Why the height last changed, for the UI.
+    quality_note: Option<String>,
+    /// When the last keyframe went out, so the UI can show recovery activity.
+    last_keyframe_request: Instant,
+    /// Set by a viewer's keyframe request, consumed by the encode worker.
+    force_keyframe: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -194,6 +262,25 @@ struct Quality {
     fps: f32,
     mbps: f32,
     loss: f32,
+    /// When the last report went to the sharer, rate-limited so a healthy link
+    /// costs nothing and a broken one cannot flood the channel.
+    last_report: Instant,
+    /// When this viewer last asked the sharer for a keyframe. Rate limiting
+    /// belongs on the requester: the sharer cannot tell a stream of genuine
+    /// requests from one viewer stuck in a retry loop.
+    last_keyframe_request: Instant,
+    /// Loss measured in the window that triggered the last request, for display.
+    requested_at_loss: f32,
+    /// How many keyframes this session has asked for. Non-zero is what makes the
+    /// "recovered" line meaningful; without it, a session that never lost
+    /// anything would claim to have recovered from a request it never sent.
+    recoveries: u64,
+    /// Packets arrived in the last window but none of them decoded.
+    ///
+    /// Distinct from loss, which is measured by sequence gaps and so reports a
+    /// perfectly intact stream here. This is the decoder waiting on an intra
+    /// frame it will not be given, which is the one failure loss cannot see.
+    starved: bool,
 }
 
 impl Default for Quality {
@@ -207,6 +294,14 @@ impl Default for Quality {
             fps: 0.0,
             mbps: 0.0,
             loss: 0.0,
+            // Both start "long ago" so the first measurement is not rate limited.
+            last_report: Instant::now() - REPORT_INTERVAL - Duration::from_millis(1),
+            last_keyframe_request: Instant::now()
+                - KEYFRAME_REQUEST_INTERVAL
+                - Duration::from_millis(1),
+            requested_at_loss: 0.0,
+            recoveries: 0,
+            starved: false,
         }
     }
 }
@@ -232,7 +327,11 @@ struct ViewSession {
     was_connected: bool,
     reconnect: Option<Reconnect>,
     lan_peer: Option<String>,
-    peer_id: Option<String>,
+    /// Peer this viewer watches. Keyframe requests and link reports go only to
+    /// the sharer actually being watched, never to whoever else is on the
+    /// network. `None` for a manual-code session, which is why those sessions
+    /// get no recovery: there is no LAN channel to ask over.
+    sharer_id: Option<String>,
 }
 
 pub struct ArgosApp {
@@ -265,6 +364,10 @@ pub struct ArgosApp {
     live: bool,
     view: Option<ViewSession>,
     view_error: Option<String>,
+    /// Adaptive resolution toggle. Off means the sharer ignores viewer reports
+    /// and only the user's choice applies, which is the escape hatch if the
+    /// controller ever fights a link it should not be judging.
+    auto_quality: bool,
     lan: Option<lan::Lan>,
     lan_error: Option<String>,
     pending_view: Option<String>,
@@ -298,6 +401,7 @@ impl ArgosApp {
             live: false,
             view: None,
             view_error: None,
+            auto_quality: true,
             lan,
             lan_error,
             pending_view: None,
@@ -524,7 +628,8 @@ impl ArgosApp {
         let stats = Arc::new(Mutex::new(EncodeStats::default()));
         let worker_stats = Arc::clone(&stats);
         let worker_sharer = Arc::clone(&sharer);
-        let worker_fps = self.frame_rate;
+        let force_keyframe = Arc::new(AtomicBool::new(false));
+        let worker_force_keyframe = Arc::clone(&force_keyframe);
         let worker_metrics = self
             .capture
             .as_ref()
@@ -539,7 +644,7 @@ impl ArgosApp {
                     encoder,
                     worker_stats,
                     worker_metrics,
-                    worker_fps,
+                    worker_force_keyframe,
                 )
             }) {
             Ok(join) => join,
@@ -581,6 +686,11 @@ impl ArgosApp {
             audio_error,
             audio_timestamp: 0,
             audio_frames_sent: 0,
+            quality: QualityController::at_height(self.share_height),
+            applied_height: self.share_height,
+            quality_note: None,
+            last_keyframe_request: Instant::now(),
+            force_keyframe,
             lan_peer,
         });
     }
@@ -694,7 +804,6 @@ impl ArgosApp {
             }
             None => Some(answer),
         };
-        let peer_id = lan_peer.clone();
         self.view = Some(ViewSession {
             viewer,
             answer_code,
@@ -708,8 +817,12 @@ impl ArgosApp {
             quality: Quality::default(),
             was_connected: false,
             reconnect: None,
+            // `lan_peer` is the sharer's id, and is the only handle a
+            // viewer has for asking that sharer for a keyframe or telling it
+            // what the link looks like from here. `lan_peer` stays as the
+            // reconnect target; the two differ only in intent, not in value.
+            sharer_id: lan_peer.clone(),
             lan_peer,
-            peer_id,
         });
     }
 
@@ -733,7 +846,10 @@ impl ArgosApp {
     fn view_visible(&self) -> bool {
         match &self.screen {
             Screen::Peer(id) => {
-                self.view.as_ref().and_then(|view| view.peer_id.as_deref()) == Some(id.as_str())
+                self.view
+                    .as_ref()
+                    .and_then(|view| view.sharer_id.as_deref())
+                    == Some(id.as_str())
             }
             Screen::View => self.view.is_some(),
             _ => false,
@@ -779,8 +895,51 @@ impl ArgosApp {
                         }
                     }
                 }
+                lan::LanEvent::Keyframe { id } => {
+                    // Only from the peer we are actually sharing to. Not every
+                    // viewer on the network gets to spend this sharer's
+                    // bandwidth on intra frames.
+                    let Some(share) = self.share.as_mut() else {
+                        continue;
+                    };
+                    if share.lan_peer.as_deref() != Some(id.as_str()) {
+                        continue;
+                    }
+                    share.force_keyframe.store(true, Ordering::Relaxed);
+                    share.last_keyframe_request = Instant::now();
+                }
+                lan::LanEvent::Report { id, loss, fps } => {
+                    self.apply_report(&id, loss, fps);
+                }
             }
         }
+    }
+
+    /// Feeds a viewer's link measurement into the adaptive quality controller.
+    ///
+    /// Runs on the UI thread, so it must not block. It only pushes to the
+    /// encode worker's channel, and only when the decision is actually new.
+    fn apply_report(&mut self, id: &str, loss: f32, fps: f32) {
+        if !self.auto_quality {
+            return;
+        }
+        let now = Instant::now();
+        let Some(share) = self.share.as_mut() else {
+            return;
+        };
+        if share.lan_peer.as_deref() != Some(id) {
+            return;
+        }
+        let Decision::Step(_) = share.quality.update(Report { loss, fps }, now) else {
+            return;
+        };
+        let height = share.quality.height();
+        share.quality_note = share.quality.last_reason().map(str::to_string);
+        if share.applied_height == height {
+            return;
+        }
+        share.applied_height = height;
+        let _ = share.tx.try_send(EncodeMsg::Quality { height });
     }
 
     fn receive_callback(
@@ -1058,45 +1217,62 @@ impl ArgosApp {
     }
 
     fn poll_view(&mut self, ctx: &egui::Context, visible: bool) {
-        let Some(view) = self.view.as_mut() else {
+        if self.view.is_none() {
             return;
-        };
-        let snapshot = view
-            .stats
-            .lock()
-            .ok()
-            .map(|s| (s.packets, s.decoded, s.bytes, s.lost, s.audio_packets));
-        if view.viewer.is_connected() {
-            view.was_connected = true;
-            view.reconnect = None;
         }
-        if let Some((packets, decoded, bytes, lost, audio_packets)) = snapshot {
-            let now = Instant::now();
-            let elapsed = now.duration_since(view.quality.last).as_secs_f32();
-            if elapsed >= 0.5 {
-                let received = packets.saturating_sub(audio_packets);
-                let d_frames = decoded.saturating_sub(view.quality.last_decoded);
-                let d_bytes = bytes.saturating_sub(view.quality.last_bytes);
-                let d_lost = lost.saturating_sub(view.quality.last_lost);
-                let d_received = received.saturating_sub(view.quality.last_received);
-                view.quality.fps = d_frames as f32 / elapsed;
-                view.quality.mbps = d_bytes as f32 * 8.0 / elapsed / 1_000_000.0;
-                let total = d_received + d_lost;
-                view.quality.loss = if total > 0 {
-                    d_lost as f32 / total as f32 * 100.0
-                } else {
-                    0.0
-                };
-                view.quality.last = now;
-                view.quality.last_decoded = decoded;
-                view.quality.last_bytes = bytes;
-                view.quality.last_lost = lost;
-                view.quality.last_received = received;
+        let snapshot = self.view.as_mut().and_then(|view| {
+            view.stats
+                .lock()
+                .ok()
+                .map(|s| (s.packets, s.decoded, s.bytes, s.lost, s.audio_packets))
+        });
+        {
+            let Some(view) = self.view.as_mut() else {
+                return;
+            };
+            if view.viewer.is_connected() {
+                view.was_connected = true;
+                view.reconnect = None;
+            }
+            if let Some((packets, decoded, bytes, lost, audio_packets)) = snapshot {
+                let now = Instant::now();
+                let elapsed = now.duration_since(view.quality.last).as_secs_f32();
+                if elapsed >= 0.5 {
+                    let received = packets.saturating_sub(audio_packets);
+                    let d_frames = decoded.saturating_sub(view.quality.last_decoded);
+                    let d_bytes = bytes.saturating_sub(view.quality.last_bytes);
+                    let d_lost = lost.saturating_sub(view.quality.last_lost);
+                    let d_received = received.saturating_sub(view.quality.last_received);
+                    view.quality.fps = d_frames as f32 / elapsed;
+                    view.quality.mbps = d_bytes as f32 * 8.0 / elapsed / 1_000_000.0;
+                    let total = d_received + d_lost;
+                    view.quality.loss = if total > 0 {
+                        d_lost as f32 / total as f32 * 100.0
+                    } else {
+                        0.0
+                    };
+                    // Packets arrived but nothing decoded. Sequence gaps count
+                    // this stream as intact, so loss-based detection cannot see
+                    // it — the decoder is simply waiting for an intra frame.
+                    view.quality.starved = d_received > 0 && d_frames == 0;
+                    view.quality.last = now;
+                    view.quality.last_decoded = decoded;
+                    view.quality.last_bytes = bytes;
+                    view.quality.last_lost = lost;
+                    view.quality.last_received = received;
+                }
             }
         }
+        // Reporting happens before the `visible` early-return below. A viewer
+        // whose window is not on screen is still watching, and its loss is the
+        // whole input to the sharer's recovery decisions.
+        self.report_link_state();
         if !visible {
             return;
         }
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
         let Some(frame) = view.latest.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
@@ -1115,6 +1291,48 @@ impl ArgosApp {
                     height: frame.height,
                 });
             }
+        }
+    }
+
+    /// Tells the sharer what this end is seeing, and asks for a keyframe when
+    /// the link has clearly lost one.
+    ///
+    /// Both messages are best-effort UDP and both are rate limited. The report
+    /// matters whether or not anything has gone wrong — it is what lets the
+    /// sharer's controller step back up when a link recovers, which it could
+    /// never infer on its own.
+    fn report_link_state(&mut self) {
+        let now = Instant::now();
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        // A manual-code session has no LAN peer, so there is nobody to tell. It
+        // also gets no keyframe recovery, which is worth saying in the UI.
+        let Some(peer) = view.sharer_id.clone() else {
+            return;
+        };
+        let Some(lan) = self.lan.as_ref() else {
+            return;
+        };
+
+        if now.duration_since(view.quality.last_report) >= REPORT_INTERVAL {
+            view.quality.last_report = now;
+            lan.send_report(&peer, view.quality.loss, view.quality.fps);
+        }
+
+        // Two independent reasons to ask, because they fail differently:
+        // sequence gaps (loss), and an intact stream the decoder refuses to
+        // decode because it is waiting for an intra frame (starved).
+        let connected = view.viewer.is_connected();
+        let needs_keyframe = view.quality.loss >= LOSS_BURST || view.quality.starved;
+        if connected
+            && needs_keyframe
+            && now.duration_since(view.quality.last_keyframe_request) >= KEYFRAME_REQUEST_INTERVAL
+        {
+            view.quality.last_keyframe_request = now;
+            view.quality.requested_at_loss = view.quality.loss;
+            view.quality.recoveries += 1;
+            lan.send_keyframe(&peer);
         }
     }
 
@@ -1237,6 +1455,27 @@ impl ArgosApp {
             .color(color)
             .size(16.0),
         );
+        // Recovery state, because "the fps is bad" and "the app is asking the
+        // sharer to fix it" are different situations and only one of them is
+        // worth waiting out.
+        if let Some(peer) = &view.sharer_id {
+            let since = view.quality.last_keyframe_request.elapsed();
+            if quality.loss >= LOSS_BURST {
+                ui.label(
+                    RichText::new(format!(
+                        "Requesting keyframes from {peer} — {:.1}% loss",
+                        quality.loss
+                    ))
+                    .color(Color32::from_rgb(220, 200, 120)),
+                );
+            } else if view.quality.recoveries > 0 && since < Duration::from_secs(10) {
+                ui.label(
+                    RichText::new(format!("Recovered {:.0} s ago", since.as_secs_f32())).weak(),
+                );
+            }
+        } else {
+            ui.label(RichText::new("No LAN peer — no keyframe recovery for this session.").weak());
+        }
     }
 
     fn share_view(&mut self, ui: &mut egui::Ui) {
@@ -1299,9 +1538,53 @@ impl ArgosApp {
                     }
                 }
             });
+        let mut auto_quality = self.auto_quality;
+        if ui
+            .checkbox(&mut auto_quality, "Adjust resolution to the viewer's link")
+            .changed()
+        {
+            self.auto_quality = auto_quality;
+            if let Some(share) = self.share.as_mut() {
+                // Turning it off must restore whatever the user picked, since the
+                // controller may have moved the encoder somewhere else.
+                share.quality.reset(self.share_height);
+                share.applied_height = self.share_height;
+                share.quality_note = None;
+                let _ = share.tx.try_send(EncodeMsg::Quality {
+                    height: self.share_height,
+                });
+            }
+        }
+        // Show what the controller is actually doing. A silent resolution change is
+        // indistinguishable from a bug to whoever is watching, and knowing it was
+        // deliberate is the difference between trusting it and fighting it.
+        if let Some(share) = self.share.as_ref() {
+            if self.auto_quality && share.quality.is_auto() {
+                let height = share
+                    .quality
+                    .height()
+                    .map(|height| format!("{height}p"))
+                    .unwrap_or_else(|| "native".to_string());
+                ui.label(
+                    RichText::new(format!(
+                        "Sending {height} · smoothed loss {:.1}%",
+                        share.quality.smoothed_loss()
+                    ))
+                    .color(Color32::from_rgb(220, 200, 120)),
+                );
+                if let Some(reason) = &share.quality_note {
+                    ui.label(RichText::new(reason).weak());
+                }
+            }
+        }
         if share_height != self.share_height {
             self.share_height = share_height;
             if let Some(share) = self.share.as_mut() {
+                // A manual choice wins. Resetting the controller stops it from
+                // undoing this on evidence gathered before the choice was made.
+                share.quality.reset(share_height);
+                share.applied_height = share_height;
+                share.quality_note = None;
                 let _ = share.tx.try_send(EncodeMsg::Quality {
                     height: share_height,
                 });
@@ -1564,7 +1847,11 @@ impl ArgosApp {
             .map(|peer| peer.name)
             .unwrap_or_else(|| "Stream".to_string());
 
-        let connected = self.view.as_ref().and_then(|view| view.peer_id.as_deref()) == Some(id);
+        let connected = self
+            .view
+            .as_ref()
+            .and_then(|view| view.sharer_id.as_deref())
+            == Some(id);
         if connected {
             self.watch_view(ui);
             return;
@@ -1891,6 +2178,18 @@ impl ArgosApp {
                             m.audio_bytes.get() / 1024
                         ),
                     );
+                    if let Some(quality) = share.quality.last_reason() {
+                        let rung = share.quality.rung();
+                        Self::counter_row(
+                            ui,
+                            "adaptive",
+                            format!(
+                                "rung {rung} of {}, {:.1}% smoothed loss — {quality}",
+                                argos_core::quality::LADDER.len() - 1,
+                                share.quality.smoothed_loss()
+                            ),
+                        );
+                    }
                 }
 
                 if let Some(view) = self.view.as_ref() {
@@ -1950,6 +2249,27 @@ impl ArgosApp {
                             m.audio_decoded.dropped()
                         ),
                     );
+                    // What the sharer is being told, and how many times
+                    // recovery has actually been asked for. A count, not a
+                    // timestamp: "idle" and "never needed" look identical on a
+                    // clock and mean completely different things.
+                    if view.sharer_id.is_some() {
+                        Self::counter_row(
+                            ui,
+                            "recovery",
+                            match view.quality.recoveries {
+                                0 => "no keyframes requested".to_string(),
+                                count => format!(
+                                    "{count} keyframes requested, last {:.1} s ago, \
+                                     {:.1}% loss at the time",
+                                    view.quality.last_keyframe_request.elapsed().as_secs_f32(),
+                                    view.quality.requested_at_loss
+                                ),
+                            },
+                        );
+                    } else {
+                        Self::counter_row(ui, "recovery", "no LAN peer — unavailable".to_string());
+                    }
                 }
 
                 if self.share.is_none() && self.view.is_none() {

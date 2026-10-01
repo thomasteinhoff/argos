@@ -13,6 +13,49 @@ pub fn timestamp_interval(fps: u32) -> u32 {
     RTP_CLOCK_RATE / fps.max(1)
 }
 
+/// A video RTP timestamp derived from elapsed wall time rather than frame count.
+///
+/// The counter-derived form (`timestamp += RTP_CLOCK_RATE / fps`) assumes every
+/// frame is sent exactly `1/fps` apart. It is not: a frame that is dropped,
+/// coalesced, or simply late still advances the counter by a whole interval, so
+/// the sender's clock runs fast and the receiver's jitter buffer eventually has
+/// to correct by dropping good frames to keep up. A sender stuck at 20 fps with
+/// a 30 fps clock is the same defect in slow motion.
+///
+/// Deriving from the clock keeps playback time proportional to real time. The
+/// receiver only needs the deltas between frames, so the epoch is arbitrary and
+/// is taken as the first frame; only differences are ever meaningful.
+#[derive(Debug, Clone, Copy)]
+pub struct Clock {
+    epoch: std::time::Instant,
+}
+
+impl Clock {
+    pub fn new() -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+        }
+    }
+
+    /// Ticks elapsed since the first call. Saturates rather than wrapping: a
+    /// timestamp that jumps backwards would make the receiver treat the frame as
+    /// arriving early and stall its buffer.
+    pub fn ticks(&self, at: std::time::Instant) -> u32 {
+        let ticks = at
+            .saturating_duration_since(self.epoch)
+            .as_nanos()
+            .saturating_mul(RTP_CLOCK_RATE as u128)
+            / 1_000_000_000;
+        ticks.min(u32::MAX as u128) as u32
+    }
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn nalu_type(nalu: &[u8]) -> u8 {
     nalu.first().map(|header| header & 0x1f).unwrap_or(0)
 }
@@ -255,6 +298,63 @@ mod tests {
     #[test]
     fn timestamp_interval_guards_against_zero_fps() {
         assert_eq!(timestamp_interval(0), RTP_CLOCK_RATE);
+    }
+
+    #[test]
+    fn clock_advances_at_the_rtp_rate() {
+        use super::Clock;
+        use std::time::Duration;
+        let clock = Clock::new();
+        let epoch = clock.epoch;
+        // One second of real time is exactly RTP_CLOCK_RATE ticks.
+        assert_eq!(clock.ticks(epoch), 0);
+        assert_eq!(clock.ticks(epoch + Duration::from_secs(1)), RTP_CLOCK_RATE);
+        // A 30 fps frame is 3000 ticks at 33.33 ms.
+        let frame = Duration::from_nanos(33_333_333);
+        let ticks = clock.ticks(epoch + frame) as u64;
+        assert!(
+            (ticks as i64 - timestamp_interval(30) as i64).abs() <= 2,
+            "one frame advanced {ticks} ticks, expected about 3000"
+        );
+    }
+
+    /// The defect the clock replaces: a sender that misses frames advances its
+    /// timestamp by a whole interval anyway, so its clock outruns real time and
+    /// the receiver's buffer has to discard good frames to catch up.
+    #[test]
+    fn clock_tracks_real_time_when_frames_are_missed() {
+        use super::{Clock, RTP_CLOCK_RATE};
+        use std::time::Duration;
+        let clock = Clock::new();
+        let epoch = clock.epoch;
+
+        // A 30 fps stream that only manages 20 fps: ten frames per second, each
+        // advancing by the full 30 fps interval.
+        let mut counter = 0u32;
+        let mut counter_elapsed = Duration::ZERO;
+        for frame in 0..20 {
+            counter_elapsed += Duration::from_millis(50);
+            counter = counter.wrapping_add(RTP_CLOCK_RATE / 30);
+            let at = epoch + counter_elapsed;
+            assert_eq!(clock.ticks(at), (frame + 1) * 50 * RTP_CLOCK_RATE / 1000);
+        }
+        // After one second both have advanced 60000 ticks, but the counter
+        // believes 20 frames is 20/30 of a second's worth of time — it has
+        // silently claimed 666 ms elapsed.
+        assert_eq!(counter, 20 * 3000);
+        assert_eq!(clock.ticks(epoch + Duration::from_secs(1)), RTP_CLOCK_RATE);
+    }
+
+    #[test]
+    fn clock_never_moves_backwards() {
+        use super::Clock;
+        use std::time::Duration;
+        let clock = Clock::new();
+        // A timestamp that jumps backwards would make the receiver treat the
+        // frame as arriving early and stall its buffer.
+        let late = clock.epoch + Duration::from_secs(10);
+        assert!(clock.ticks(late) >= clock.ticks(clock.epoch));
+        assert_eq!(clock.ticks(clock.epoch), 0);
     }
 
     #[test]

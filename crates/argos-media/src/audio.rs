@@ -441,12 +441,17 @@ fn capture_loop(
     // COM initialisation is per-thread and unrecoverable: if it fails there is
     // no point retrying, so this is the one failure that legitimately reports
     // through `ready` and stops. Everything else retries below.
+    //
+    // A successful init must still answer `ready`: `start()` blocks on it, and
+    // the worker deliberately outlives that answer by retrying forever, so no
+    // later code path will ever send.
     if let Err(error) = initialize_mta().ok() {
         let message = format!("COM init failed: {error}");
         state.fail(0, message.clone());
         let _ = ready.send(Err(message));
         return;
     }
+    let _ = ready.send(Ok(()));
 
     let mut backoff = RETRY_BACKOFF;
     let mut generation = 0u64;
@@ -838,12 +843,17 @@ fn playback_loop(
     // missing or invalid at startup is *not* fatal: the worker retries in the
     // background, so plugging in headphones brings the audio back without
     // restarting the app.
+    //
+    // A successful init must still answer `ready`: `start()` blocks on it, and
+    // the worker deliberately outlives that answer by retrying forever, so no
+    // later code path will ever send.
     if let Err(error) = initialize_mta().ok() {
         let message = format!("COM init failed: {error}");
         state.fail(0, message.clone());
         let _ = ready.send(Err(message));
         return;
     }
+    let _ = ready.send(Ok(()));
 
     let mut backoff = RETRY_BACKOFF;
     let mut generation = 0u64;

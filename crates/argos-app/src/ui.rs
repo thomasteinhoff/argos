@@ -91,6 +91,20 @@ fn decode_target(value: i32) -> Option<u32> {
     (value >= 0).then_some(value as u32)
 }
 
+/// Turns a controller rung into the height the encoder should use.
+///
+/// Rung 0 is the top of the ladder, where a native share is parked even though
+/// native is not itself a rung. So the top rung resolves to the user's choice
+/// when that choice was native, and to the ladder height otherwise. Without
+/// this, recovering to the top would pin a native share to 720p for good.
+fn resolved_height(rung: usize, chosen: Option<u32>) -> Option<u32> {
+    if rung == 0 && chosen.is_none() {
+        None
+    } else {
+        argos_core::quality::LADDER[rung]
+    }
+}
+
 #[derive(Default)]
 struct EncodeStats {
     frames_sent: u64,
@@ -995,6 +1009,11 @@ impl ArgosApp {
             return;
         }
         let now = Instant::now();
+        // The user's own choice, because rung 0 of the ladder means "their
+        // starting point". "Native" is not a rung — the controller parks it at
+        // rung 0 — so without this the first recovery to the top would silently
+        // pin a native share to 720p and never return it.
+        let chosen = self.share_height;
         let Some(share) = self.share.as_mut() else {
             return;
         };
@@ -1009,7 +1028,7 @@ impl ArgosApp {
         let Decision::Step(_) = share.quality.update(Report { loss, fps, drops }, now) else {
             return;
         };
-        let height = share.quality.height();
+        let height = resolved_height(share.quality.rung(), chosen);
         share.quality_note = share.quality.last_reason().map(str::to_string);
         share
             .target_height
@@ -2642,7 +2661,16 @@ impl eframe::App for ArgosApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_target, encode_target};
+    use super::{decode_target, encode_target, resolved_height};
+
+    #[test]
+    fn the_top_rung_restores_a_native_choice() {
+        assert_eq!(resolved_height(0, None), None);
+        assert_eq!(resolved_height(0, Some(720)), Some(720));
+        // Below the top, the user's choice is irrelevant: the ladder applies.
+        assert_eq!(resolved_height(1, None), Some(540));
+        assert_eq!(resolved_height(3, Some(720)), Some(240));
+    }
 
     #[test]
     fn the_height_target_round_trips_through_the_atomic() {

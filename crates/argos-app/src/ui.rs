@@ -459,8 +459,11 @@ impl ArgosApp {
             preview_error: None,
             share: None,
             share_error: None,
-            share_height: Some(720),
-            frame_rate: 30,
+            // The adaptive controller starts at the ceiling and walks down, so
+            // the sensible default is the best we can send, not a compromise
+            // picked before the link was known.
+            share_height: None,
+            frame_rate: 60,
             live: false,
             view: None,
             view_error: None,
@@ -1622,21 +1625,11 @@ impl ArgosApp {
                 }
             });
 
-        let mut share_height = self.share_height;
-        egui::ComboBox::from_label("Stream quality")
-            .selected_text(Self::quality_label(share_height))
-            .show_ui(ui, |ui| {
-                for (label, height) in [
-                    ("Native", None),
-                    ("720p", Some(720)),
-                    ("540p", Some(540)),
-                    ("360p", Some(360)),
-                ] {
-                    if ui.selectable_label(share_height == height, label).clicked() {
-                        share_height = height;
-                    }
-                }
-            });
+        // Adaptive resolution is the primary control and stays in the open: it
+        // starts at the ceiling and walks down only as far as the link and the
+        // encoder actually need. The exact ceiling and the frame rate live
+        // under Advanced, because the defaults (native / 60 fps) are what most
+        // people want and the controller handles everything below them.
         let mut auto_quality = self.auto_quality;
         if ui
             .checkbox(&mut auto_quality, "Adjust resolution to the viewer's link")
@@ -1676,44 +1669,65 @@ impl ArgosApp {
                 }
             }
         }
-        if share_height != self.share_height {
-            self.share_height = share_height;
-            if let Some(share) = self.share.as_mut() {
-                // A manual choice wins. Resetting the controller stops it from
-                // undoing this on evidence gathered before the choice was made.
-                share.quality.reset(share_height);
-                share.quality_note = None;
-                share
-                    .target_height
-                    .store(encode_target(share_height), Ordering::Relaxed);
-            }
-        }
 
         let streaming = self.live || self.share.is_some();
-        let mut frame_rate = self.frame_rate;
-        ui.add_enabled_ui(!streaming, |ui| {
-            egui::ComboBox::from_label("Frame rate")
-                .selected_text(format!("{frame_rate} fps"))
-                .show_ui(ui, |ui| {
-                    for fps in [30u32, 60u32] {
-                        if ui
-                            .selectable_label(frame_rate == fps, format!("{fps} fps"))
-                            .clicked()
-                        {
-                            frame_rate = fps;
+        egui::CollapsingHeader::new("Advanced")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut share_height = self.share_height;
+                egui::ComboBox::from_label("Stream quality")
+                    .selected_text(Self::quality_label(share_height))
+                    .show_ui(ui, |ui| {
+                        for (label, height) in [
+                            ("Native", None),
+                            ("720p", Some(720)),
+                            ("540p", Some(540)),
+                            ("360p", Some(360)),
+                        ] {
+                            if ui.selectable_label(share_height == height, label).clicked() {
+                                share_height = height;
+                            }
                         }
+                    });
+                if share_height != self.share_height {
+                    self.share_height = share_height;
+                    if let Some(share) = self.share.as_mut() {
+                        // A manual choice wins. Resetting the controller stops it
+                        // from undoing this on evidence gathered before the choice
+                        // was made.
+                        share.quality.reset(share_height);
+                        share.quality_note = None;
+                        share
+                            .target_height
+                            .store(encode_target(share_height), Ordering::Relaxed);
                     }
+                }
+
+                let mut frame_rate = self.frame_rate;
+                ui.add_enabled_ui(!streaming, |ui| {
+                    egui::ComboBox::from_label("Frame rate")
+                        .selected_text(format!("{frame_rate} fps"))
+                        .show_ui(ui, |ui| {
+                            for fps in [30u32, 60u32] {
+                                if ui
+                                    .selectable_label(frame_rate == fps, format!("{fps} fps"))
+                                    .clicked()
+                                {
+                                    frame_rate = fps;
+                                }
+                            }
+                        });
                 });
-        });
-        if streaming {
-            ui.label(RichText::new("Stop streaming to change the frame rate.").weak());
-        }
-        if frame_rate != self.frame_rate {
-            self.frame_rate = frame_rate;
-            if let Some(capture) = &self.capture {
-                capture.set_interval(self.frame_interval());
-            }
-        }
+                if streaming {
+                    ui.label(RichText::new("Stop streaming to change the frame rate.").weak());
+                }
+                if frame_rate != self.frame_rate {
+                    self.frame_rate = frame_rate;
+                    if let Some(capture) = &self.capture {
+                        capture.set_interval(self.frame_interval());
+                    }
+                }
+            });
 
         ui.add_space(6.0);
         let preview_label = if self.preview_active {

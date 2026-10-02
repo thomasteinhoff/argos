@@ -231,10 +231,37 @@ struct ShareSession {
     applied_height: Option<u32>,
     /// Why the height last changed, for the UI.
     quality_note: Option<String>,
+    /// Encoder-handoff counters as of the last report, so the drop *rate* over
+    /// the interval — not the lifetime total — can be fed to the controller.
+    load_offered: u64,
+    load_dropped: u64,
     /// When the last keyframe went out, so the UI can show recovery activity.
     last_keyframe_request: Instant,
     /// Set by a viewer's keyframe request, consumed by the encode worker.
     force_keyframe: Arc<AtomicBool>,
+}
+
+impl ShareSession {
+    /// Frames the encode handoff discarded since the last call, as a percentage
+    /// of those it was offered.
+    ///
+    /// The lifetime counters only report the average since the stream started,
+    /// which decays as clean periods accumulate and eventually stops seeing a
+    /// fresh overload. The controller wants the rate over the report interval.
+    fn encoder_drops(&mut self) -> f32 {
+        let offered = self.metrics.queued.frames();
+        let dropped = self.metrics.queued.dropped();
+        let offered_delta = offered.saturating_sub(self.load_offered);
+        let dropped_delta = dropped.saturating_sub(self.load_dropped);
+        self.load_offered = offered;
+        self.load_dropped = dropped;
+        if offered_delta == 0 {
+            // Nothing was offered, so nothing was refused. Absence of demand is
+            // not evidence of pressure.
+            return 0.0;
+        }
+        dropped_delta as f32 / offered_delta as f32 * 100.0
+    }
 }
 
 #[derive(Default)]
@@ -693,6 +720,8 @@ impl ArgosApp {
             quality: QualityController::at_height(self.share_height),
             applied_height: self.share_height,
             quality_note: None,
+            load_offered: 0,
+            load_dropped: 0,
             last_keyframe_request: Instant::now(),
             force_keyframe,
             lan_peer,
@@ -934,7 +963,12 @@ impl ArgosApp {
         if share.lan_peer.as_deref() != Some(id) {
             return;
         }
-        let Decision::Step(_) = share.quality.update(Report { loss, fps }, now) else {
+        // The viewer can measure the link but not the sender's own handoff, so
+        // the encoder half of the report is measured here. It is the only
+        // evidence available when the link is lossless and the machine is the
+        // limit.
+        let drops = share.encoder_drops();
+        let Decision::Step(_) = share.quality.update(Report { loss, fps, drops }, now) else {
             return;
         };
         let height = share.quality.height();
@@ -1580,8 +1614,9 @@ impl ArgosApp {
                     .unwrap_or_else(|| "native".to_string());
                 ui.label(
                     RichText::new(format!(
-                        "Sending {height} · smoothed loss {:.1}%",
-                        share.quality.smoothed_loss()
+                        "Sending {height} · loss {:.1}% · encoder drops {:.1}%",
+                        share.quality.smoothed_loss(),
+                        share.quality.smoothed_drops()
                     ))
                     .color(Color32::from_rgb(220, 200, 120)),
                 );
@@ -2264,9 +2299,10 @@ impl ArgosApp {
                     sink,
                     "adaptive",
                     format!(
-                        "rung {rung} of {}, {:.1}% smoothed loss — {quality}",
+                        "rung {rung} of {}, {:.1}% loss, {:.1}% encoder drops — {quality}",
                         argos_core::quality::LADDER.len() - 1,
-                        share.quality.smoothed_loss()
+                        share.quality.smoothed_loss(),
+                        share.quality.smoothed_drops()
                     ),
                 );
             }

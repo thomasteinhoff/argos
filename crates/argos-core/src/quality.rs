@@ -23,9 +23,21 @@ const DOWN_LOSS: f32 = 3.0;
 /// Loss below this, sustained, justifies stepping back up.
 const UP_LOSS: f32 = 0.5;
 
+/// Encoder queue drops above this, sustained, justify stepping down: the
+/// encoder is producing frames slower than it is being fed, so the overload is
+/// the machine rather than the link. Higher than [`DOWN_LOSS`] because a full
+/// queue is a coarser signal — a single slow keyframe can overflow it — and the
+/// remedy, a resolution drop, costs a forced intra frame.
+const DOWN_DROPS: f32 = 10.0;
+/// Encoder drops below this count as headroom.
+const UP_DROPS: f32 = 1.0;
+
 /// How long loss must stay bad before a step down. Short enough to react to a
 /// genuinely bad link, long enough that one burst is not treated as a trend.
 const DOWN_HOLD: Duration = Duration::from_millis(1500);
+/// Encoder saturation must persist through warm-up and the first keyframe
+/// before it is believed, so it waits longer than a loss burst.
+const LOAD_HOLD: Duration = Duration::from_secs(3);
 /// Recovery takes much longer than the way down. Stepping up into a link that
 /// is still congested reintroduces the loss that caused the step down, and
 /// the oscillation is more visible than either end state.
@@ -33,13 +45,21 @@ const UP_HOLD: Duration = Duration::from_secs(8);
 /// Floor between any two changes.
 const MIN_HOLD: Duration = Duration::from_secs(5);
 
-/// A measurement from the receiver.
+/// A measurement from the receiver, plus what the sender's own pipeline knows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Report {
     /// Fraction of expected packets that never arrived, 0..100.
     pub loss: f32,
     /// Frames actually decoded per second.
     pub fps: f32,
+    /// Frames the sender's encoder discarded because its input queue was full,
+    /// as a percentage of those offered, 0..100.
+    ///
+    /// A receiver cannot measure this and sends zero; the sharer fills it in
+    /// from its own queue counters. It is the one signal that separates "the
+    /// link is dropping packets" from "the machine cannot encode fast enough" —
+    /// on a lossless LAN, the difference between a network fault and a CPU one.
+    pub drops: f32,
 }
 
 /// What the controller decided, if anything.
@@ -58,9 +78,16 @@ pub struct Controller {
     /// directly would make the controller jump on single bad windows.
     loss: f32,
     samples: u32,
+    /// Smoothed encoder drop percentage. Tracked separately from `loss`: the
+    /// two have different causes and, in the reason the UI shows, different
+    /// remedies.
+    drops: f32,
+    drop_samples: u32,
     /// When the current bad-or-good streak began.
     since_bad: Option<std::time::Instant>,
     since_good: Option<std::time::Instant>,
+    /// When the current streak of encoder saturation began.
+    since_loaded: Option<std::time::Instant>,
     /// When the last change was made, for [`MIN_HOLD`].
     last_change: Option<std::time::Instant>,
     /// Why the last step happened, so the UI can say so.
@@ -83,8 +110,11 @@ impl Controller {
             rung,
             loss: 0.0,
             samples: 0,
+            drops: 0.0,
+            drop_samples: 0,
             since_bad: None,
             since_good: None,
+            since_loaded: None,
             last_change: None,
             last_reason: None,
         }
@@ -126,6 +156,11 @@ impl Controller {
         self.loss
     }
 
+    /// Smoothed encoder queue-drop percentage, 0..100.
+    pub fn smoothed_drops(&self) -> f32 {
+        self.drops
+    }
+
     /// Feeds one measurement in and reports whether to change height.
     ///
     /// `now` is passed rather than read so the timing behaviour is testable
@@ -145,6 +180,12 @@ impl Controller {
             self.loss * 0.7 + report.loss * 0.3
         };
         self.samples = self.samples.saturating_add(1);
+        self.drops = if self.drop_samples < 8 {
+            report.drops
+        } else {
+            self.drops * 0.7 + report.drops * 0.3
+        };
+        self.drop_samples = self.drop_samples.saturating_add(1);
 
         // The two mechanisms deliberately use different inputs. The smoothed
         // value decides whether the link *looks* bad, because a single 500 ms
@@ -160,10 +201,26 @@ impl Controller {
             self.since_bad = None;
         }
 
-        // Mirrored for recovery. A report that is itself bad cancels a good
-        // streak, so the ladder cannot climb on a smoothed value the link
-        // stopped supporting.
-        if self.loss < UP_LOSS && report.loss < UP_LOSS {
+        // Encoder saturation is a second, independent reason to step down. It
+        // is not loss and it never shows up as loss: on a healthy LAN the link
+        // delivers every packet, and the frames are discarded before they ever
+        // reach it.
+        if self.drops > DOWN_DROPS && report.drops > DOWN_DROPS {
+            self.since_loaded.get_or_insert(now);
+        } else {
+            self.since_loaded = None;
+        }
+
+        // Stepping back up needs both axes clean. The link recovering is not
+        // enough while the encoder still cannot keep up: the step would be
+        // undone the moment motion returned, at the cost of a forced intra
+        // frame in each direction. Arming the streak on the conjunction is what
+        // stops that.
+        if self.loss < UP_LOSS
+            && report.loss < UP_LOSS
+            && self.drops < UP_DROPS
+            && report.drops < UP_DROPS
+        {
             self.since_good.get_or_insert(now);
         } else {
             self.since_good = None;
@@ -173,7 +230,25 @@ impl Controller {
             .since_bad
             .is_some_and(|since| now.duration_since(since) >= DOWN_HOLD)
         {
-            if let Some(decision) = self.step(now, true) {
+            if let Some(decision) = self.step(
+                now,
+                true,
+                "reduced automatically — the viewer is losing packets",
+            ) {
+                return decision;
+            }
+            return Decision::Hold;
+        }
+
+        if self
+            .since_loaded
+            .is_some_and(|since| now.duration_since(since) >= LOAD_HOLD)
+        {
+            if let Some(decision) = self.step(
+                now,
+                true,
+                "reduced automatically — the encoder cannot keep up",
+            ) {
                 return decision;
             }
             return Decision::Hold;
@@ -183,7 +258,11 @@ impl Controller {
             .since_good
             .is_some_and(|since| now.duration_since(since) >= UP_HOLD)
         {
-            if let Some(decision) = self.step(now, false) {
+            if let Some(decision) = self.step(
+                now,
+                false,
+                "raised automatically — the link and encoder both have headroom",
+            ) {
                 return decision;
             }
             return Decision::Hold;
@@ -199,13 +278,17 @@ impl Controller {
     /// them armed. Otherwise a link pinned at the top or the bottom would keep
     /// a fully-satisfied streak on the books and move the instant [`MIN_HOLD`]
     /// expired, on evidence that had long since stopped being current.
-    fn step(&mut self, now: std::time::Instant, down: bool) -> Option<Decision> {
+    fn step(
+        &mut self,
+        now: std::time::Instant,
+        down: bool,
+        reason: &'static str,
+    ) -> Option<Decision> {
         if self
             .last_change
             .is_some_and(|last| now.duration_since(last) < MIN_HOLD)
         {
-            self.since_bad = None;
-            self.since_good = None;
+            self.clear_streaks();
             return None;
         }
         let next = if down {
@@ -214,8 +297,7 @@ impl Controller {
             match self.rung.checked_sub(1) {
                 Some(rung) => rung,
                 None => {
-                    self.since_good = None;
-                    self.since_bad = None;
+                    self.clear_streaks();
                     return None;
                 }
             }
@@ -223,25 +305,30 @@ impl Controller {
         if next >= LADDER.len() {
             // Already at the floor. Clear the streak so the controller stops
             // re-testing an end state it cannot leave every half second.
-            self.since_bad = None;
-            self.since_good = None;
+            self.clear_streaks();
             return None;
         }
         self.rung = next;
         self.last_change = Some(now);
         // Restart the streak, and discard the smoothed history with it: the
-        // evidence that justified this step is spent, and the loss that matters
-        // from here on is that of the new level, not the one just left behind.
-        self.since_bad = None;
-        self.since_good = None;
+        // evidence that justified this step is spent, and the pressure that
+        // matters from here on is that of the new level, not the one just left
+        // behind.
+        self.clear_streaks();
         self.loss = 0.0;
         self.samples = 0;
-        self.last_reason = Some(if down {
-            "reduced automatically — the viewer is losing packets"
-        } else {
-            "raised automatically — the link recovered"
-        });
+        self.drops = 0.0;
+        self.drop_samples = 0;
+        self.last_reason = Some(reason);
         Some(Decision::Step(self.rung))
+    }
+
+    /// Clears every streak. A held-off or impossible move must not leave a
+    /// fully-satisfied streak armed for the instant [`MIN_HOLD`] expires.
+    fn clear_streaks(&mut self) {
+        self.since_bad = None;
+        self.since_good = None;
+        self.since_loaded = None;
     }
 
     /// Clears the auto-adjust state, so a user-chosen height is not immediately
@@ -261,7 +348,21 @@ mod tests {
     }
 
     fn busy(loss: f32) -> Report {
-        Report { loss, fps: 30.0 }
+        Report {
+            loss,
+            fps: 30.0,
+            drops: 0.0,
+        }
+    }
+
+    /// A clean link whose *encoder* is the limit: no packets lost, but frames
+    /// thrown away at the handoff because the worker was already busy.
+    fn saturated(drops: f32) -> Report {
+        Report {
+            loss: 0.0,
+            fps: 30.0,
+            drops,
+        }
     }
 
     /// Drives the controller for `seconds` of reports arriving every 500 ms,
@@ -450,6 +551,7 @@ mod tests {
         let idle = Report {
             loss: 0.0,
             fps: 0.0,
+            drops: 0.0,
         };
         let start = Instant::now();
         for tick in 0..200 {
@@ -546,5 +648,94 @@ mod tests {
         controller.reset(Some(1080));
         assert_eq!(controller.height(), Some(720));
         assert!(!controller.is_auto());
+    }
+
+    /// The reason the encoder signal exists: a lossless LAN reports zero loss
+    /// forever, so without a second input the ladder can never relieve a sender
+    /// whose CPU, not its link, is the limit.
+    #[test]
+    fn sustained_encoder_drops_step_down() {
+        let mut controller = controller();
+        let start = Instant::now();
+        let mut stepped = None;
+        for tick in 0..20 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            if let Decision::Step(rung) = controller.update(saturated(40.0), at) {
+                stepped = Some(rung);
+                break;
+            }
+        }
+        assert_eq!(stepped, Some(1));
+        assert!(controller.is_auto());
+        let reason = controller.last_reason().unwrap_or_default();
+        assert!(
+            reason.contains("encoder"),
+            "expected an encoder reason, got {reason:?}"
+        );
+    }
+
+    /// Warm-up and the first keyframe both overflow the handoff queue. The
+    /// longer [`LOAD_HOLD`] is what keeps that from being read as a persistent
+    /// overload and dropping resolution before any video has been sent.
+    #[test]
+    fn a_brief_encoder_overflow_does_not_step_down() {
+        let mut controller = controller();
+        let start = Instant::now();
+        for tick in 0..4 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            assert_eq!(controller.update(saturated(80.0), at), Decision::Hold);
+        }
+        for tick in 4..40 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            assert_eq!(controller.update(busy(0.0), at), Decision::Hold);
+        }
+        assert_eq!(controller.height(), Some(720));
+    }
+
+    /// Zero loss is not a reason to climb while the encoder is still discarding
+    /// frames. Otherwise the recovery path would undo every encoder-driven step
+    /// eight seconds later, forcing an intra frame in each direction.
+    #[test]
+    fn an_encoder_that_stays_saturated_never_climbs_back() {
+        let mut controller = controller();
+        let start = Instant::now();
+        let mut deepest = 0usize;
+        for tick in 0..140 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            if let Decision::Step(rung) = controller.update(saturated(40.0), at) {
+                assert!(
+                    rung > deepest,
+                    "climbed from {deepest} to {rung} while the encoder was saturated"
+                );
+                deepest = rung;
+            }
+        }
+        assert!(deepest > 0, "the encoder never forced a step down");
+    }
+
+    /// And when the encoder does catch up, the ladder resumes climbing — the
+    /// block on recovery is the drops, not the fact that a local signal once
+    /// moved it.
+    #[test]
+    fn an_encoder_with_headroom_climbs_back() {
+        let mut controller = controller();
+        let start = Instant::now();
+        let mut descended = None;
+        for tick in 0..20 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            if let Decision::Step(rung) = controller.update(saturated(40.0), at) {
+                descended = Some(rung);
+                break;
+            }
+        }
+        let descended = descended.expect("the encoder never forced a step down");
+        for tick in 20..120 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            if let Decision::Step(rung) = controller.update(busy(0.0), at) {
+                assert!(rung < descended);
+                return;
+            }
+        }
+        panic!("never climbed back once the encoder had headroom");
     }
 }

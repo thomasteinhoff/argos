@@ -123,6 +123,8 @@ fn encode_worker(
                 width,
                 height,
             } => {
+                metrics.captured_width.set(width as u64);
+                metrics.captured_height.set(height as u64);
                 // A viewer asking for recovery. An atomic flag rather than a
                 // message: the frame queue below is small and fills up exactly
                 // when the machine is struggling, and a dropped request would
@@ -148,6 +150,8 @@ fn encode_worker(
                 };
                 let bitstream = match converted {
                     Ok(dims) => {
+                        metrics.encoded_width.set(dims.0 as u64);
+                        metrics.encoded_height.set(dims.1 as u64);
                         let _encode = StageTimer::new(&metrics.encode);
                         encoder.encode_planes(dims.0, dims.1)
                     }
@@ -1159,7 +1163,16 @@ impl ArgosApp {
                     width: frame.width,
                     height: frame.height,
                 };
-                let _ = share.tx.try_send(msg);
+                match share.tx.try_send(msg) {
+                    Ok(()) => share.metrics.queued.record(),
+                    // The encoder is not keeping up, so the handoff queue is
+                    // full and this frame is discarded. `encoded` cannot show
+                    // this: the frame never reached the encoder to be counted.
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        share.metrics.queued.drop_frame()
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                }
             }
         }
     }
@@ -2025,8 +2038,8 @@ impl ArgosApp {
     /// One line of the stage-timing table. The peak column is the important
     /// one: a mean over a long window stays flat through an intermittent stall,
     /// while a single 400 ms hitch is the whole story.
-    fn stage_row(ui: &mut egui::Ui, name: &str, stage: &Ema) {
-        ui.monospace(format!(
+    fn stage_row<S: ReportSink>(sink: &mut S, name: &str, stage: &Ema) {
+        sink.line(format!(
             "  {name:<11} {:>7.2} ms avg  {:>8.2} ms peak  {:>7} samples",
             stage.mean_ms(),
             stage.peak_ms(),
@@ -2034,8 +2047,8 @@ impl ArgosApp {
         ));
     }
 
-    fn counter_row(ui: &mut egui::Ui, name: &str, value: String) {
-        ui.monospace(format!("  {name:<11} {value}"));
+    fn counter_row<S: ReportSink>(sink: &mut S, name: &str, value: String) {
+        sink.line(format!("  {name:<11} {value}"));
     }
 
     /// Rows for one audio device worker.
@@ -2043,13 +2056,13 @@ impl ArgosApp {
     /// The drift figure is the one that matters over a long session: a buffer
     /// that is slowly emptying looks fine right up until every period is
     /// silence, and the level itself is what says whether that is happening.
-    fn audio_rows(ui: &mut egui::Ui, name: &str, audio: &AudioMetrics, secs: f32) {
-        ui.label(RichText::new(name).strong());
-        Self::stage_row(ui, "  device io", &audio.device_io);
-        Self::stage_row(ui, "  convert", &audio.convert);
-        Self::stage_row(ui, "  codec", &audio.codec);
+    fn audio_rows<S: ReportSink>(sink: &mut S, name: &str, audio: &AudioMetrics, secs: f32) {
+        sink.heading(name);
+        Self::stage_row(sink, "  device io", &audio.device_io);
+        Self::stage_row(sink, "  convert", &audio.convert);
+        Self::stage_row(sink, "  codec", &audio.codec);
         Self::counter_row(
-            ui,
+            sink,
             "  periods",
             format!(
                 "{} ({:.1}/s)",
@@ -2058,7 +2071,7 @@ impl ArgosApp {
             ),
         );
         Self::counter_row(
-            ui,
+            sink,
             "  underruns",
             format!(
                 "{} ({} periods silent)",
@@ -2067,7 +2080,7 @@ impl ArgosApp {
             ),
         );
         Self::counter_row(
-            ui,
+            sink,
             "  overruns",
             format!(
                 "{} ({} periods clipped)",
@@ -2076,7 +2089,7 @@ impl ArgosApp {
             ),
         );
         Self::counter_row(
-            ui,
+            sink,
             "  drift",
             format!(
                 "{} samples ({:.1}/s), {} device errors, {} restarts",
@@ -2095,6 +2108,7 @@ impl ArgosApp {
     /// the sidebar is not what anyone is looking at.
     fn metrics_window(&mut self, ctx: &egui::Context) {
         let mut reset = false;
+        let mut copy = false;
         let mut close = false;
         let window = egui::Window::new("Pipeline")
             .collapsible(false)
@@ -2109,178 +2123,36 @@ impl ArgosApp {
                     if ui.small_button("Reset").clicked() {
                         reset = true;
                     }
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy every number below to the clipboard")
+                        .clicked()
+                    {
+                        copy = true;
+                    }
                     if ui.small_button("Close").clicked() {
                         close = true;
                     }
                 });
                 ui.separator();
 
-                if let Some(share) = self.share.as_ref() {
-                    let m = &share.metrics;
-                    let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
-                    if let Some(capture) = share.audio_capture.as_ref() {
-                        Self::audio_rows(ui, "Capture", capture.state().metrics(), secs);
-                    }
-                    ui.label(RichText::new("Sending").strong());
-                    Self::stage_row(ui, "acquire", &m.acquire);
-                    Self::stage_row(ui, "convert", &m.convert);
-                    Self::stage_row(ui, "encode", &m.encode);
-                    Self::stage_row(ui, "packetize", &m.packetize);
-                    Self::stage_row(ui, "write", &m.write);
-                    ui.separator();
-                    Self::counter_row(
-                        ui,
-                        "captured",
-                        format!(
-                            "{} ({:.1} fps, {} dropped)",
-                            m.captured.frames(),
-                            m.captured.frames() as f32 / secs,
-                            m.captured.dropped()
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "encoded",
-                        format!(
-                            "{} ({:.1} fps, {} dropped)",
-                            m.encoded.frames(),
-                            m.encoded.frames() as f32 / secs,
-                            m.encoded.dropped()
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "bitrate",
-                        format!(
-                            "{:.2} Mbps, {} keyframes, last IDR {} KiB",
-                            m.encoded_bytes.get() as f32 * 8.0 / secs / 1_000_000.0,
-                            m.keyframes.get(),
-                            m.last_keyframe_bytes.get() / 1024
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "errors",
-                        format!(
-                            "{} encode, {} video write, {} audio write",
-                            m.encode_errors.get(),
-                            m.write_errors.get(),
-                            m.audio_errors.get()
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "audio out",
-                        format!(
-                            "{} frames ({:.1}/s), {} KiB",
-                            m.audio_frames.get(),
-                            m.audio_frames.get() as f32 / secs,
-                            m.audio_bytes.get() / 1024
-                        ),
-                    );
-                    if let Some(quality) = share.quality.last_reason() {
-                        let rung = share.quality.rung();
-                        Self::counter_row(
-                            ui,
-                            "adaptive",
-                            format!(
-                                "rung {rung} of {}, {:.1}% smoothed loss — {quality}",
-                                argos_core::quality::LADDER.len() - 1,
-                                share.quality.smoothed_loss()
-                            ),
-                        );
-                    }
-                }
-
-                if let Some(view) = self.view.as_ref() {
-                    if self.share.is_some() {
-                        ui.separator();
-                    }
-                    let m = &view.metrics;
-                    let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
-                    if let Some(playback) = view.audio_playback.as_ref() {
-                        Self::audio_rows(ui, "Speaker", playback.state().metrics(), secs);
-                    }
-                    ui.label(RichText::new("Receiving").strong());
-                    Self::stage_row(ui, "callback", &m.receive);
-                    Self::stage_row(ui, "depacketize", &m.depacketize);
-                    Self::stage_row(ui, "decode", &m.decode);
-                    Self::stage_row(ui, "present", &m.present);
-                    ui.separator();
-                    Self::counter_row(
-                        ui,
-                        "packets",
-                        format!(
-                            "{} ({:.0}/s), {} lost, {:.2} Mbps",
-                            m.packets.get(),
-                            m.packets.get() as f32 / secs,
-                            m.sequence_losses.get(),
-                            m.bytes.get() as f32 * 8.0 / secs / 1_000_000.0
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "frames",
-                        format!(
-                            "{} decoded ({:.1} fps), {} replaced before display, {} no-picture",
-                            m.decoded.frames(),
-                            m.decoded.frames() as f32 / secs,
-                            m.presented.dropped(),
-                            m.no_picture.get()
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "errors",
-                        format!(
-                            "{} decode, {} audio",
-                            m.decode_errors.get(),
-                            m.audio_errors.get()
-                        ),
-                    );
-                    Self::counter_row(
-                        ui,
-                        "audio in",
-                        format!(
-                            "{} packets ({:.1}/s), {} decoded, {} dropped by device",
-                            m.audio_packets.get(),
-                            m.audio_packets.get() as f32 / secs,
-                            m.audio_decoded.frames(),
-                            m.audio_decoded.dropped()
-                        ),
-                    );
-                    // What the sharer is being told, and how many times
-                    // recovery has actually been asked for. A count, not a
-                    // timestamp: "idle" and "never needed" look identical on a
-                    // clock and mean completely different things.
-                    if view.sharer_id.is_some() {
-                        Self::counter_row(
-                            ui,
-                            "recovery",
-                            match view.quality.recoveries {
-                                0 => "no keyframes requested".to_string(),
-                                count => format!(
-                                    "{count} keyframes requested, last {:.1} s ago, \
-                                     {:.1}% loss at the time",
-                                    view.quality.last_keyframe_request.elapsed().as_secs_f32(),
-                                    view.quality.requested_at_loss
-                                ),
-                            },
-                        );
-                    } else {
-                        Self::counter_row(ui, "recovery", "no LAN peer — unavailable".to_string());
-                    }
-                }
-
-                if self.share.is_none() && self.view.is_none() {
-                    ui.label(RichText::new("Idle — nothing is streaming.").weak());
-                }
+                let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
+                Self::metrics_body(ui, self.share.as_ref(), self.view.as_ref(), secs);
             });
         if window.is_none() {
             self.show_metrics = false;
         }
         if close {
             self.show_metrics = false;
+        }
+        if copy {
+            let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
+            let mut report = format!(
+                "Argos pipeline report — window {secs:.1} s\n\
+                 (rates are per second over that window)\n"
+            );
+            Self::metrics_body(&mut report, self.share.as_ref(), self.view.as_ref(), secs);
+            ctx.copy_text(report);
         }
         if reset {
             self.metrics_since = Instant::now();
@@ -2290,6 +2162,197 @@ impl ArgosApp {
             if let Some(metrics) = self.view.as_ref().map(|view| &view.metrics) {
                 Self::reset_receiver(metrics);
             }
+        }
+    }
+
+    /// The readout rows, written to whichever [`ReportSink`] is passed.
+    ///
+    /// The floating window and the copied report both call this, so the text on
+    /// the clipboard cannot drift from the text on screen.
+    fn metrics_body<S: ReportSink>(
+        sink: &mut S,
+        share: Option<&ShareSession>,
+        view: Option<&ViewSession>,
+        secs: f32,
+    ) {
+        if let Some(share) = share {
+            let m = &share.metrics;
+            if let Some(capture) = share.audio_capture.as_ref() {
+                Self::audio_rows(sink, "Capture", capture.state().metrics(), secs);
+            }
+            sink.heading("Sending");
+            Self::stage_row(sink, "acquire", &m.acquire);
+            Self::stage_row(sink, "convert", &m.convert);
+            Self::stage_row(sink, "encode", &m.encode);
+            Self::stage_row(sink, "packetize", &m.packetize);
+            Self::stage_row(sink, "write", &m.write);
+            sink.separator();
+            Self::counter_row(
+                sink,
+                "captured",
+                format!(
+                    "{} ({:.1} fps, {} dropped)",
+                    m.captured.frames(),
+                    m.captured.frames() as f32 / secs,
+                    m.captured.dropped()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "resolution",
+                format!(
+                    "{}x{} captured -> {}x{} encoded",
+                    m.captured_width.get(),
+                    m.captured_height.get(),
+                    m.encoded_width.get(),
+                    m.encoded_height.get()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "queued",
+                format!(
+                    "{} ({:.1} fps, {} dropped)",
+                    m.queued.frames(),
+                    m.queued.frames() as f32 / secs,
+                    m.queued.dropped()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "encoded",
+                format!(
+                    "{} ({:.1} fps, {} dropped)",
+                    m.encoded.frames(),
+                    m.encoded.frames() as f32 / secs,
+                    m.encoded.dropped()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "bitrate",
+                format!(
+                    "{:.2} Mbps, {} keyframes, last IDR {} KiB",
+                    m.encoded_bytes.get() as f32 * 8.0 / secs / 1_000_000.0,
+                    m.keyframes.get(),
+                    m.last_keyframe_bytes.get() / 1024
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "errors",
+                format!(
+                    "{} encode, {} video write, {} audio write",
+                    m.encode_errors.get(),
+                    m.write_errors.get(),
+                    m.audio_errors.get()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "audio out",
+                format!(
+                    "{} frames ({:.1}/s), {} KiB",
+                    m.audio_frames.get(),
+                    m.audio_frames.get() as f32 / secs,
+                    m.audio_bytes.get() / 1024
+                ),
+            );
+            if let Some(quality) = share.quality.last_reason() {
+                let rung = share.quality.rung();
+                Self::counter_row(
+                    sink,
+                    "adaptive",
+                    format!(
+                        "rung {rung} of {}, {:.1}% smoothed loss — {quality}",
+                        argos_core::quality::LADDER.len() - 1,
+                        share.quality.smoothed_loss()
+                    ),
+                );
+            }
+        }
+
+        if let Some(view) = view {
+            if share.is_some() {
+                sink.separator();
+            }
+            let m = &view.metrics;
+            if let Some(playback) = view.audio_playback.as_ref() {
+                Self::audio_rows(sink, "Speaker", playback.state().metrics(), secs);
+            }
+            sink.heading("Receiving");
+            Self::stage_row(sink, "callback", &m.receive);
+            Self::stage_row(sink, "depacketize", &m.depacketize);
+            Self::stage_row(sink, "decode", &m.decode);
+            Self::stage_row(sink, "present", &m.present);
+            sink.separator();
+            Self::counter_row(
+                sink,
+                "packets",
+                format!(
+                    "{} ({:.0}/s), {} lost, {:.2} Mbps",
+                    m.packets.get(),
+                    m.packets.get() as f32 / secs,
+                    m.sequence_losses.get(),
+                    m.bytes.get() as f32 * 8.0 / secs / 1_000_000.0
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "frames",
+                format!(
+                    "{} decoded ({:.1} fps), {} replaced before display, {} no-picture",
+                    m.decoded.frames(),
+                    m.decoded.frames() as f32 / secs,
+                    m.presented.dropped(),
+                    m.no_picture.get()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "errors",
+                format!(
+                    "{} decode, {} audio",
+                    m.decode_errors.get(),
+                    m.audio_errors.get()
+                ),
+            );
+            Self::counter_row(
+                sink,
+                "audio in",
+                format!(
+                    "{} packets ({:.1}/s), {} decoded, {} dropped by device",
+                    m.audio_packets.get(),
+                    m.audio_packets.get() as f32 / secs,
+                    m.audio_decoded.frames(),
+                    m.audio_decoded.dropped()
+                ),
+            );
+            // What the sharer is being told, and how many times recovery has
+            // actually been asked for. A count, not a timestamp: "idle" and
+            // "never needed" look identical on a clock and mean completely
+            // different things.
+            if view.sharer_id.is_some() {
+                Self::counter_row(
+                    sink,
+                    "recovery",
+                    match view.quality.recoveries {
+                        0 => "no keyframes requested".to_string(),
+                        count => format!(
+                            "{count} keyframes requested, last {:.1} s ago, \
+                             {:.1}% loss at the time",
+                            view.quality.last_keyframe_request.elapsed().as_secs_f32(),
+                            view.quality.requested_at_loss
+                        ),
+                    },
+                );
+            } else {
+                Self::counter_row(sink, "recovery", "no LAN peer — unavailable".to_string());
+            }
+        }
+
+        if share.is_none() && view.is_none() {
+            sink.note("Idle — nothing is streaming.");
         }
     }
 
@@ -2311,6 +2374,10 @@ impl ArgosApp {
             &metrics.encoded_bytes,
             &metrics.last_keyframe_bytes,
             &metrics.keyframes,
+            &metrics.captured_width,
+            &metrics.captured_height,
+            &metrics.encoded_width,
+            &metrics.encoded_height,
             &metrics.encode_errors,
             &metrics.write_errors,
             &metrics.audio_frames,
@@ -2379,6 +2446,61 @@ impl ArgosApp {
             "offline"
         }
     }
+}
+
+/// Where a pipeline readout is written: the floating window, or the clipboard.
+///
+/// Both render through the same row helpers, so the copied report and the
+/// on-screen text cannot drift apart.
+trait ReportSink {
+    /// A section title, e.g. `Sending`.
+    fn heading(&mut self, text: &str);
+    /// A plain, de-emphasised line, e.g. the idle message.
+    fn note(&mut self, text: &str);
+    /// One pre-formatted readout row.
+    fn line(&mut self, text: String);
+    /// A blank separator between sections.
+    fn separator(&mut self);
+}
+
+impl ReportSink for egui::Ui {
+    fn heading(&mut self, text: &str) {
+        self.label(RichText::new(text).strong());
+    }
+
+    fn note(&mut self, text: &str) {
+        self.label(RichText::new(text).weak());
+    }
+
+    fn line(&mut self, text: String) {
+        self.monospace(text);
+    }
+
+    fn separator(&mut self) {
+        egui::Ui::separator(self);
+    }
+}
+
+impl ReportSink for String {
+    fn heading(&mut self, text: &str) {
+        if !self.is_empty() {
+            self.push('\n');
+        }
+        self.push_str(text);
+        self.push('\n');
+    }
+
+    fn note(&mut self, text: &str) {
+        self.push_str(text);
+        self.push('\n');
+    }
+
+    fn line(&mut self, text: String) {
+        self.push_str(&text);
+        self.push('\n');
+    }
+
+    fn separator(&mut self) {}
 }
 
 impl eframe::App for ArgosApp {

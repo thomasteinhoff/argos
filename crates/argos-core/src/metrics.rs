@@ -231,6 +231,14 @@ pub struct SenderMetrics {
     /// Bytes in the most recently encoded keyframe.
     pub last_keyframe_bytes: Counter,
     pub keyframes: Counter,
+    /// Dimensions of the frame the backend produced, before any scaling. The
+    /// difference from the encoded dimensions is the scaling cost, and the
+    /// encoded size is what the H.264 encoder's time is spent on.
+    pub captured_width: Counter,
+    pub captured_height: Counter,
+    /// Dimensions actually handed to the H.264 encoder, after any scaling.
+    pub encoded_width: Counter,
+    pub encoded_height: Counter,
     /// H.264 encoder errors.
     pub encode_errors: Counter,
     /// RTP writes that failed.

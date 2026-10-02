@@ -14,9 +14,14 @@ use std::time::Duration;
 
 /// Heights the controller may select, best first.
 ///
-/// Each step is roughly a halving of pixel count below 720p, which is what
+/// `None` is native: whatever the capture backend produced. It sits above 720p
+/// so a native share is not forced to jump straight from full resolution to
+/// 540p — the 720p rung in between is what keeps an up-step from more than
+/// doubling the pixel count in one move.
+///
+/// Each step below 720p is roughly a halving of pixel count, which is what
 /// makes a step actually relieve the link rather than nibble at it.
-pub const LADDER: [Option<u32>; 4] = [Some(720), Some(540), Some(360), Some(240)];
+pub const LADDER: [Option<u32>; 5] = [None, Some(720), Some(540), Some(360), Some(240)];
 
 /// Loss above this, sustained, justifies stepping down.
 const DOWN_LOSS: f32 = 3.0;
@@ -74,6 +79,12 @@ pub enum Decision {
 pub struct Controller {
     /// Current position in [`LADDER`].
     rung: usize,
+    /// Best rung the controller may climb back to: the user's own choice.
+    ///
+    /// Steps down are unrestricted, but recovery never goes past this. A quiet
+    /// link does not license spending bandwidth on a height the user did not
+    /// ask for, and without the cap a 540p choice would drift up to native.
+    ceiling: usize,
     /// Smoothed loss. The raw measurement is spiky enough that thresholding it
     /// directly would make the controller jump on single bad windows.
     loss: f32,
@@ -108,6 +119,7 @@ impl Controller {
             .unwrap_or(0);
         Self {
             rung,
+            ceiling: rung,
             loss: 0.0,
             samples: 0,
             drops: 0.0,
@@ -122,16 +134,16 @@ impl Controller {
 
     /// Starts at the user's chosen quality rather than assuming 720p.
     ///
-    /// "Native" has no rung in the ladder. It is treated as rung 0, so a link
-    /// that is fine leaves native alone and a link that is not gets the first
-    /// real step rather than a no-op.
+    /// The choice is also the ceiling: recovery climbs back to it and no
+    /// higher. An unknown height (including 1080p, which is not a ladder rung)
+    /// is treated as native, so it too can step down and return.
     pub fn at_height(height: Option<u32>) -> Self {
         let mut controller = Self::new();
-        if let Some(position) = LADDER.iter().position(|candidate| *candidate == height) {
-            controller.rung = position;
-        } else {
-            controller.rung = 0;
-        }
+        controller.rung = LADDER
+            .iter()
+            .position(|candidate| *candidate == height)
+            .unwrap_or(0);
+        controller.ceiling = controller.rung;
         controller
     }
 
@@ -294,13 +306,12 @@ impl Controller {
         let next = if down {
             self.rung + 1
         } else {
-            match self.rung.checked_sub(1) {
-                Some(rung) => rung,
-                None => {
-                    self.clear_streaks();
-                    return None;
-                }
+            // Never climb back above the user's own choice.
+            if self.rung <= self.ceiling {
+                self.clear_streaks();
+                return None;
             }
+            self.rung - 1
         };
         if next >= LADDER.len() {
             // Already at the floor. Clear the streak so the controller stops
@@ -393,7 +404,7 @@ mod tests {
     #[test]
     fn sustained_loss_steps_down() {
         let mut controller = controller();
-        assert_eq!(run(&mut controller, 8.0, 10), Some(1));
+        assert_eq!(run(&mut controller, 8.0, 10), Some(2));
         assert!(controller.is_auto());
     }
 
@@ -421,7 +432,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(controller.height(), LADDER[ticks.len()]);
+        assert_eq!(controller.height(), LADDER[1 + ticks.len()]);
     }
 
     /// One burst is not a trend. Without the hold this would step down on a
@@ -645,7 +656,7 @@ mod tests {
         let mut controller = controller();
         run(&mut controller, 8.0, 10);
         assert!(controller.is_auto());
-        controller.reset(Some(1080));
+        controller.reset(Some(720));
         assert_eq!(controller.height(), Some(720));
         assert!(!controller.is_auto());
     }
@@ -665,7 +676,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(stepped, Some(1));
+        assert_eq!(stepped, Some(2));
         assert!(controller.is_auto());
         let reason = controller.last_reason().unwrap_or_default();
         assert!(
@@ -737,5 +748,44 @@ mod tests {
             }
         }
         panic!("never climbed back once the encoder had headroom");
+    }
+
+    /// A native share steps down to 720p first, not straight to 540p, and can
+    /// climb all the way back to native. The rung in between is what stops the
+    /// recovery from more than doubling the pixel count in one move.
+    #[test]
+    fn a_native_share_steps_down_through_720p_and_back() {
+        let mut controller = Controller::at_height(None);
+        assert_eq!(controller.height(), None);
+        let start = Instant::now();
+        let mut first = None;
+        for tick in 0..40 {
+            let at = start + Duration::from_millis(tick as u64 * 500);
+            if let Decision::Step(rung) = controller.update(busy(9.0), at) {
+                first = Some(rung);
+                break;
+            }
+        }
+        assert_eq!(first, Some(1), "native should step down to 720p first");
+        assert_eq!(controller.height(), Some(720));
+        run(&mut controller, 0.0, 600);
+        assert_eq!(
+            controller.height(),
+            None,
+            "native is the ceiling and must be reachable again"
+        );
+    }
+
+    /// The user's choice is a ceiling, not merely a starting point. A 540p
+    /// share must not spend bandwidth climbing to native on a quiet link.
+    #[test]
+    fn recovery_never_climbs_above_the_user_choice() {
+        let mut controller = Controller::at_height(Some(540));
+        run(&mut controller, 9.0, 20);
+        assert!(controller.rung() > 2);
+        // A long, clean run may return to 540 and no further.
+        run(&mut controller, 0.0, 600);
+        assert_eq!(controller.height(), Some(540));
+        assert_eq!(controller.rung(), 2);
     }
 }

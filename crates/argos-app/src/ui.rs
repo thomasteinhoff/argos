@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -74,9 +74,21 @@ enum EncodeMsg {
         width: u32,
         height: u32,
     },
-    Quality {
-        height: Option<u32>,
-    },
+}
+
+/// Packs a resolution choice into the atomic the encode worker polls.
+///
+/// A negative value means "native" (no scaling); anything else is a target
+/// height in pixels. The target travels as an atomic rather than as an
+/// [`EncodeMsg`] because it must not share the frame queue: that queue is full
+/// exactly when this matters (the encoder is behind), and a control message
+/// behind a backlog of stale frames would be dropped or applied minutes late.
+fn encode_target(height: Option<u32>) -> i32 {
+    height.map_or(-1, |height| height as i32)
+}
+
+fn decode_target(value: i32) -> Option<u32> {
+    (value >= 0).then_some(value as u32)
 }
 
 #[derive(Default)]
@@ -94,6 +106,7 @@ fn encode_worker(
     stats: Arc<Mutex<EncodeStats>>,
     metrics: Arc<SenderMetrics>,
     force_keyframe: Arc<AtomicBool>,
+    target_height: Arc<AtomicI32>,
 ) {
     // RTP timestamps come from elapsed wall time, not from the frame rate.
     // The counter form (`timestamp += 90_000 / fps`) claims a fixed interval
@@ -103,6 +116,10 @@ fn encode_worker(
     // encoder's own configuration, set before this thread starts.
     let clock = h264::Clock::new();
     let mut last_keyframe = Instant::now();
+    // The target the encoder is currently configured for. Compared against the
+    // shared atomic on every frame, so a resolution change is picked up on the
+    // next frame regardless of how backed up the frame queue is.
+    let mut applied_target = target_height.load(Ordering::Relaxed);
     // Set when an intra frame has been asked for but not yet encoded. The flag
     // outlives the request, because the frame that carries the intra arrives
     // later — and that frame's size is the number worth measuring, not the
@@ -110,14 +127,6 @@ fn encode_worker(
     let mut pending_keyframe = false;
     while let Ok(msg) = rx.recv() {
         match msg {
-            EncodeMsg::Quality { height } => {
-                encoder.set_target_height(height);
-                // A resolution change is unviewable until the next intra frame,
-                // so this one is never optional.
-                encoder.force_keyframe();
-                last_keyframe = Instant::now();
-                pending_keyframe = true;
-            }
             EncodeMsg::Frame {
                 rgba,
                 width,
@@ -125,6 +134,22 @@ fn encode_worker(
             } => {
                 metrics.captured_width.set(width as u64);
                 metrics.captured_height.set(height as u64);
+                // Pick up an adaptive or user resolution change. This is polled
+                // rather than queued: the frame queue fills up precisely when
+                // the encoder is behind, which is exactly when the controller
+                // is trying to lower the resolution, so a queued control
+                // message would be dropped by the very congestion it exists to
+                // relieve.
+                let target = target_height.load(Ordering::Relaxed);
+                if target != applied_target {
+                    applied_target = target;
+                    encoder.set_target_height(decode_target(target));
+                    // A resolution change is unviewable until the next intra
+                    // frame, so this one is never optional.
+                    encoder.force_keyframe();
+                    last_keyframe = Instant::now();
+                    pending_keyframe = true;
+                }
                 // A viewer asking for recovery. An atomic flag rather than a
                 // message: the frame queue below is small and fills up exactly
                 // when the machine is struggling, and a dropped request would
@@ -226,9 +251,9 @@ struct ShareSession {
     /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
     /// Pure state machine: see `argos_core::quality`.
     quality: QualityController,
-    /// Last height this controller asked for, so a repeat decision is not
-    /// re-sent to the encoder.
-    applied_height: Option<u32>,
+    /// Target height the encode worker polls. An atomic, not a message, so a
+    /// resolution change is never lost behind a full frame queue.
+    target_height: Arc<AtomicI32>,
     /// Why the height last changed, for the UI.
     quality_note: Option<String>,
     /// Encoder-handoff counters as of the last report, so the drop *rate* over
@@ -661,6 +686,8 @@ impl ArgosApp {
         let worker_sharer = Arc::clone(&sharer);
         let force_keyframe = Arc::new(AtomicBool::new(false));
         let worker_force_keyframe = Arc::clone(&force_keyframe);
+        let target_height = Arc::new(AtomicI32::new(encode_target(self.share_height)));
+        let worker_target_height = Arc::clone(&target_height);
         let worker_metrics = self
             .capture
             .as_ref()
@@ -676,6 +703,7 @@ impl ArgosApp {
                     worker_stats,
                     worker_metrics,
                     worker_force_keyframe,
+                    worker_target_height,
                 )
             }) {
             Ok(join) => join,
@@ -718,7 +746,7 @@ impl ArgosApp {
             audio_timestamp: 0,
             audio_frames_sent: 0,
             quality: QualityController::at_height(self.share_height),
-            applied_height: self.share_height,
+            target_height,
             quality_note: None,
             load_offered: 0,
             load_dropped: 0,
@@ -950,8 +978,10 @@ impl ArgosApp {
 
     /// Feeds a viewer's link measurement into the adaptive quality controller.
     ///
-    /// Runs on the UI thread, so it must not block. It only pushes to the
-    /// encode worker's channel, and only when the decision is actually new.
+    /// Runs on the UI thread, so it must not block. It publishes the chosen
+    /// height to the lock-free target the encode worker polls; unlike the frame
+    /// queue it cannot be dropped, which is what makes adaptive resolution
+    /// actually reach the encoder while the encoder is the bottleneck.
     fn apply_report(&mut self, id: &str, loss: f32, fps: f32) {
         if !self.auto_quality {
             return;
@@ -973,11 +1003,9 @@ impl ArgosApp {
         };
         let height = share.quality.height();
         share.quality_note = share.quality.last_reason().map(str::to_string);
-        if share.applied_height == height {
-            return;
-        }
-        share.applied_height = height;
-        let _ = share.tx.try_send(EncodeMsg::Quality { height });
+        share
+            .target_height
+            .store(encode_target(height), Ordering::Relaxed);
     }
 
     fn receive_callback(
@@ -1595,11 +1623,10 @@ impl ArgosApp {
                 // Turning it off must restore whatever the user picked, since the
                 // controller may have moved the encoder somewhere else.
                 share.quality.reset(self.share_height);
-                share.applied_height = self.share_height;
                 share.quality_note = None;
-                let _ = share.tx.try_send(EncodeMsg::Quality {
-                    height: self.share_height,
-                });
+                share
+                    .target_height
+                    .store(encode_target(self.share_height), Ordering::Relaxed);
             }
         }
         // Show what the controller is actually doing. A silent resolution change is
@@ -1631,11 +1658,10 @@ impl ArgosApp {
                 // A manual choice wins. Resetting the controller stops it from
                 // undoing this on evidence gathered before the choice was made.
                 share.quality.reset(share_height);
-                share.applied_height = share_height;
                 share.quality_note = None;
-                let _ = share.tx.try_send(EncodeMsg::Quality {
-                    height: share_height,
-                });
+                share
+                    .target_height
+                    .store(encode_target(share_height), Ordering::Relaxed);
             }
         }
 
@@ -2585,5 +2611,23 @@ impl eframe::App for ArgosApp {
         if self.show_settings {
             self.settings_window(ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_target, encode_target};
+
+    #[test]
+    fn the_height_target_round_trips_through_the_atomic() {
+        for height in [None, Some(2), Some(240), Some(540), Some(720), Some(1080)] {
+            assert_eq!(decode_target(encode_target(height)), height);
+        }
+    }
+
+    #[test]
+    fn native_is_a_negative_sentinel_not_a_height() {
+        assert!(encode_target(None) < 0);
+        assert_eq!(decode_target(-1), None);
     }
 }

@@ -377,6 +377,13 @@ struct ViewSession {
     /// with the transport's packet callback.
     metrics: Arc<ReceiverMetrics>,
     texture: Option<Preview>,
+    /// Width-to-height ratio of the first decoded frame.
+    ///
+    /// Remembered for the whole session so the on-screen box is sized from the
+    /// source shape, not the current decoded resolution. When the sharer drops
+    /// the resolution the picture is stretched into the same rectangle rather
+    /// than shrinking, so the window is stable while watching.
+    display_aspect: Option<f32>,
     audio_playback: Option<Arc<AudioPlayback>>,
     audio_error: Option<String>,
     quality: Quality,
@@ -873,6 +880,7 @@ impl ArgosApp {
             stats,
             metrics,
             texture: None,
+            display_aspect: None,
             audio_playback,
             audio_error,
             quality: Quality::default(),
@@ -1351,6 +1359,16 @@ impl ArgosApp {
         let Some(frame) = view.latest.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
+        // Fix the display aspect on the first frame. The ladder preserves the
+        // source ratio, so every later resolution shares it and the box stays
+        // put when the resolution drops.
+        view.display_aspect.get_or_insert_with(|| {
+            if frame.height > 0 {
+                frame.width as f32 / frame.height as f32
+            } else {
+                16.0 / 9.0
+            }
+        });
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
             &frame.rgba,
@@ -1451,23 +1469,27 @@ impl ArgosApp {
         }
     }
 
-    fn render_image(ui: &mut egui::Ui, preview: &Preview) {
-        let target = egui::vec2(preview.width as f32, preview.height as f32);
-        if target.x <= 0.0 || target.y <= 0.0 {
+    /// Draws the decoded frame into a fixed box, stretched to fill it.
+    ///
+    /// The box depends only on the available space and the source aspect, never
+    /// on the decoded resolution, and it is drawn at the source aspect so a
+    /// non-16:9 monitor is not distorted. A resolution drop therefore stretches
+    /// the pixels into the same rectangle instead of shrinking the video, which
+    /// is the point: the window no longer jumps size as the sharer's adaptive
+    /// controller moves up and down the ladder.
+    fn render_image(ui: &mut egui::Ui, preview: &Preview, aspect: f32) {
+        if !aspect.is_finite() || aspect <= 0.0 {
             return;
         }
-        let max = egui::vec2(1024.0, 576.0);
-        let cap = (max.x / target.x).min(max.y / target.y).min(1.0);
-        let mut scale = cap;
+        // Largest the video is ever shown. A 1080p source used to land exactly
+        // here, so any lower resolution now scales up to match.
+        let cap = egui::vec2(1024.0, 576.0);
         let available = ui.available_size();
-        if available.x > 1.0 && available.y > 1.0 {
-            scale = scale
-                .min(available.x / target.x)
-                .min(available.y / target.y);
-        }
-        scale = scale.max((360.0 / target.y).min(1.0).min(cap));
-        let size = egui::vec2(target.x * scale, target.y * scale);
-        ui.image((preview.texture.id(), size));
+        let box_width = cap.x.min(available.x.max(1.0));
+        let box_height = cap.y.min(available.y.max(1.0));
+        let width = box_width.min(box_height * aspect);
+        let height = width / aspect;
+        ui.image((preview.texture.id(), egui::vec2(width, height)));
     }
 
     fn network_status(&mut self, ui: &mut egui::Ui) {
@@ -1748,7 +1770,8 @@ impl ArgosApp {
                     preview.width, preview.height, self.fps
                 ));
                 ui.add_space(8.0);
-                Self::render_image(ui, preview);
+                let aspect = preview.width as f32 / preview.height.max(1) as f32;
+                Self::render_image(ui, preview, aspect);
             }
         } else if self.live {
             ui.label(RichText::new("Press Preview to see your screen here.").weak());
@@ -2064,7 +2087,10 @@ impl ArgosApp {
             ui.add_space(8.0);
             if let Some(preview) = &view.texture {
                 ui.label(format!("Stream {}x{}", preview.width, preview.height));
-                Self::render_image(ui, preview);
+                let aspect = view
+                    .display_aspect
+                    .unwrap_or(preview.width as f32 / preview.height as f32);
+                Self::render_image(ui, preview, aspect);
             } else if view.stats.lock().map(|s| s.packets).unwrap_or(0) > 0 {
                 ui.label(
                     RichText::new("Receiving stream data but no decoded picture yet…")

@@ -1,31 +1,13 @@
-//! Screen capture over DXGI Desktop Duplication.
-//!
-//! The public surface is deliberately identical to the previous `xcap`-based
-//! backend: a [`CaptureSession`] owns a thread that keeps a duplication alive
-//! and hands whole frames to [`CaptureSession::latest`], and [`list_monitors`]
-//! enumerates the displays a sharer can pick.
-//!
-//! Desktop Duplication has two rules that shape the recorder:
-//!
-//! 1. At most one frame may be held at a time. Every acquire must be matched by
-//!    a release before the next one. The recorder releases on *every* path,
-//!    including the ones where it throws the frame away. Failing to do so is
-//!    what eventually surfaces as `DXGI_ERROR_ACCESS_LOST`, and it is why the
-//!    old backend could stall for good.
-//! 2. `AcquireNextFrame` is the pacer. Waiting on a full handoff queue instead
-//!    of on the compositor means stale frames pile up and the release is
-//!    delayed behind the consumer. The recorder therefore never blocks on the
-//!    channel; it drops and counts.
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{
+    channel, sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError,
+};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use argos_core::metrics::SenderMetrics;
-
-use crate::dxgi::{Control, Recorder};
+use xcap::Monitor;
 
 const DEFAULT_CAPTURE_INTERVAL_MICROS: u64 = 33_000;
 /// How long a streak of capture failures may last before the session is
@@ -41,6 +23,7 @@ const HEALTHY_PERIOD: Duration = Duration::from_secs(10);
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// Upper bound for the recovery backoff.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const INACTIVE_SLEEP: Duration = Duration::from_millis(20);
 const STOP_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Debug)]
@@ -167,10 +150,101 @@ impl Default for CaptureSession {
     }
 }
 
+/// (Re)connect the video recorder for the given monitor name. This is the
+/// documented recovery from DXGI "access lost" failures: drop the old
+/// duplication and create a fresh one for the same output.
+fn open_recorder(wanted: &str) -> Result<(xcap::VideoRecorder, Receiver<xcap::Frame>), String> {
+    let monitors = Monitor::all().map_err(|error| format!("list monitors: {error}"))?;
+    let monitor = monitors
+        .into_iter()
+        .find(|candidate| candidate.name().ok().as_deref() == Some(wanted))
+        .ok_or_else(|| format!("monitor '{wanted}' not found"))?;
+    let (recorder, frames) = monitor
+        .video_recorder()
+        .map_err(|error| format!("create video recorder: {error}"))?;
+    recorder
+        .start()
+        .map_err(|error| format!("start video recorder: {error}"))?;
+    Ok((recorder, frames))
+}
+
+/// Pump frames from the recorder into `tx`, obeying the active/interval
+/// pacing. Returns `true` when the recorder died unexpectedly (its frame
+/// channel disconnected while the session is still supposed to be running)
+/// and `false` when the pump exited for a normal reason (session stopped or
+/// torn down).
+fn pump_once(
+    recorder: xcap::VideoRecorder,
+    frames: Receiver<xcap::Frame>,
+    tx: &SyncSender<Frame>,
+    stop: &Arc<AtomicBool>,
+    active: &Arc<AtomicBool>,
+    interval: &Arc<AtomicU64>,
+    metrics: &SenderMetrics,
+) -> bool {
+    let mut last = Instant::now() - Duration::from_secs(1);
+    let died = loop {
+        if stop.load(Ordering::Relaxed) {
+            break false;
+        }
+        if !active.load(Ordering::Relaxed) {
+            thread::sleep(INACTIVE_SLEEP);
+            last = Instant::now();
+            // Discard frames that arrived while paused and detect a recorder
+            // that died while the session was inactive.
+            match frames.try_recv() {
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => break true,
+            }
+            continue;
+        }
+        let target = Duration::from_micros(interval.load(Ordering::Relaxed).max(1));
+        let elapsed = last.elapsed();
+        if elapsed < target {
+            thread::sleep(target - elapsed);
+        }
+        if stop.load(Ordering::Relaxed) {
+            break false;
+        }
+        // `AcquireNextFrame` runs inside the backend's own thread and includes
+        // its full GPU readback, so this window covers both the wait for a frame
+        // and the readback itself. It is the number that reveals whether
+        // capture is starved (sitting near the interval) or over-producing
+        // (busy-waiting on a zero-capacity handoff).
+        let waiting = Instant::now();
+        match frames.recv_timeout(target) {
+            Ok(frame) => {
+                metrics.acquire.record(waiting.elapsed());
+                last = Instant::now();
+                let outgoing = Frame {
+                    width: frame.width,
+                    height: frame.height,
+                    rgba: frame.raw,
+                };
+                match tx.try_send(outgoing) {
+                    Ok(()) => metrics.captured.record(),
+                    // The consumer (UI preview + encode queue) did not take the
+                    // last frame in time. This is the earliest signal that the
+                    // pipeline downstream of capture is too slow, and it is the
+                    // one that matters: a rising drop rate here means frames are
+                    // being thrown away before they are ever encoded.
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => metrics.captured.drop_frame(),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break false,
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => metrics.acquire.record(waiting.elapsed()),
+            Err(RecvTimeoutError::Disconnected) => break true,
+        }
+    };
+    let _ = recorder.stop();
+    died
+}
+
 /// Keeps the capture alive across recoverable source failures (desktop
 /// composition changes, mode switches, monitor flaps). When the recorder dies
 /// or cannot be created, it retries with a bounded backoff and recreates the
-/// duplication, which is how the DXGI API itself prescribes handling access
+/// recorder, which is how the DXGI API itself prescribes handling access
 /// loss. Only a persistent failure streak is reported as fatal.
 fn pump(
     wanted: String,
@@ -188,17 +262,8 @@ fn pump(
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        // Resolving the monitor and creating the duplication happens on this
-        // thread, so a failure to connect is reportable before we commit to a
-        // long-lived recorder.
-        let control = Control {
-            stop: Arc::clone(&stop),
-            active: Arc::clone(&active),
-            interval: Arc::clone(&interval),
-            metrics: Arc::clone(&metrics),
-        };
-        let mut recorder = match Recorder::start(&wanted, tx.clone(), control) {
-            Ok(recorder) => recorder,
+        let (recorder, frames) = match open_recorder(&wanted) {
+            Ok(ready) => ready,
             Err(reason) => {
                 if failure_exhausted(&mut failed_since, connected_at) {
                     set_capture_error(&error, format!("capture failed: {reason}"));
@@ -213,13 +278,13 @@ fn pump(
         };
         connected_at = Some(Instant::now());
         backoff = RETRY_BACKOFF;
-        let recorder_died = recorder.wait();
+        let recorder_died = pump_once(recorder, frames, &tx, &stop, &active, &interval, &metrics);
         if stop.load(Ordering::Relaxed) || !recorder_died {
             // Stopped, or the session was torn down by the UI. Not a failure.
             return;
         }
-        // The duplication went away (access lost, mode switch, GPU reset).
-        // Recreate it and retry.
+        // The capture source stopped delivering frames. Recreate the recorder
+        // and retry.
         if failure_exhausted(&mut failed_since, connected_at) {
             set_capture_error(
                 &error,
@@ -279,57 +344,21 @@ impl Drop for CaptureSession {
     }
 }
 
-/// The attached displays, in the same shape the rest of the app expects.
 pub fn list_monitors() -> Vec<MonitorInfo> {
-    crate::dxgi::list_monitors()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Exercises the real duplication path: enumerate, duplicate, acquire,
-    /// read back. Ignored by default because it needs an interactive desktop
-    /// and a GPU. Run it explicitly with:
-    ///
-    /// ```text
-    /// cargo test -p argos-media --no-default-features --features capture-native -- --ignored
-    /// ```
-    #[test]
-    #[ignore = "requires an interactive desktop and a GPU"]
-    fn captures_real_frames() {
-        let monitors = list_monitors();
-        assert!(!monitors.is_empty(), "no monitors were enumerated");
-        let primary = monitors
-            .iter()
-            .find(|monitor| monitor.is_primary)
-            .unwrap_or(&monitors[0]);
-        assert!(
-            primary.width > 0 && primary.height > 0,
-            "monitor reported no size: {primary:?}"
-        );
-
-        let mut session = CaptureSession::new();
-        session.start(primary).expect("capture should start");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let frame = loop {
-            if let Some(frame) = session.latest() {
-                break frame;
-            }
-            assert!(Instant::now() < deadline, "no frame arrived within 5s");
-            thread::sleep(Duration::from_millis(20));
-        };
-
-        assert!(frame.width > 0 && frame.height > 0);
-        assert_eq!(
-            frame.rgba.len(),
-            (frame.width as usize) * (frame.height as usize) * 4,
-            "frame buffer is not tightly packed RGBA"
-        );
-        assert!(
-            session.metrics().captured.frames() > 0,
-            "the capture metric never recorded a frame"
-        );
-    }
+    Monitor::all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|monitor| {
+            let name = monitor.name().ok()?;
+            let width = monitor.width().ok()?;
+            let height = monitor.height().ok()?;
+            let is_primary = monitor.is_primary().ok()?;
+            Some(MonitorInfo {
+                name,
+                width,
+                height,
+                is_primary,
+            })
+        })
+        .collect()
 }

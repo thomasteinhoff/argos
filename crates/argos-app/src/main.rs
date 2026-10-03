@@ -1,3 +1,12 @@
+// Link as a GUI subsystem binary rather than a console one, so launching Argos
+// does not open a cmd window behind the app window. Nothing here writes to
+// stdout or stderr — the only output the console ever carried was a panic
+// message, and the app reports its failures in the UI instead.
+//
+// Excluded from the test build on purpose: the test harness reports through
+// stdout, and a GUI subsystem would swallow every result `cargo test` prints.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod config;
 mod radmin;
 mod ui;

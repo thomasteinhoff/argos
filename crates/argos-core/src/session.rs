@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
@@ -35,6 +36,31 @@ const VIDEO_SSRC: u32 = 0x5a5a_77e1;
 const AUDIO_SSRC: u32 = 0x5a5a_77e2;
 const MTU: usize = 1200;
 const GATHER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an offer may go unanswered before the slot can be handed out again.
+///
+/// Gathering itself is bounded by `GATHER_TIMEOUT`, so anything past that plus a
+/// margin is an offer the viewer never acted on — its datagram was lost, or the
+/// person closed the window. Either way, re-offering beats leaving them on a
+/// connecting screen forever.
+const UNANSWERED_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a connection must sit down before another request earns a fresh
+/// offer for it.
+///
+/// A viewer whose link dropped re-requests every few seconds and gives up after
+/// five tries, so a re-offer has to land inside that window or the reconnect is
+/// lost. The grace period is what keeps it from firing on the first duplicate
+/// click or on a link that is mid-handshake: only a connection that has already
+/// been seen down for this long is one that is not coming back on its own.
+const REOFFER_DELAY: Duration = Duration::from_secs(5);
+
+/// How long a connection that was up may sit down before its slot is freed.
+///
+/// Long enough to ride out a link that dips and recovers on its own, since
+/// tearing the connection down on the first `Disconnected` would turn a blip
+/// into a reconnect.
+const DOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub type PacketCallback = Arc<dyn Fn(&Packet) + Send + Sync>;
 
@@ -199,89 +225,311 @@ async fn wait_for_gathering(state: &Mutex<HandlerState>) -> Result<(), String> {
     }
 }
 
-pub struct Sharer {
+/// Creates an offer and returns it as a signal code, candidates included.
+async fn create_offer(
+    pc: &Arc<dyn PeerConnection>,
+    state: &Mutex<HandlerState>,
+) -> Result<String, String> {
+    let offer = pc
+        .create_offer(None)
+        .await
+        .map_err(|error| error.to_string())?;
+    pc.set_local_description(offer)
+        .await
+        .map_err(|error| error.to_string())?;
+    wait_for_gathering(state).await?;
+    let description = pc
+        .local_description()
+        .await
+        .ok_or_else(|| "no local description".to_string())?;
+    Ok(signal::encode(&description))
+}
+
+/// One viewer's connection to a sharer.
+///
+/// Every viewer gets its own peer connection and its own pair of tracks. The
+/// encoded frame is shared, the transports are not: an SDP is a single-negotiated
+/// description of one connection, so a second viewer on the first connection's
+/// answer would be negotiating against a description that already says `recvonly`
+/// and has no second media section to put them in.
+struct ViewerConn {
     pc: Arc<dyn PeerConnection>,
     track: Arc<TrackLocalStaticRTP>,
     audio_track: Arc<TrackLocalStaticRTP>,
+    state: Arc<Mutex<HandlerState>>,
+    /// Whether this connection ever reached `Connected`.
+    ///
+    /// Distinguishes "the viewer closed their app" from "the viewer never got
+    /// my offer", which the connection state reports identically and which want
+    /// opposite treatment: one frees the slot at once, the other holds it until
+    /// the answer window closes.
+    ever_connected: bool,
+    /// When the connection was first seen without a live peer.
+    down_since: Option<Instant>,
+}
+
+fn video_track() -> TrackLocalStaticRTP {
+    TrackLocalStaticRTP::new(MediaStreamTrack::new(
+        "argos-stream".to_string(),
+        "argos-video".to_string(),
+        "argos-video".to_string(),
+        RtpCodecKind::Video,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(VIDEO_SSRC),
+                ..Default::default()
+            },
+            codec: h264_codec(),
+            ..Default::default()
+        }],
+    ))
+}
+
+fn audio_track() -> TrackLocalStaticRTP {
+    TrackLocalStaticRTP::new(MediaStreamTrack::new(
+        "argos-stream".to_string(),
+        "argos-audio".to_string(),
+        "argos-audio".to_string(),
+        RtpCodecKind::Audio,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(AUDIO_SSRC),
+                ..Default::default()
+            },
+            codec: opus_codec(),
+            ..Default::default()
+        }],
+    ))
+}
+
+pub struct Sharer {
+    /// Live connections, keyed by the viewer's id.
+    ///
+    /// Ordering is irrelevant here: a frame goes to all of them, and the UI keeps
+    /// its own order for display.
+    viewers: Mutex<HashMap<String, ViewerConn>>,
+    udp_addrs: Vec<String>,
+    /// Shared across viewers so every connection sees one monotonic sequence
+    /// space for a given SSRC. Per-viewer packetizers would also be correct —
+    /// each peer connection is its own RTP session — but sharing keeps the
+    /// packetize step off the per-viewer path, and a `Bytes` payload clone is a
+    /// refcount bump rather than a copy.
     packetizer: Mutex<Packetizer>,
     audio_packetizer: Mutex<Packetizer>,
-    state: Arc<Mutex<HandlerState>>,
 }
 
 impl Sharer {
-    pub async fn new(udp_addrs: Vec<String>) -> Result<Self, String> {
+    pub fn new(udp_addrs: Vec<String>) -> Self {
+        Self {
+            viewers: Mutex::new(HashMap::new()),
+            udp_addrs,
+            packetizer: Mutex::new(Packetizer::new(VIDEO_SSRC, VIDEO_PT, MTU)),
+            audio_packetizer: Mutex::new(Packetizer::new(AUDIO_SSRC, AUDIO_PT, MTU)),
+        }
+    }
+
+    /// Opens a connection for one viewer and returns the offer it must answer.
+    ///
+    /// Any previous connection for the same id is closed first, so a peer that
+    /// asks again — a re-request after a dropped link, or a click that arrived
+    /// twice over UDP — gets one connection rather than two tracks fighting
+    /// over the same viewer's packets.
+    pub async fn add_viewer(&self, id: &str) -> Result<String, String> {
+        self.remove_viewer(id).await;
         let state = Arc::new(Mutex::new(HandlerState::default()));
-        let pc = build_pc(state.clone(), None, udp_addrs).await?;
-        let track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
-            "argos-stream".to_string(),
-            "argos-video".to_string(),
-            "argos-video".to_string(),
-            RtpCodecKind::Video,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters {
-                    ssrc: Some(VIDEO_SSRC),
-                    ..Default::default()
-                },
-                codec: h264_codec(),
-                ..Default::default()
-            }],
-        )));
+        let pc = build_pc(state.clone(), None, self.udp_addrs.clone()).await?;
+        let track = Arc::new(video_track());
         pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|error| error.to_string())?;
-        let audio_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
-            "argos-stream".to_string(),
-            "argos-audio".to_string(),
-            "argos-audio".to_string(),
-            RtpCodecKind::Audio,
-            vec![RTCRtpEncodingParameters {
-                rtp_coding_parameters: RTCRtpCodingParameters {
-                    ssrc: Some(AUDIO_SSRC),
-                    ..Default::default()
-                },
-                codec: opus_codec(),
-                ..Default::default()
-            }],
-        )));
+        let audio_track = Arc::new(audio_track());
         pc.add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Self {
-            pc,
-            track,
-            audio_track,
-            packetizer: Mutex::new(Packetizer::new(VIDEO_SSRC, VIDEO_PT, MTU)),
-            audio_packetizer: Mutex::new(Packetizer::new(AUDIO_SSRC, AUDIO_PT, MTU)),
-            state,
-        })
+        let offer = create_offer(&pc, &state).await?;
+        let Ok(mut viewers) = self.viewers.lock() else {
+            let _ = pc.close().await;
+            return Err("sharer viewer lock poisoned".to_string());
+        };
+        viewers.insert(
+            id.to_string(),
+            ViewerConn {
+                pc,
+                track,
+                audio_track,
+                state,
+                ever_connected: false,
+                down_since: None,
+            },
+        );
+        Ok(offer)
     }
 
-    pub async fn create_offer(&self) -> Result<String, String> {
-        let offer = self
-            .pc
-            .create_offer(None)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.pc
-            .set_local_description(offer)
-            .await
-            .map_err(|error| error.to_string())?;
-        wait_for_gathering(&self.state).await?;
-        let description = self
-            .pc
-            .local_description()
-            .await
-            .ok_or_else(|| "no local description".to_string())?;
-        Ok(signal::encode(&description))
-    }
-
-    pub async fn set_answer(&self, code: &str) -> Result<(), String> {
+    /// Answers the offer belonging to one viewer.
+    pub async fn set_answer(&self, id: &str, code: &str) -> Result<(), String> {
+        let pc = self
+            .viewers
+            .lock()
+            .ok()
+            .and_then(|viewers| viewers.get(id).map(|conn| Arc::clone(&conn.pc)))
+            .ok_or_else(|| "that viewer is no longer waiting for an offer".to_string())?;
         let answer =
             signal::decode(code).map_err(|error| format!("invalid answer code: {error}"))?;
-        self.pc
-            .set_remote_description(answer)
+        pc.set_remote_description(answer)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    /// Closes one viewer's connection and forgets it.
+    pub async fn remove_viewer(&self, id: &str) {
+        let conn = self
+            .viewers
+            .lock()
+            .ok()
+            .and_then(|mut viewers| viewers.remove(id));
+        if let Some(conn) = conn {
+            let _ = conn.pc.close().await;
+        }
+    }
+
+    /// Folds a connection's state into its slot, returning whether it is up.
+    ///
+    /// Owns the `down_since` clock, which is the only thing that knows how long
+    /// a connection has been dead — and therefore the only thing that can tell a
+    /// handshake still in progress from a connection that is never going to
+    /// arrive.
+    fn observe(conn: &mut ViewerConn, connected: bool, now: Instant) -> bool {
+        if connected {
+            conn.ever_connected = true;
+            conn.down_since = None;
+            return true;
+        }
+        conn.down_since.get_or_insert(now);
+        false
+    }
+
+    /// Whether a fresh offer is worth making for this viewer.
+    ///
+    /// A request means one of three things: a first click, the same click twice
+    /// (UDP does not dedupe), or a reconnect after the link dropped. The first
+    /// two want the offer already in flight — re-offering would throw away a
+    /// negotiation that is about to succeed. The third wants a new connection,
+    /// and without this it would be answered with the dead one and sit on a
+    /// connecting screen until the viewer gave up.
+    pub fn needs_reoffer(&self, id: &str) -> bool {
+        let now = Instant::now();
+        let Ok(mut viewers) = self.viewers.lock() else {
+            return false;
+        };
+        let Some(conn) = viewers.get_mut(id) else {
+            return false;
+        };
+        let connected = conn
+            .state
+            .lock()
+            .map(|state| state.connected)
+            .unwrap_or(false);
+        if Self::observe(conn, connected, now) {
+            return false;
+        }
+        // Still gathering, and never connected: an answer is not possible yet,
+        // so this is a handshake in progress rather than a failed one. Without
+        // this the second of two clicks inside the gather window would tear down
+        // a negotiation that is about to succeed.
+        if !conn.ever_connected
+            && !conn
+                .state
+                .lock()
+                .map(|state| state.gathering_complete)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        now.duration_since(conn.down_since.unwrap_or(now)) >= REOFFER_DELAY
+    }
+
+    /// Drops connections that are finished, returning the ids it freed.
+    ///
+    /// Called by the UI rather than from the send path, so the `await` on the
+    /// closes is off every frame. The map lock is released first: a close can
+    /// take a moment, and blocking a sender on it would stall the encode thread.
+    pub async fn prune(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut dead: Vec<(String, Arc<dyn PeerConnection>)> = Vec::new();
+        {
+            let Ok(mut viewers) = self.viewers.lock() else {
+                return Vec::new();
+            };
+            for (id, conn) in viewers.iter_mut() {
+                let connected = conn
+                    .state
+                    .lock()
+                    .map(|state| state.connected)
+                    .unwrap_or(false);
+                if Self::observe(conn, connected, now) {
+                    continue;
+                }
+                let limit = if conn.ever_connected {
+                    DOWN_TIMEOUT
+                } else {
+                    UNANSWERED_TIMEOUT
+                };
+                if now.duration_since(conn.down_since.unwrap_or(now)) >= limit {
+                    dead.push((id.clone(), Arc::clone(&conn.pc)));
+                }
+            }
+            for (id, _) in &dead {
+                viewers.remove(id);
+            }
+        }
+        for (_, pc) in &dead {
+            let _ = pc.close().await;
+        }
+        dead.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Tracks a frame has to reach, with the id of the viewer behind each.
+    ///
+    /// Snapshot so the encode thread never holds the map lock across a socket
+    /// write: adding a viewer then never waits on a congested send, and a stuck
+    /// viewer cannot hold up everyone else's picture.
+    ///
+    /// Only connections that are up. A viewer still negotiating has no RTP sender
+    /// to write to, and treating its failure as a dead connection would drop
+    /// someone who is on their way in — they get their first frame from the
+    /// keyframe interval instead, which is the same wait anyone joining a stream
+    /// already has.
+    fn video_targets(&self) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+        self.connected_tracks(true)
+    }
+
+    fn audio_targets(&self) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+        self.connected_tracks(false)
+    }
+
+    fn connected_tracks(&self, video: bool) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+        self.viewers
+            .lock()
+            .map(|viewers| {
+                viewers
+                    .iter()
+                    .filter(|(_, conn)| {
+                        conn.state
+                            .lock()
+                            .map(|state| state.connected)
+                            .unwrap_or(false)
+                    })
+                    .map(|(id, conn)| {
+                        let track = if video {
+                            &conn.track
+                        } else {
+                            &conn.audio_track
+                        };
+                        (id.clone(), Arc::clone(track))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn send_frame(
@@ -306,13 +554,30 @@ impl Sharer {
                 })
                 .collect::<Vec<Packet>>()
         };
+        // No viewer to send to is the normal state between going live and the first
+        // request, not an error worth writing to the stats panel.
+        let targets = self.video_targets();
+        if targets.is_empty() {
+            return Ok(());
+        }
         let _write = StageTimer::new(&metrics.write);
-        for packet in packets {
-            if let Err(error) = self.track.write_rtp(packet).await {
-                metrics.write_errors.incr();
-                return Err(error.to_string());
+        let mut failed = Vec::new();
+        for (id, track) in targets {
+            for packet in &packets {
+                if let Err(_error) = track.write_rtp(packet.clone()).await {
+                    metrics.write_errors.incr();
+                    if !failed.contains(&id) {
+                        failed.push(id);
+                    }
+                    break;
+                }
             }
         }
+        // One dead viewer must not cost everyone else their picture, so the
+        // error is contained to its own connection and the frame still counts as
+        // sent. The slot goes with it, which is what lets the same person be
+        // served again when they ask.
+        self.drop_failed(&failed).await;
         Ok(())
     }
 
@@ -331,30 +596,111 @@ impl Sharer {
                 .map_err(|_| "audio packetizer lock poisoned".to_string())?;
             packetizer.packetize(opus, timestamp, true)
         };
-        for packet in packets {
-            if let Err(error) = self.audio_track.write_rtp(packet).await {
-                metrics.audio_errors.incr();
-                return Err(error.to_string());
+        let targets = self.audio_targets();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut failed = Vec::new();
+        for (id, track) in targets {
+            for packet in &packets {
+                if let Err(_error) = track.write_rtp(packet.clone()).await {
+                    metrics.audio_errors.incr();
+                    if !failed.contains(&id) {
+                        failed.push(id);
+                    }
+                    break;
+                }
             }
         }
+        self.drop_failed(&failed).await;
         Ok(())
     }
 
-    pub fn status(&self) -> &'static str {
-        let current = self.state.lock().ok();
-        match current.as_deref() {
-            Some(state) if state.connected => "Connected",
-            Some(state) if state.gathering_complete => "Waiting for peer",
-            _ => "Gathering",
+    /// Closes the connections whose writes failed.
+    async fn drop_failed(&self, ids: &[String]) {
+        for id in ids {
+            self.remove_viewer(id).await;
         }
     }
 
+    /// Whether one viewer's connection is up.
+    pub fn viewer_connected(&self, id: &str) -> bool {
+        let Ok(viewers) = self.viewers.lock() else {
+            return false;
+        };
+        viewers
+            .get(id)
+            .and_then(|conn| conn.state.lock().ok().map(|state| state.connected))
+            .unwrap_or(false)
+    }
+
+    /// Viewers with a live connection, and the number of slots in total.
+    ///
+    /// Two counts because they answer different questions: the second says
+    /// whether anyone is being served at all, the first says how many people are
+    /// actually watching.
+    pub fn viewer_counts(&self) -> (usize, usize) {
+        self.viewers
+            .lock()
+            .map(|viewers| {
+                let connected = viewers
+                    .values()
+                    .filter(|conn| {
+                        conn.state
+                            .lock()
+                            .map(|state| state.connected)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                (connected, viewers.len())
+            })
+            .unwrap_or((0, 0))
+    }
+
+    pub fn status(&self) -> &'static str {
+        let (connected, slots) = self.viewer_counts();
+        if slots == 0 {
+            return "Waiting for someone to join";
+        }
+        if connected > 0 {
+            return "Connected";
+        }
+        // Every slot is still negotiating. Whether they have finished gathering
+        // is the only thing left to say about it.
+        let gathering = self
+            .viewers
+            .lock()
+            .map(|viewers| {
+                viewers.values().any(|conn| {
+                    !conn
+                        .state
+                        .lock()
+                        .map(|s| s.gathering_complete)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(true);
+        if gathering {
+            "Gathering"
+        } else {
+            "Waiting for peer"
+        }
+    }
+
+    /// True while at least one viewer has a live connection.
     pub fn is_connected(&self) -> bool {
-        self.state.lock().map(|s| s.connected).unwrap_or(false)
+        self.viewer_counts().0 > 0
     }
 
     pub async fn close(&self) {
-        let _ = self.pc.close().await;
+        let conns: Vec<Arc<dyn PeerConnection>> = self
+            .viewers
+            .lock()
+            .map(|mut viewers| viewers.drain().map(|(_, conn)| conn.pc).collect())
+            .unwrap_or_default();
+        for pc in conns {
+            let _ = pc.close().await;
+        }
     }
 }
 

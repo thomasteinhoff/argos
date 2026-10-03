@@ -54,6 +54,22 @@ const REPORT_INTERVAL: Duration = Duration::from_millis(500);
 /// whereas stepping resolution down costs quality and takes seconds to undo.
 const LOSS_BURST: f32 = 2.0;
 
+/// How stale a viewer's link report may be before it is ignored.
+///
+/// The sharer sends one stream to everyone and adapts its single resolution to
+/// the worst of them, so a viewer's report keeps steering the ladder for as long
+/// as it is fresh. Past this the viewer has almost certainly gone, and acting on
+/// its last-known loss would hold the resolution down for nobody.
+const VIEWER_REPORT_TTL: Duration = Duration::from_secs(3);
+
+/// How often the sharer sweeps its viewer slots for connections that are done.
+///
+/// Throttled because the sweep closes peer connections, and that is not work
+/// worth doing sixty times a second. The grace periods that decide whether a
+/// connection counts as done are in seconds, so a half-second sweep cannot miss
+/// anything.
+const VIEWER_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+
 #[derive(Clone, PartialEq, Eq)]
 enum Screen {
     Home,
@@ -231,9 +247,108 @@ fn encode_worker(
     }
 }
 
+/// One viewer's slot in a share.
+///
+/// A share is a single encode fanned out over one peer connection per viewer, so
+/// the UI tracks viewers as peers rather than as a connection. Everything keyed
+/// off "who is this message from" — keyframe requests, link reports, answers —
+/// resolves through this list.
+struct ViewerSlot {
+    /// Peer id over the LAN channel, or a generated id for a manual code.
+    id: String,
+    /// Who they are, for the panel. Empty when the peer sent none.
+    name: String,
+    /// Whether their connection is up. Refreshed by the sweep; the sharer is the
+    /// only thing that actually knows, and this only has to be close enough to
+    /// label the panel.
+    connected: bool,
+    /// When the offer went out, which is the start of both the answer window and
+    /// the "connecting…" timer shown beside a viewer.
+    offered: Instant,
+    /// Their last link measurement. The sharer adapts to the worst report it has
+    /// from any viewer, so these are kept per viewer rather than blended.
+    loss: f32,
+    fps: f32,
+    /// When that measurement arrived, so a viewer's silence ages out instead of
+    /// steering the ladder forever.
+    reported: Option<Instant>,
+    /// When this viewer last asked for an intra frame, for the per-viewer floor.
+    /// Without it, several viewers losing packets at once would each be inside
+    /// their own window and the request would multiply.
+    last_keyframe_request: Instant,
+}
+
+impl ViewerSlot {
+    fn new(id: &str, name: &str, offered: Instant) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            connected: false,
+            offered,
+            loss: 0.0,
+            fps: 0.0,
+            reported: None,
+            // Start well outside the floor so the first request a viewer makes is
+            // honoured rather than eaten by the limiter. There is no earlier
+            // request to be close to — this is the start of the session.
+            last_keyframe_request: offered - KEYFRAME_REQUEST_FLOOR - Duration::from_millis(1),
+        }
+    }
+
+    /// True while this slot is still worth an answer or already serving.
+    fn is_live(&self, now: Instant) -> bool {
+        self.connected || now.duration_since(self.offered) < VIEWER_ANSWER_TIMEOUT
+    }
+
+    fn label(&self) -> &str {
+        if self.name.trim().is_empty() {
+            "Anonymous"
+        } else {
+            self.name.as_str()
+        }
+    }
+}
+
+/// The measurement the adaptive controller should act on, as `(loss, fps)`.
+///
+/// One encode feeds everyone and the ladder has one rung to move, so it has to
+/// answer for the worst link rather than an average of them: averaging would let
+/// a viewer on a bad link be carried by someone on a good one, which is the
+/// failure this is meant to prevent. `None` when nobody has reported recently
+/// enough to be evidence of anything — a viewer that has gone quiet must stop
+/// steering the ladder, or the resolution stays pinned down for nobody.
+fn worst_link(slots: &[ViewerSlot], now: Instant) -> Option<(f32, f32)> {
+    slots
+        .iter()
+        .filter(|slot| {
+            slot.reported
+                .is_some_and(|at| now.duration_since(at) <= VIEWER_REPORT_TTL)
+        })
+        .map(|slot| (slot.loss, slot.fps))
+        .reduce(|(loss, fps), (loss_b, fps_b)| (loss.max(loss_b), fps.min(fps_b)))
+}
+
+/// How long an unanswered offer is worth waiting on before the slot is reused.
+///
+/// Comfortably past ICE gathering, since the sharer only returns from the offer
+/// once candidates are in: a viewer who answers slower than that was never going
+/// to, and holding the slot for them means holding it against their next request.
+const VIEWER_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
 struct ShareSession {
     sharer: Arc<session::Sharer>,
-    offer_code: Option<String>,
+    /// Viewers being served, in the order they arrived.
+    viewers: Vec<ViewerSlot>,
+    /// The manual-code offer currently on screen, and the slot it belongs to.
+    ///
+    /// Manual codes are the same thing a LAN request produces, minus the peer
+    /// that asked, so they take a slot with a generated id. More than one can
+    /// exist; only the newest is shown, since the panel has one paste box and a
+    /// code that has been answered is dead.
+    manual_offer: Option<(String, String)>,
+    /// Counter behind the generated manual ids, so a second manual code gets its
+    /// own connection instead of replacing the first.
+    manual_seq: u32,
     answer_input: String,
     error: Option<String>,
     tx: SyncSender<EncodeMsg>,
@@ -247,7 +362,6 @@ struct ShareSession {
     audio_error: Option<String>,
     audio_timestamp: u32,
     audio_frames_sent: u64,
-    lan_peer: Option<String>,
     /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
     /// Pure state machine: see `argos_core::quality`.
     quality: QualityController,
@@ -260,9 +374,11 @@ struct ShareSession {
     /// the interval — not the lifetime total — can be fed to the controller.
     load_offered: u64,
     load_dropped: u64,
-    /// When the last keyframe went out, so the UI can show recovery activity.
-    last_keyframe_request: Instant,
     /// Set by a viewer's keyframe request, consumed by the encode worker.
+    ///
+    /// One flag for the whole share rather than one per viewer, and that is the
+    /// point: there is one encode, so one intra frame serves everyone who is
+    /// waiting on one.
     force_keyframe: Arc<AtomicBool>,
 }
 
@@ -434,6 +550,8 @@ pub struct ArgosApp {
     lan: Option<lan::Lan>,
     lan_error: Option<String>,
     pending_view: Option<String>,
+    /// When the sharer last swept its viewer slots for finished connections.
+    last_viewer_sweep: Instant,
     radmin_exe: Option<std::path::PathBuf>,
     radmin_error: Option<String>,
 }
@@ -471,6 +589,7 @@ impl ArgosApp {
             lan,
             lan_error,
             pending_view: None,
+            last_viewer_sweep: Instant::now(),
             radmin_exe: crate::radmin::find_exe(),
             radmin_error: None,
             config,
@@ -637,47 +756,25 @@ impl ArgosApp {
         );
     }
 
-    fn attach_sharer(&mut self, lan_peer: Option<String>) {
+    /// Creates the share if it does not exist yet.
+    ///
+    /// One encode, one audio capture, one set of worker threads — all of it
+    /// independent of how many people are watching. Viewers attach to it
+    /// afterwards, which is what lets the second one join without disturbing the
+    /// first.
+    fn ensure_share(&mut self) -> Result<(), String> {
         self.share_error = None;
-        if let Some(mut existing) = self.share.take() {
-            let sharer = Arc::clone(&existing.sharer);
-            let join = existing.join.take();
-            drop(existing);
-            if let Some(join) = join {
-                let _ = join.join();
-            }
-            session::block_on(sharer.close());
+        if self.share.is_some() {
+            return Ok(());
         }
         if self.capture.is_none() {
             if let Err(error) = self.start_capture() {
-                self.share_error = Some(error);
-                return;
+                self.share_error = Some(error.clone());
+                return Err(error);
             }
         }
         let udp = vec!["0.0.0.0:0".to_string()];
-        let sharer = match session::block_on(session::Sharer::new(udp)) {
-            Ok(sharer) => Arc::new(sharer),
-            Err(error) => {
-                self.share_error = Some(error);
-                return;
-            }
-        };
-        let offer = match session::block_on(sharer.create_offer()) {
-            Ok(code) => code,
-            Err(error) => {
-                self.share_error = Some(error);
-                return;
-            }
-        };
-        let offer_code = match &lan_peer {
-            Some(peer) => {
-                if let Some(lan) = &self.lan {
-                    lan.send_offer(peer, offer);
-                }
-                None
-            }
-            None => Some(offer),
-        };
+        let sharer = Arc::new(session::Sharer::new(udp));
         let encoder_result = H264Encoder::new_at(self.frame_rate as f32).map(|mut encoder| {
             encoder.set_target_height(self.share_height);
             encoder
@@ -686,8 +783,8 @@ impl ArgosApp {
             Ok(encoder) => encoder,
             Err(error) => {
                 session::block_on(sharer.close());
-                self.share_error = Some(error);
-                return;
+                self.share_error = Some(error.clone());
+                return Err(error);
             }
         };
         let (tx, rx) = sync_channel::<EncodeMsg>(4);
@@ -719,8 +816,9 @@ impl ArgosApp {
             Ok(join) => join,
             Err(error) => {
                 session::block_on(sharer.close());
-                self.share_error = Some(error.to_string());
-                return;
+                let message = error.to_string();
+                self.share_error = Some(message.clone());
+                return Err(message);
             }
         };
         let (audio_capture, audio_encoder, audio_error) =
@@ -731,14 +829,14 @@ impl ArgosApp {
                     (None, None, error)
                 }
             };
-        if lan_peer.is_some() {
-            if let Some(lan) = &self.lan {
-                lan.set_sharing(true);
-            }
+        if let Some(lan) = &self.lan {
+            lan.set_sharing(true);
         }
         self.share = Some(ShareSession {
             sharer,
-            offer_code,
+            viewers: Vec::new(),
+            manual_offer: None,
+            manual_seq: 0,
             answer_input: String::new(),
             error: None,
             tx,
@@ -760,10 +858,93 @@ impl ArgosApp {
             quality_note: None,
             load_offered: 0,
             load_dropped: 0,
-            last_keyframe_request: Instant::now(),
             force_keyframe,
-            lan_peer,
         });
+        Ok(())
+    }
+
+    /// Opens a connection for one viewer and returns the offer they must answer.
+    ///
+    /// Reuses the running share, and replaces whatever this viewer had before:
+    /// a request that arrives twice over UDP, or from someone whose connection
+    /// has already been swept, gets a fresh offer instead of silently failing to
+    /// negotiate against a description that is already answered.
+    fn add_share_viewer(&mut self, id: &str, name: &str) -> Result<String, String> {
+        self.ensure_share()?;
+        let now = Instant::now();
+        let Some(share) = self.share.as_mut() else {
+            return Err("no share to attach a viewer to".to_string());
+        };
+        // The sharer has just replaced this viewer's connection, so the old slot
+        // describes nothing. Leaving it would double-count them in the panel and
+        // let a stale loss reading steer the ladder.
+        share.viewers.retain(|slot| slot.id != id);
+        match session::block_on(share.sharer.add_viewer(id)) {
+            Ok(offer) => {
+                share.viewers.push(ViewerSlot::new(id, name, now));
+                Ok(offer)
+            }
+            Err(error) => {
+                share.error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Serves a peer who asked to watch.
+    fn on_view_request(&mut self, id: &str, name: &str) {
+        if !self.live {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(share) = self.share.as_ref() {
+            // Already serving them, or still waiting on an answer, and the
+            // connection is not one that has settled down. A request that lands
+            // here is a retransmit or a second click, and the offer in flight is
+            // the right answer to both — re-offering would throw away a
+            // negotiation that is about to succeed. The exception is a slot the
+            // sharer knows is dead: that viewer needs a new connection, which is
+            // what keeps a dropped link from reconnecting to nothing.
+            if share
+                .viewers
+                .iter()
+                .any(|slot| slot.id == id && slot.is_live(now))
+                && !share.sharer.needs_reoffer(id)
+            {
+                return;
+            }
+        }
+        let offer = match self.add_share_viewer(id, name) {
+            Ok(offer) => offer,
+            Err(_) => return,
+        };
+        if let Some(lan) = &self.lan {
+            lan.send_offer(id, offer);
+        }
+    }
+
+    /// Brings the viewer list in line with the connections that actually exist.
+    ///
+    /// The sharer is the only thing that knows which connections are finished,
+    /// and it applies the grace periods: a viewer who closes the app must be
+    /// given time to be noticed, or every sweep would tear down a healthy link
+    /// the moment it blipped.
+    fn sweep_viewers(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_viewer_sweep) < VIEWER_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_viewer_sweep = now;
+        let Some(share) = self.share.as_mut() else {
+            return;
+        };
+        let freed = session::block_on(share.sharer.prune());
+        if !freed.is_empty() {
+            share.viewers.retain(|slot| !freed.contains(&slot.id));
+        }
+        for slot in &mut share.viewers {
+            slot.connected = share.sharer.viewer_connected(&slot.id);
+        }
     }
 
     fn go_live(&mut self) {
@@ -798,7 +979,24 @@ impl ArgosApp {
     }
 
     fn create_manual_offer(&mut self) {
-        self.attach_sharer(None);
+        self.share_error = None;
+        if self.ensure_share().is_err() {
+            return;
+        }
+        // A generated id, because a manual code has no peer to key on. Numbered
+        // so asking for a second code opens a second connection instead of
+        // replacing the first and hanging whoever is holding it.
+        let id = {
+            let share = self.share.as_mut().expect("share exists");
+            share.manual_seq += 1;
+            format!("manual-{}", share.manual_seq)
+        };
+        let Ok(offer) = self.add_share_viewer(&id, "Manual viewer") else {
+            return;
+        };
+        if let Some(share) = self.share.as_mut() {
+            share.manual_offer = Some((id, offer));
+        }
     }
 
     fn update_capture_active(&mut self) -> bool {
@@ -823,8 +1021,21 @@ impl ArgosApp {
             share.error = Some("paste the viewer's answer code first".to_string());
             return;
         }
-        match session::block_on(share.sharer.set_answer(&code)) {
-            Ok(()) => share.error = None,
+        // The answer belongs to the code on screen. A share can have several
+        // connections, but only one is offered by hand at a time, so this is
+        // unambiguous — and routing it to the wrong one would fail as an
+        // invalid description rather than as "that viewer is gone".
+        let Some((id, _)) = share.manual_offer.clone() else {
+            share.error = Some("create a connection code first".to_string());
+            return;
+        };
+        match session::block_on(share.sharer.set_answer(&id, &code)) {
+            Ok(()) => {
+                share.error = None;
+                // The code has served its purpose: keeping it would invite a
+                // second paste against a description that is already answered.
+                share.manual_offer = None;
+            }
             Err(error) => share.error = Some(error),
         }
     }
@@ -929,6 +1140,9 @@ impl ArgosApp {
     }
 
     fn poll_lan_events(&mut self) {
+        // Before the events, so a request is answered against a slot list that
+        // has already had its dead connections cleared out.
+        self.sweep_viewers();
         let Some(lan) = self.lan.as_ref() else {
             return;
         };
@@ -938,19 +1152,7 @@ impl ArgosApp {
         }
         for event in events {
             match event {
-                lan::LanEvent::Request { id, .. } => {
-                    if !self.live {
-                        continue;
-                    }
-                    let busy = self
-                        .share
-                        .as_ref()
-                        .map(|share| share.sharer.is_connected())
-                        .unwrap_or(false);
-                    if !busy {
-                        self.attach_sharer(Some(id));
-                    }
-                }
+                lan::LanEvent::Request { id, name } => self.on_view_request(&id, &name),
                 lan::LanEvent::Offer { id, sdp } => {
                     if self.pending_view.as_deref() == Some(id.as_str()) {
                         self.pending_view = None;
@@ -959,8 +1161,12 @@ impl ArgosApp {
                 }
                 lan::LanEvent::Answer { id, sdp } => {
                     if let Some(share) = self.share.as_mut() {
-                        if share.lan_peer.as_deref() == Some(id.as_str()) {
-                            match session::block_on(share.sharer.set_answer(&sdp)) {
+                        // Only for a viewer whose offer is actually out, and only
+                        // for the connection that offer came from — a share may
+                        // have several, and an answer against the wrong one is a
+                        // description mismatch with no useful error.
+                        if share.viewers.iter().any(|slot| slot.id == id) {
+                            match session::block_on(share.sharer.set_answer(&id, &sdp)) {
                                 Ok(()) => share.error = None,
                                 Err(error) => share.error = Some(error),
                             }
@@ -968,17 +1174,24 @@ impl ArgosApp {
                     }
                 }
                 lan::LanEvent::Keyframe { id } => {
-                    // Only from the peer we are actually sharing to. Not every
-                    // viewer on the network gets to spend this sharer's
-                    // bandwidth on intra frames.
+                    let now = Instant::now();
                     let Some(share) = self.share.as_mut() else {
                         continue;
                     };
-                    if share.lan_peer.as_deref() != Some(id.as_str()) {
+                    let Some(slot) = share.viewers.iter_mut().find(|slot| slot.id == id) else {
+                        continue;
+                    };
+                    // A peer that is not being served gets no burst on this
+                    // sharer's bandwidth, and one viewer asking every few
+                    // hundred milliseconds does not get to multiply them either.
+                    if now.duration_since(slot.last_keyframe_request) < KEYFRAME_REQUEST_FLOOR {
                         continue;
                     }
+                    slot.last_keyframe_request = now;
+                    // One flag for the share: there is one encode, so the intra
+                    // frame that unblocks this viewer unblocks everyone waiting
+                    // on one.
                     share.force_keyframe.store(true, Ordering::Relaxed);
-                    share.last_keyframe_request = Instant::now();
                 }
                 lan::LanEvent::Report { id, loss, fps } => {
                     self.apply_report(&id, loss, fps);
@@ -994,16 +1207,24 @@ impl ArgosApp {
     /// queue it cannot be dropped, which is what makes adaptive resolution
     /// actually reach the encoder while the encoder is the bottleneck.
     fn apply_report(&mut self, id: &str, loss: f32, fps: f32) {
-        if !self.auto_quality {
-            return;
-        }
         let now = Instant::now();
         let Some(share) = self.share.as_mut() else {
             return;
         };
-        if share.lan_peer.as_deref() != Some(id) {
+        let Some(slot) = share.viewers.iter_mut().find(|slot| slot.id == id) else {
+            return;
+        };
+        slot.loss = loss;
+        slot.fps = fps;
+        slot.reported = Some(now);
+        if !self.auto_quality {
             return;
         }
+        // One encode feeds every viewer, and the ladder has one setting to move,
+        // so it has to answer for the worst link rather than an average of them.
+        let Some((loss, fps)) = worst_link(&share.viewers, now) else {
+            return;
+        };
         // The viewer can measure the link but not the sender's own handoff, so
         // the encoder half of the report is measured here. It is the only
         // evidence available when the link is lossless and the machine is the
@@ -1768,6 +1989,41 @@ impl ArgosApp {
             if let Some(error) = &share.error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }
+            // Who is actually watching. With one stream going to several people
+            // this is the only place a viewer count exists, and it is what tells
+            // the person sharing that the second click was served rather than
+            // dropped.
+            let now = Instant::now();
+            let connected = share.viewers.iter().filter(|slot| slot.connected).count();
+            if share.viewers.is_empty() {
+                ui.label(RichText::new("Nobody is watching yet.").weak());
+            } else {
+                ui.label(format!("{connected} of {} watching", share.viewers.len()));
+            }
+            for slot in &share.viewers {
+                let state = if slot.connected {
+                    RichText::new("live").color(Color32::from_rgb(150, 220, 150))
+                } else {
+                    RichText::new(format!(
+                        "connecting… {}s",
+                        now.duration_since(slot.offered).as_secs()
+                    ))
+                    .color(Color32::from_rgb(220, 200, 120))
+                };
+                let link = match slot.reported {
+                    Some(reported) if now.duration_since(reported) <= VIEWER_REPORT_TTL => {
+                        format!(" · {:.0} fps, {:.1}% loss", slot.fps, slot.loss)
+                    }
+                    _ => String::new(),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}:", slot.label())).strong());
+                    ui.label(state);
+                    if !link.is_empty() {
+                        ui.label(RichText::new(link).weak());
+                    }
+                });
+            }
         } else if self.live {
             ui.label(
                 RichText::new("Waiting for someone to join…")
@@ -1879,6 +2135,10 @@ impl ArgosApp {
                 egui::CollapsingHeader::new("Advanced")
                     .default_open(false)
                     .show(ui, |ui| {
+                        // Only while there is nothing to attach a code to: once a
+                        // share exists, the panel above owns this, because a
+                        // second code means a second viewer rather than a
+                        // second share.
                         if !self.live
                             && self.share.is_none()
                             && ui.button("Create manual connection code").clicked()
@@ -1886,11 +2146,9 @@ impl ArgosApp {
                             do_manual = true;
                         }
                         if let Some(share) = self.share.as_mut() {
-                            if let Some(code) = &share.offer_code {
+                            if let Some((_, code)) = &share.manual_offer {
                                 ui.label(RichText::new("Share code").strong());
                                 Self::code_widget(ui, code, 3);
-                            }
-                            if share.lan_peer.is_none() {
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut share.answer_input)
@@ -1901,6 +2159,15 @@ impl ArgosApp {
                                         do_accept = true;
                                     }
                                 });
+                            }
+                            // Another manual viewer is another connection, so
+                            // this belongs to a share that is already serving one
+                            // rather than to the case where nothing works yet.
+                            // Kept outside the block above because a code that
+                            // has been answered is gone from the panel, and the
+                            // button has to outlive it.
+                            if ui.button("New code for another viewer").clicked() {
+                                do_manual = true;
                             }
                             let (frames_sent, encode_ms, encode_errors) = share
                                 .stats
@@ -2658,7 +2925,23 @@ impl eframe::App for ArgosApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_target, encode_target};
+    use super::{
+        decode_target, encode_target, worst_link, ViewerSlot, KEYFRAME_REQUEST_FLOOR,
+        VIEWER_REPORT_TTL,
+    };
+    use std::time::{Duration, Instant};
+
+    fn slot(name: &str) -> ViewerSlot {
+        ViewerSlot::new(name, name, Instant::now())
+    }
+
+    /// Marks the slot as having reported `loss`/`fps` as of `at`.
+    fn reported(mut slot: ViewerSlot, loss: f32, fps: f32, at: Instant) -> ViewerSlot {
+        slot.loss = loss;
+        slot.fps = fps;
+        slot.reported = Some(at);
+        slot
+    }
 
     #[test]
     fn the_height_target_round_trips_through_the_atomic() {
@@ -2671,5 +2954,99 @@ mod tests {
     fn native_is_a_negative_sentinel_not_a_height() {
         assert!(encode_target(None) < 0);
         assert_eq!(decode_target(-1), None);
+    }
+
+    /// A share serves one stream to everyone, so the resolution has to be chosen
+    /// for the link that needs it most. Picking the average would let one bad
+    /// viewer be carried by a good one, which is the failure this exists to
+    /// prevent.
+    #[test]
+    fn the_ladder_answers_to_the_worst_viewer_not_the_average() {
+        let now = Instant::now();
+        let slots = vec![
+            reported(slot("alice"), 0.2, 60.0, now),
+            reported(slot("bob"), 7.5, 41.0, now),
+            reported(slot("carol"), 0.0, 60.0, now),
+        ];
+        let (loss, fps) = worst_link(&slots, now).expect("someone reported");
+        assert_eq!(loss, 7.5, "the worst link's loss is the one that counts");
+        assert_eq!(
+            fps, 41.0,
+            "the worst link's frame rate is the one that counts"
+        );
+    }
+
+    /// One viewer leaves and their last measurement stops being evidence. Acting
+    /// on it would keep the resolution down for nobody.
+    #[test]
+    fn a_viewer_who_went_quiet_stops_steering_the_ladder() {
+        let now = Instant::now();
+        let stale = reported(
+            slot("gone"),
+            9.0,
+            20.0,
+            now - VIEWER_REPORT_TTL - Duration::from_millis(1),
+        );
+        let fresh = reported(slot("here"), 0.5, 60.0, now);
+        let (loss, fps) = worst_link(&[stale, fresh], now).expect("someone is still reporting");
+        assert_eq!(loss, 0.5);
+        assert_eq!(fps, 60.0);
+
+        // With everyone stale there is nothing to act on, which is different from
+        // finding a healthy link and climbing on it.
+        let all_stale = vec![reported(
+            slot("gone"),
+            9.0,
+            20.0,
+            now - VIEWER_REPORT_TTL - Duration::from_millis(1),
+        )];
+        assert!(worst_link(&all_stale, now).is_none());
+    }
+
+    /// A viewer that never got as far as sending a report has no measurement,
+    /// and must not be counted as a lossless link.
+    #[test]
+    fn a_viewer_who_has_not_reported_yet_is_not_a_healthy_link() {
+        let now = Instant::now();
+        let silent = slot("connecting");
+        assert!(silent.reported.is_none());
+        assert!(worst_link(&[silent], now).is_none());
+    }
+
+    /// The second viewer has to get the offer already waiting for them, not a
+    /// slot that is treated as finished because nobody has answered a *first*
+    /// one yet.
+    #[test]
+    fn a_slot_is_live_until_it_connects_or_its_answer_window_lapses() {
+        let now = Instant::now();
+        let mut fresh = slot("fresh");
+        fresh.connected = false;
+        assert!(
+            fresh.is_live(now),
+            "an unanswered offer is still worth waiting on"
+        );
+        assert!(
+            !fresh.is_live(now + super::VIEWER_ANSWER_TIMEOUT + Duration::from_millis(1)),
+            "a slot past its answer window can be handed out again"
+        );
+        let connected = ViewerSlot {
+            connected: true,
+            ..slot("connected")
+        };
+        assert!(
+            connected.is_live(now + Duration::from_secs(3600)),
+            "a served viewer is live whatever the clock says"
+        );
+    }
+
+    /// The first request a viewer makes has to get through: starting the floor
+    /// at zero would make the rate limiter swallow the request that matters.
+    #[test]
+    fn the_first_keyframe_request_is_not_eaten_by_the_rate_limit() {
+        let slot = slot("first");
+        assert!(
+            Instant::now().duration_since(slot.last_keyframe_request) >= KEYFRAME_REQUEST_FLOOR,
+            "a brand new slot is already outside the floor, so its first request counts"
+        );
     }
 }

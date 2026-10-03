@@ -12,8 +12,17 @@
 //! how often it dropped. A drop counter climbing while the matching stage's
 //! duration climbs points straight at the culprit.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// How many recent observations an [`Ema`] keeps individually.
+///
+/// Enough that a decoder running at 60 fps has a second of history, which is
+/// long enough to see a stall that has already ended and short enough that the
+/// mean still tracks the machine's current mood. A fixed bound rather than a
+/// growing buffer: this is written to several hundred times a second on the
+/// packet path, and nothing here should ever allocate or grow.
+pub const RECENT_SAMPLES: usize = 64;
 
 /// Accumulates a duration sum and a sample count into a pair of atomics, so a
 /// reader can derive a mean over the measurement window without resetting state
@@ -25,11 +34,31 @@ use std::time::{Duration, Instant};
 /// because a session-long mean stays flat during an intermittent stall: a
 /// single 400 ms hitch barely moves the total, but it is the single most
 /// informative number when hunting exactly that kind of problem.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Ema {
     micros: AtomicU64,
     samples: AtomicU64,
     peak_micros: AtomicU64,
+    /// The last [`RECENT_SAMPLES`] observations, oldest at the cursor.
+    recent: [AtomicU64; RECENT_SAMPLES],
+    /// Where the next observation goes.
+    recent_cursor: AtomicUsize,
+}
+
+impl Default for Ema {
+    /// Hand-written because `AtomicU64` is not `Default`, and the derived form
+    /// cannot fill an array of 64 of them either. An array of fresh zeroes is
+    /// exactly the empty window, so this is the same thing the derive would
+    /// have produced if it could have.
+    fn default() -> Self {
+        Self {
+            micros: AtomicU64::new(0),
+            samples: AtomicU64::new(0),
+            peak_micros: AtomicU64::new(0),
+            recent: [const { AtomicU64::new(0) }; RECENT_SAMPLES],
+            recent_cursor: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl Ema {
@@ -38,6 +67,12 @@ impl Ema {
         self.micros.fetch_add(micros, Ordering::Relaxed);
         self.samples.fetch_add(1, Ordering::Relaxed);
         self.raise_peak(micros);
+        // The slot is written before the cursor moves, so a reader that sees the
+        // new cursor is guaranteed to see the value it points at.
+        let cursor = self.recent_cursor.load(Ordering::Relaxed) % RECENT_SAMPLES;
+        self.recent[cursor].store(micros, Ordering::Relaxed);
+        self.recent_cursor
+            .store((cursor + 1) % RECENT_SAMPLES, Ordering::Relaxed);
     }
 
     /// Records one observation from a duration.
@@ -80,6 +115,47 @@ impl Ema {
         Some(started.elapsed().as_secs_f32().max(1e-3))
     }
 
+    /// Mean observation over the most recent `window` observations, or `None` before
+    /// `window` of them exist.
+    ///
+    /// A session-long mean is the wrong number for a stage that is either fast or
+    /// slow. A decoder that misses its budget on every frame and one that sits
+    /// comfortably inside it average to something in between, and that something
+    /// is below both — so the figure meant to answer "is this machine fast enough
+    /// to decode this stream" would be unable to answer it. What matters is how
+    /// the frames being decoded *now* went.
+    ///
+    /// Backed by a fixed ring rather than a subtraction from the running total: to
+    /// find the tail of a sum you have to know the sum before it, and the accumulator
+    /// only keeps the total. Reconstructing that from means is not the same number
+    /// and drifts, which is the one thing a measurement like this must not do.
+    ///
+    /// The window is in samples rather than seconds because that is what the ring
+    /// holds, and because it makes a stage that ran briefly comparable to one that
+    /// ran all session: both are described by their most recent frames.
+    pub fn recent_mean_ms(&self, window: usize) -> Option<f32> {
+        if window == 0 || window > RECENT_SAMPLES {
+            return None;
+        }
+        let recorded = self.samples() as usize;
+        if recorded < 2 {
+            return None;
+        }
+        let take = window.min(recorded).min(RECENT_SAMPLES);
+        let end = self.recent_cursor.load(Ordering::Relaxed);
+        let mut total = 0u64;
+        let mut counted = 0usize;
+        for step in 0..take {
+            let index = (end + RECENT_SAMPLES - 1 - step) % RECENT_SAMPLES;
+            total += self.recent[index].load(Ordering::Relaxed);
+            counted += 1;
+        }
+        if counted == 0 {
+            return None;
+        }
+        Some(total as f32 / counted as f32 / 1000.0)
+    }
+
     /// Clears the window. Exposed so the UI can offer "reset stats" and turn the
     /// session-long mean into a windowed one on demand, rather than paying for a
     /// ring buffer on the hot path.
@@ -87,6 +163,13 @@ impl Ema {
         self.micros.store(0, Ordering::Relaxed);
         self.samples.store(0, Ordering::Relaxed);
         self.peak_micros.store(0, Ordering::Relaxed);
+        // The ring is cleared with the totals, and the cursor rewound to match:
+        // leaving stale samples behind would let a "recent" mean reach back past
+        // the reset and report time from a window the caller just discarded.
+        for slot in &self.recent {
+            slot.store(0, Ordering::Relaxed);
+        }
+        self.recent_cursor.store(0, Ordering::Relaxed);
     }
 
     fn raise_peak(&self, micros: u64) {
@@ -331,7 +414,7 @@ pub struct AudioMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{Counter, DropCounter, Ema, StageTimer};
+    use super::{Counter, DropCounter, Ema, StageTimer, RECENT_SAMPLES};
     use std::time::Duration;
 
     #[test]
@@ -431,5 +514,86 @@ mod tests {
         assert_eq!(counter.get(), 207);
         counter.reset();
         assert_eq!(counter.get(), 0);
+    }
+
+    /// The whole reason the recent window exists. A decoder that is too slow on
+    /// every frame and one that stalls once in a while have session means that
+    /// differ, but there is a case where they do not: after the stall has passed,
+    /// the session mean of the slow machine is the same as the recent mean of the
+    /// healthy one. Reporting only the total would call both of them fine.
+    #[test]
+    fn the_recent_mean_sees_a_stall_that_the_session_mean_has_diluted_away() {
+        let stage = Ema::default();
+        // Two seconds of healthy frames at 10 fps.
+        for _ in 0..20 {
+            stage.record_micros(10_000);
+        }
+        // One very slow second.
+        for _ in 0..10 {
+            stage.record_micros(100_000);
+        }
+        // Then healthy again, which is where the session mean is by now.
+        for _ in 0..20 {
+            stage.record_micros(10_000);
+        }
+        let session = stage.mean_ms();
+        let recent = stage.recent_mean_ms(20).expect("enough samples");
+        assert!((recent - 10.0).abs() < 0.01, "recent was {recent} ms");
+        assert!(
+            session > recent * 1.5,
+            "session mean {session} ms did not hide the stall that the recent mean still shows"
+        );
+    }
+
+    /// The window is a window: asking for more frames than were recorded must not
+    /// invent samples, and asking for fewer must not look at more.
+    #[test]
+    fn the_recent_window_is_bounded_by_what_was_actually_recorded() {
+        let stage = Ema::default();
+        for _ in 0..4 {
+            stage.record_micros(4_000);
+        }
+        stage.record_micros(100_000);
+        let wide = stage.recent_mean_ms(RECENT_SAMPLES).expect("some samples");
+        assert!((wide - 23.2).abs() < 0.01, "wide was {wide} ms");
+        // The last two observations are the slow one and one healthy one.
+        let narrow = stage.recent_mean_ms(2).expect("some samples");
+        assert!((narrow - 52.0).abs() < 0.01, "narrow was {narrow} ms");
+        // A window wider than the ring, or empty, has no honest answer.
+        assert_eq!(stage.recent_mean_ms(RECENT_SAMPLES + 1), None);
+        assert_eq!(stage.recent_mean_ms(0), None);
+    }
+
+    /// One sample is not a mean. Reporting the first frame's cost as the recent
+    /// cost would let a single slow frame decide whether a machine is too slow,
+    /// which is the exact opposite of what a mean is for.
+    #[test]
+    fn a_recent_mean_needs_more_than_one_sample() {
+        let stage = Ema::default();
+        assert_eq!(stage.recent_mean_ms(10), None);
+        stage.record_micros(100_000);
+        assert_eq!(stage.recent_mean_ms(10), None);
+        stage.record_micros(10_000);
+        assert!(stage.recent_mean_ms(10).is_some());
+    }
+
+    /// Resetting the totals has to reset the ring with them. Otherwise the next
+    /// read reaches back past the reset and reports time from a window the caller
+    /// deliberately threw away.
+    #[test]
+    fn reset_clears_the_recent_window_too() {
+        let stage = Ema::default();
+        for _ in 0..RECENT_SAMPLES {
+            stage.record_micros(50_000);
+        }
+        stage.reset();
+        for _ in 0..3 {
+            stage.record_micros(10_000);
+        }
+        let recent = stage.recent_mean_ms(RECENT_SAMPLES).expect("fresh samples");
+        assert!(
+            (recent - 10.0).abs() < 0.01,
+            "recent mean reached back past the reset: {recent} ms"
+        );
     }
 }

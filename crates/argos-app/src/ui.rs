@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use argos_core::diagnose::{self, diagnose, Bottleneck};
 use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics, StageTimer};
 use argos_core::quality::{Controller as QualityController, Decision, Report};
 use argos_core::{h264, lan, session, Packet};
@@ -269,6 +270,14 @@ struct ViewerSlot {
     /// from any viewer, so these are kept per viewer rather than blended.
     loss: f32,
     fps: f32,
+    /// Everything else their end measured: decode time, render drops, whether
+    /// they are waiting on a keyframe.
+    ///
+    /// Read-only, and deliberately so. This is the evidence for deciding whether
+    /// the ladder should move; it is not itself a reason to move it, because
+    /// "this machine is slow" and "this link is bad" want opposite responses
+    /// from a setting that everybody shares.
+    diag: lan::Diagnostics,
     /// When that measurement arrived, so a viewer's silence ages out instead of
     /// steering the ladder forever.
     reported: Option<Instant>,
@@ -287,6 +296,7 @@ impl ViewerSlot {
             offered,
             loss: 0.0,
             fps: 0.0,
+            diag: lan::Diagnostics::default(),
             reported: None,
             // Start well outside the floor so the first request a viewer makes is
             // honoured rather than eaten by the limiter. There is no earlier
@@ -307,7 +317,58 @@ impl ViewerSlot {
             self.name.as_str()
         }
     }
+
+    /// One line about how this viewer's end of the stream is doing.
+    ///
+    /// Three states, because they want different words. A viewer still
+    /// negotiating has said nothing and has nothing to say. A viewer whose
+    /// reports have stopped being fresh has gone quiet, which is not the same as
+    /// being healthy — the whole point of the report TTL is that silence stops
+    /// counting as evidence. A viewer reporting gets its numbers and a verdict on
+    /// them.
+    ///
+    /// `source_fps` is the stream's own rate, because a decode time cannot be
+    /// called too slow without knowing how often a frame is due.
+    fn summary(&self, now: Instant, source_fps: u32) -> RichText {
+        let fresh = self
+            .reported
+            .is_some_and(|at| now.duration_since(at) <= VIEWER_REPORT_TTL);
+        if !self.connected && !fresh {
+            return RichText::new(format!(
+                "{}: connecting… {}s",
+                self.label(),
+                now.duration_since(self.offered).as_secs()
+            ))
+            .color(Color32::from_rgb(220, 200, 120));
+        }
+        if !fresh {
+            return RichText::new(format!("{}: not reporting", self.label()))
+                .color(Color32::from_rgb(220, 200, 120));
+        }
+        let verdict = diagnose(&self.diag, self.loss, source_fps);
+        let numbers = format!("{:.0} fps, {:.1}% loss", self.fps, self.loss);
+        let text = format!(
+            "{}: {numbers} — {}",
+            self.label(),
+            verdict.describe(source_fps)
+        );
+        if verdict == Bottleneck::Ok {
+            RichText::new(text).weak()
+        } else {
+            // Anything that is not "ok" is worth interrupting a list for. The
+            // whole reason these numbers cross the network is that one person
+            // said their stream was stuttering and the sharer could not see it.
+            RichText::new(text).color(Color32::from_rgb(220, 200, 120))
+        }
+    }
 }
+
+/// Recent decode samples a stage mean covers.
+///
+/// A second's worth at 60 fps. Long enough that a stall which has already ended
+/// is still visible, short enough that the mean still describes the machine as it
+/// is now rather than as it was when the session started.
+const DIAG_DECODE_SAMPLES: usize = 60;
 
 /// The measurement the adaptive controller should act on, as `(loss, fps)`.
 ///
@@ -365,6 +426,14 @@ struct ShareSession {
     /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
     /// Pure state machine: see `argos_core::quality`.
     quality: QualityController,
+    /// Frame rate the encoder was built with.
+    ///
+    /// Held here rather than read off the app because the picker that sets it is
+    /// disabled while streaming, and this is what the viewers are told: a decode
+    /// time means nothing without knowing how often a frame is due, and
+    /// advertising a rate the encoder is not running at would make every
+    /// viewer's verdict wrong in a way that looks like a bug in their machine.
+    frame_rate: u32,
     /// Target height the encode worker polls. An atomic, not a message, so a
     /// resolution change is never lost behind a full frame queue.
     target_height: Arc<AtomicI32>,
@@ -380,9 +449,69 @@ struct ShareSession {
     /// point: there is one encode, so one intra frame serves everyone who is
     /// waiting on one.
     force_keyframe: Arc<AtomicBool>,
+    /// When the audience list last went out, and what it said.
+    ///
+    /// Both halves are needed. The list changes rarely and the channel loses
+    /// datagrams, so sending only on change would leave a viewer who missed one
+    /// datagram with a permanently wrong answer and no way to tell. The
+    /// keepalive covers the loss; the signature keeps a session with nobody
+    /// changing from spending a datagram per viewer per frame on it.
+    roster_sent: Option<Instant>,
+    roster_signature: Vec<String>,
 }
 
 impl ShareSession {
+    /// The audience as the sharer sees it.
+    ///
+    /// Slots rather than the sharer's connection map, because the UI already
+    /// keeps them in arrival order and knows which ones are still negotiating.
+    /// A viewer is listed from the moment they ask, not from the moment their
+    /// connection comes up: someone who has typed the code and is waiting is
+    /// watching as far as anybody in the room is concerned.
+    fn audience(&self) -> Vec<lan::RosterEntry> {
+        self.viewers
+            .iter()
+            .map(|slot| lan::RosterEntry {
+                id: slot.id.clone(),
+                name: slot.name.clone(),
+                connected: slot.connected,
+            })
+            .collect()
+    }
+
+    /// Pushes the audience list to every viewer, on change or on the keepalive.
+    ///
+    /// Includes the stream's frame rate and height because a viewer cannot work
+    /// either out: it knows what it decoded and not what it was sent. The frame
+    /// rate is what makes its own decode time readable as fast or slow, so
+    /// without it the diagnosis would have no budget to compare against.
+    ///
+    /// Rate-limited rather than sent on every change because a join and a leave
+    /// can happen back to back, and each of those is a datagram per viewer.
+    fn broadcast_roster(&mut self, height: Option<u32>, lan: &lan::Lan) {
+        let now = Instant::now();
+        let audience = self.audience();
+        let signature: Vec<String> = audience
+            .iter()
+            .map(|entry| format!("{}|{}|{}", entry.id, entry.name, entry.connected))
+            .collect();
+        let due = self
+            .roster_sent
+            .is_none_or(|at| now.duration_since(at) >= ROSTER_KEEPALIVE);
+        if !due && signature == self.roster_signature {
+            return;
+        }
+        self.roster_sent = Some(now);
+        self.roster_signature = signature;
+        for slot in &self.viewers {
+            // Unconnected viewers get it too. Their LAN channel is already
+            // working — they sent a request and answered an offer over it — and
+            // this way the list is correct before their first frame arrives
+            // rather than appearing a keyframe interval later.
+            lan.send_roster(&slot.id, &audience, self.frame_rate, height);
+        }
+    }
+
     /// Frames the encode handoff discarded since the last call, as a percentage
     /// of those it was offered.
     ///
@@ -453,6 +582,30 @@ struct Quality {
     /// perfectly intact stream here. This is the decoder waiting on an intra
     /// frame it will not be given, which is the one failure loss cannot see.
     starved: bool,
+    /// Decode errors per second over the last window.
+    ///
+    /// A rate rather than a total because a viewer that made ten errors an hour
+    /// ago and none since is not currently in trouble, and the sharer needs to
+    /// be able to tell that from a viewer who is failing right now.
+    decode_errors: f32,
+    /// Share of decoded frames that were replaced before display, `0..100`.
+    ///
+    /// The one failure no amount of keyframe recovery fixes: the frame decoded
+    /// fine and the machine could not show it.
+    render_drops: f32,
+    /// Worst `decode_errors` seen since the counters were last cleared.
+    ///
+    /// Carried across windows because a burst that recovers between two reports
+    /// is still a burst, and a per-window rate would quietly drop it.
+    decode_errors_peak: f32,
+    /// Worst `render_drops` seen since the counters were last cleared.
+    render_drops_peak: f32,
+    /// Counter baselines for the two rates above, read once when the window
+    /// closed so a rate is a difference between two samples rather than a
+    /// division of two separately-taken reads of the same counter.
+    last_errors: u64,
+    last_dropped: u64,
+    last_shown: u64,
 }
 
 impl Default for Quality {
@@ -474,6 +627,47 @@ impl Default for Quality {
             requested_at_loss: 0.0,
             recoveries: 0,
             starved: false,
+            decode_errors: 0.0,
+            render_drops: 0.0,
+            decode_errors_peak: 0.0,
+            render_drops_peak: 0.0,
+            last_errors: 0,
+            last_dropped: 0,
+            last_shown: 0,
+        }
+    }
+}
+
+impl Quality {
+    /// This viewer's measurements, as sent to the sharer.
+    ///
+    /// Peaks rather than window rates for the two failure counts, because what a
+    /// sharer needs to know is whether this viewer has *ever* been in trouble
+    /// recently, not whether it happened to be clean in the half-second window
+    /// that happened to contain a report.
+    ///
+    /// The stage means cover recent frames rather than the whole session. This
+    /// number exists to be compared against a frame budget, and a session mean
+    /// cannot answer that: a decoder that misses its budget on every frame and one
+    /// that sits comfortably inside it average to something that is below both.
+    /// What matters is how the frames being decoded now went.
+    fn link_report(&self, metrics: &ReceiverMetrics) -> lan::LinkReport {
+        lan::LinkReport {
+            loss: self.loss,
+            fps: self.fps,
+            diag: lan::Diagnostics {
+                decode_ms: metrics
+                    .decode
+                    .recent_mean_ms(DIAG_DECODE_SAMPLES)
+                    .unwrap_or(0.0),
+                present_ms: metrics
+                    .present
+                    .recent_mean_ms(DIAG_DECODE_SAMPLES)
+                    .unwrap_or(0.0),
+                render_drops: self.render_drops_peak,
+                decode_errors: self.decode_errors_peak,
+                waiting_keyframe: self.starved,
+            },
         }
     }
 }
@@ -511,6 +705,147 @@ struct ViewSession {
     /// network. `None` for a manual-code session, which is why those sessions
     /// get no recovery: there is no LAN channel to ask over.
     sharer_id: Option<String>,
+    /// Everyone the sharer says is watching, and the shape of the stream.
+    ///
+    /// Only the sharer knows this. A viewer can see the other machines on the
+    /// network, but not which of them are watching *this* stream, so it is
+    /// pushed to us rather than discovered.
+    roster: Vec<lan::RosterEntry>,
+    /// When that list arrived. UDP loses datagrams and a list that quietly stops
+    /// being updated would be indistinguishable from everyone leaving.
+    roster_received: Option<Instant>,
+    /// The stream's frame rate, which is what makes a decode time readable as
+    /// fast or slow. Zero until the sharer says.
+    source_fps: u32,
+    /// The stream's target height; `None` means native.
+    source_height: Option<u32>,
+    /// This viewer's own peer id, so it can mark itself in the audience list.
+    ///
+    /// The sharer's roster is keyed by peer id, and a viewer has its own id from
+    /// the start, so the two can be matched exactly. Matching on the displayed
+    /// name instead would be one more thing that can be wrong — two people on the
+    /// network can both be called "desk" — and a mismatched viewer would show up
+    /// as a stranger in its own list.
+    self_id: Option<String>,
+    /// This viewer's own name, for the fallback list a manual-code session has.
+    self_name: String,
+}
+
+impl ViewSession {
+    /// Everyone watching, including this viewer.
+    ///
+    /// From the sharer's list when there is one, because it is the only account
+    /// that is complete.
+    fn audience(&self) -> Vec<lan::RosterEntry> {
+        audience_from(&self.roster, self.self_id.as_deref(), &self.self_name)
+    }
+}
+
+/// The audience list, or the only viewer who can be known about it.
+///
+/// A manual-code session has no channel to be told over, so it falls back to a
+/// list of one — itself. That is the honest answer: showing an empty room would
+/// say nobody is watching when the person reading the screen is.
+fn audience_from(
+    roster: &[lan::RosterEntry],
+    self_id: Option<&str>,
+    self_name: &str,
+) -> Vec<lan::RosterEntry> {
+    if roster.is_empty() {
+        return vec![lan::RosterEntry {
+            id: self_id.unwrap_or_default().to_string(),
+            name: self_name.to_string(),
+            connected: true,
+        }];
+    }
+    roster.to_vec()
+}
+
+/// Whether a list last received at `received` can still be believed.
+///
+/// `None` is not stale: nobody has claimed to know anything yet, which is a
+/// different thing from having been told something and then not being told
+/// again. Only the second one deserves a warning.
+fn roster_is_stale(received: Option<Instant>, now: Instant) -> bool {
+    received.is_some_and(|at| now.duration_since(at) > ROSTER_STALE)
+}
+
+/// How long an audience list may go without an update before it is shown as out
+/// of date.
+///
+/// Three times the sharer's keepalive, so a single lost datagram is invisible
+/// while a sharer that has actually gone quiet is not. Generous on purpose: the
+/// failure this guards against is a list that stops updating and looks like a
+/// room everybody left, which is worse than a slightly stale headcount.
+const ROSTER_STALE: Duration = Duration::from_secs(9);
+
+/// How often the sharer repeats the audience list whether or not it changed.
+///
+/// This channel is UDP and a datagram can simply not arrive, so a list sent only
+/// on change would leave a viewer who missed one datagram permanently wrong with
+/// no way to tell that anything is missing. Repeating it every few seconds costs
+/// a few bytes and makes the wrong answer self-correcting.
+const ROSTER_KEEPALIVE: Duration = Duration::from_secs(3);
+
+/// The audience list, rendered the same way on both sides.
+///
+/// One function for both because the two sides already know the same things about
+/// each other and a viewer who is told "nobody else is watching" while the sharer
+/// shows three rows would have no way to tell which is true.
+///
+/// `me` is the local peer id, empty on the sharer's side where every row is
+/// somebody else. `stale` is only ever true for a viewer: the sharer can read the
+/// list straight out of its own slot list and has no reason to doubt it.
+fn viewer_list(ui: &mut egui::Ui, audience: &[lan::RosterEntry], me: &str, stale: bool) {
+    let connected = audience.iter().filter(|entry| entry.connected).count();
+    if audience.is_empty() {
+        ui.label(RichText::new("Nobody is watching yet.").weak());
+        return;
+    }
+    let summary = if connected == audience.len() {
+        format!("{connected} watching")
+    } else {
+        format!("{connected} of {} watching", audience.len())
+    };
+    if stale {
+        // Said out loud, because the alternative is a headcount that quietly
+        // stops being true and reads as fact.
+        ui.label(
+            RichText::new(format!("{summary} · list may be out of date"))
+                .color(Color32::from_rgb(220, 200, 120)),
+        );
+    } else {
+        ui.label(RichText::new(summary).weak());
+    }
+    for entry in audience {
+        let is_me = !me.is_empty() && entry.id == me;
+        let name = if is_me {
+            format!("{} (you)", entry.label())
+        } else {
+            entry.label().to_string()
+        };
+        let state = if entry.connected {
+            RichText::new("watching").color(Color32::from_rgb(150, 220, 150))
+        } else {
+            RichText::new("connecting…").color(Color32::from_rgb(220, 200, 120))
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(name).strong());
+            ui.label(state);
+        });
+    }
+}
+
+/// The audience as a viewer sees it, under the picture.
+///
+/// A viewer's own copy of the sharer's list, plus the staleness warning. Kept as
+/// its own wrapper because it has to answer two questions the sharer's call does
+/// not: is this list current, and which of these people am I.
+fn viewer_audience(ui: &mut egui::Ui, view: &ViewSession) {
+    let audience = view.audience();
+    let stale = roster_is_stale(view.roster_received, Instant::now());
+    let me = view.self_id.as_deref().unwrap_or_default();
+    viewer_list(ui, &audience, me, stale);
 }
 
 pub struct ArgosApp {
@@ -854,11 +1189,14 @@ impl ArgosApp {
             audio_timestamp: 0,
             audio_frames_sent: 0,
             quality: QualityController::at_height(self.share_height),
+            frame_rate: self.frame_rate,
             target_height,
             quality_note: None,
             load_offered: 0,
             load_dropped: 0,
             force_keyframe,
+            roster_sent: None,
+            roster_signature: Vec::new(),
         });
         Ok(())
     }
@@ -1106,6 +1444,12 @@ impl ArgosApp {
             // reconnect target; the two differ only in intent, not in value.
             sharer_id: lan_peer.clone(),
             lan_peer,
+            roster: Vec::new(),
+            roster_received: None,
+            source_fps: 0,
+            source_height: None,
+            self_id: self.lan.as_ref().map(|lan| lan.id().to_string()),
+            self_name: self.config.name.clone(),
         });
     }
 
@@ -1141,7 +1485,8 @@ impl ArgosApp {
 
     fn poll_lan_events(&mut self) {
         // Before the events, so a request is answered against a slot list that
-        // has already had its dead connections cleared out.
+        // has already had its dead connections cleared out, and so the roster
+        // that follows reflects those clearings.
         self.sweep_viewers();
         let Some(lan) = self.lan.as_ref() else {
             return;
@@ -1193,9 +1538,48 @@ impl ArgosApp {
                     // on one.
                     share.force_keyframe.store(true, Ordering::Relaxed);
                 }
-                lan::LanEvent::Report { id, loss, fps } => {
-                    self.apply_report(&id, loss, fps);
+                lan::LanEvent::Report {
+                    id,
+                    loss,
+                    fps,
+                    diag,
+                } => {
+                    self.apply_report(&id, &lan::LinkReport { loss, fps, diag });
                 }
+                lan::LanEvent::Roster {
+                    id,
+                    viewers,
+                    source_fps,
+                    source_height,
+                } => {
+                    // Only from the sharer being watched. Anyone else on the
+                    // network could send one of these, and acting on it would
+                    // display someone else's audience as ours.
+                    let watching = self
+                        .view
+                        .as_ref()
+                        .and_then(|view| view.sharer_id.as_deref())
+                        == Some(id.as_str());
+                    if !watching {
+                        continue;
+                    }
+                    if let Some(view) = self.view.as_mut() {
+                        view.roster = viewers;
+                        view.roster_received = Some(Instant::now());
+                        view.source_fps = source_fps;
+                        view.source_height = source_height;
+                    }
+                }
+            }
+        }
+        // After the events, so a viewer who has just joined is already in the
+        // list the moment the others are told about them, rather than being
+        // absent from it for one keepalive interval. Costs one comparison per
+        // frame in the common case and a datagram per viewer when it matters.
+        if let Some(lan) = self.lan.as_ref() {
+            let height = self.share_height;
+            if let Some(share) = self.share.as_mut() {
+                share.broadcast_roster(height, lan);
             }
         }
     }
@@ -1206,7 +1590,13 @@ impl ArgosApp {
     /// height to the lock-free target the encode worker polls; unlike the frame
     /// queue it cannot be dropped, which is what makes adaptive resolution
     /// actually reach the encoder while the encoder is the bottleneck.
-    fn apply_report(&mut self, id: &str, loss: f32, fps: f32) {
+    ///
+    /// The diagnostics are stored and nothing more happens with them here. They
+    /// exist to be read: what to do about a viewer whose machine cannot keep up
+    /// is a decision about the ladder, and making that call automatically would
+    /// mean one person's slow decoder silently lowers everyone else's quality
+    /// before anyone has looked at why.
+    fn apply_report(&mut self, id: &str, report: &lan::LinkReport) {
         let now = Instant::now();
         let Some(share) = self.share.as_mut() else {
             return;
@@ -1214,8 +1604,9 @@ impl ArgosApp {
         let Some(slot) = share.viewers.iter_mut().find(|slot| slot.id == id) else {
             return;
         };
-        slot.loss = loss;
-        slot.fps = fps;
+        slot.loss = report.loss;
+        slot.fps = report.fps;
+        slot.diag = report.diag;
         slot.reported = Some(now);
         if !self.auto_quality {
             return;
@@ -1564,11 +1955,48 @@ impl ArgosApp {
                     // this stream as intact, so loss-based detection cannot see
                     // it — the decoder is simply waiting for an intra frame.
                     view.quality.starved = d_received > 0 && d_frames == 0;
+                    // Baselines for the two rates that are reported to the
+                    // sharer rather than shown here: decode errors per second,
+                    // and the share of decoded frames the UI never displayed.
+                    //
+                    // Sampled here rather than read again in `link_report`
+                    // because a counter read twice can differ between the two
+                    // reads, which would make the delta negative and the rate
+                    // nonsense. Same reason the window is closed here.
+                    let errors = view.metrics.decode_errors.get();
+                    let dropped = view.metrics.presented.dropped();
+                    let shown = view.metrics.presented.frames();
+                    view.quality.decode_errors =
+                        errors.saturating_sub(view.quality.last_errors) as f32 / elapsed;
+                    let shown_delta = shown.saturating_sub(view.quality.last_shown);
+                    view.quality.render_drops = if shown_delta > 0 {
+                        dropped.saturating_sub(view.quality.last_dropped) as f32
+                            / shown_delta as f32
+                            * 100.0
+                    } else {
+                        0.0
+                    };
                     view.quality.last = now;
                     view.quality.last_decoded = decoded;
                     view.quality.last_bytes = bytes;
                     view.quality.last_lost = lost;
                     view.quality.last_received = received;
+                    view.quality.last_errors = errors;
+                    view.quality.last_dropped = dropped;
+                    view.quality.last_shown = shown;
+                    // Warnings are carried forward rather than recomputed from a
+                    // single window: a decode error that recovers between two
+                    // reports would otherwise blink out of existence and the
+                    // sharer would see a viewer whose errors stopped, which is
+                    // the opposite of what happened.
+                    view.quality.decode_errors_peak = view
+                        .quality
+                        .decode_errors_peak
+                        .max(view.quality.decode_errors);
+                    view.quality.render_drops_peak = view
+                        .quality
+                        .render_drops_peak
+                        .max(view.quality.render_drops);
                 }
             }
         }
@@ -1636,7 +2064,7 @@ impl ArgosApp {
 
         if now.duration_since(view.quality.last_report) >= REPORT_INTERVAL {
             view.quality.last_report = now;
-            lan.send_report(&peer, view.quality.loss, view.quality.fps);
+            lan.send_report(&peer, &view.quality.link_report(&view.metrics));
         }
 
         // Two independent reasons to ask, because they fail differently:
@@ -1993,36 +2421,17 @@ impl ArgosApp {
             // this is the only place a viewer count exists, and it is what tells
             // the person sharing that the second click was served rather than
             // dropped.
+            //
+            // The same list the viewers get, rendered by the same code, because
+            // they are the same fact: a disagreement between the two lists would
+            // be read as a bug in one of them.
+            let audience = share.audience();
+            viewer_list(ui, &audience, "", false);
             let now = Instant::now();
-            let connected = share.viewers.iter().filter(|slot| slot.connected).count();
-            if share.viewers.is_empty() {
-                ui.label(RichText::new("Nobody is watching yet.").weak());
-            } else {
-                ui.label(format!("{connected} of {} watching", share.viewers.len()));
-            }
+            let source_fps = share.frame_rate;
             for slot in &share.viewers {
-                let state = if slot.connected {
-                    RichText::new("live").color(Color32::from_rgb(150, 220, 150))
-                } else {
-                    RichText::new(format!(
-                        "connecting… {}s",
-                        now.duration_since(slot.offered).as_secs()
-                    ))
-                    .color(Color32::from_rgb(220, 200, 120))
-                };
-                let link = match slot.reported {
-                    Some(reported) if now.duration_since(reported) <= VIEWER_REPORT_TTL => {
-                        format!(" · {:.0} fps, {:.1}% loss", slot.fps, slot.loss)
-                    }
-                    _ => String::new(),
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}:", slot.label())).strong());
-                    ui.label(state);
-                    if !link.is_empty() {
-                        ui.label(RichText::new(link).weak());
-                    }
-                });
+                let line = slot.summary(now, source_fps);
+                ui.label(line);
             }
         } else if self.live {
             ui.label(
@@ -2382,6 +2791,23 @@ impl ArgosApp {
             } else {
                 ui.label(RichText::new("Waiting for stream data…").color(Color32::GRAY));
             }
+            // Who else is watching, and what this end measured. Under the picture
+            // rather than above it, because the picture is the point and both of
+            // these are context for it.
+            //
+            // The verdict is computed from the very report that is on its way to
+            // the sharer, so the two sides can never disagree about what this
+            // machine measured — only about what to do about it.
+            ui.add_space(6.0);
+            viewer_audience(ui, view);
+            let mine = view.quality.link_report(&view.metrics);
+            let verdict = diagnose(&mine.diag, mine.loss, view.source_fps);
+            let verdict_text = format!("Your end: {}", verdict.describe(view.source_fps));
+            if verdict == Bottleneck::Ok {
+                ui.label(RichText::new(verdict_text).weak());
+            } else {
+                ui.label(RichText::new(verdict_text).color(Color32::from_rgb(220, 200, 120)));
+            }
             ui.add_space(8.0);
             if ui.button("Stop watching").clicked() {
                 request_stop = true;
@@ -2529,6 +2955,12 @@ impl ArgosApp {
             if let Some(metrics) = self.share.as_ref().map(|share| &share.metrics) {
                 Self::reset_sender(metrics);
             }
+            // The per-viewer send timings are part of the readout, so clearing the
+            // readout without clearing them would leave the comparison rows
+            // describing a window the rest of the panel has forgotten.
+            if let Some(share) = self.share.as_ref() {
+                share.sharer.reset_write_timings();
+            }
             if let Some(metrics) = self.view.as_ref().map(|view| &view.metrics) {
                 Self::reset_receiver(metrics);
             }
@@ -2641,6 +3073,7 @@ impl ArgosApp {
                     ),
                 );
             }
+            Self::viewer_comparison(sink, share);
         }
 
         if let Some(view) = view {
@@ -2725,6 +3158,91 @@ impl ArgosApp {
         if share.is_none() && view.is_none() {
             sink.note("Idle — nothing is streaming.");
         }
+    }
+
+    /// One row per viewer, comparing everyone against everyone.
+    ///
+    /// This is the whole answer to "why is his stream stuttering when mine is
+    /// fine", laid out as numbers rather than prose. The columns are the pipeline in
+    /// order — what the sharer spent writing to that socket, what the viewer spent
+    /// decoding it, what it spent displaying it — so a row that goes red at one point
+    /// names the stage without anyone having to reason about it.
+    ///
+    /// The send column is per viewer rather than the aggregate the `write` row above
+    /// reports, because the aggregate is the sum over every viewer and so hides the
+    /// one that matters: five fast viewers and one slow one produce an aggregate that
+    /// looks fine.
+    ///
+    /// Nothing here feeds the adaptive controller. These rows exist to be read, and a
+    /// verdict that moved the ladder would lower the resolution for everybody because
+    /// of one machine.
+    fn viewer_comparison<S: ReportSink>(sink: &mut S, share: &ShareSession) {
+        if share.viewers.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        sink.separator();
+        sink.heading("Viewers");
+        let budget = diagnose::frame_budget_ms(share.frame_rate);
+        sink.line(format!(
+            "  {:<14} {:>5} {:>6} {:>8} {:>8} {:>7}  {}",
+            "viewer", "fps", "loss%", "send ms", "decode ms", "drops%", "verdict"
+        ));
+        for slot in &share.viewers {
+            let fresh = slot
+                .reported
+                .is_some_and(|at| now.duration_since(at) <= VIEWER_REPORT_TTL);
+            let (send_mean, send_peak) = share.sharer.viewer_write_ms(&slot.id);
+            if !fresh {
+                sink.line(format!(
+                    "  {:<14} {:>5} {:>6} {:>8} {:>8} {:>7} {:>7}",
+                    Self::truncate(slot.label(), 14),
+                    "—",
+                    "—",
+                    format!("{send_mean:.2}"),
+                    "—",
+                    "—",
+                    if slot.connected { "silent" } else { "joining" }
+                ));
+                continue;
+            }
+            let verdict = diagnose(&slot.diag, slot.loss, share.frame_rate);
+            sink.line(format!(
+                "  {:<14} {:>5.0} {:>6.1} {:>8} {:>8} {:>7} {:>7}",
+                Self::truncate(slot.label(), 14),
+                slot.fps,
+                slot.loss,
+                format!("{send_mean:.2}/{send_peak:.2}"),
+                format!("{:.1}", slot.diag.decode_ms),
+                format!("{:.0}", slot.diag.render_drops),
+                verdict.describe(share.frame_rate),
+            ));
+        }
+        if let Some(budget) = budget {
+            // The one line that turns a column of decode times into a verdict. The
+            // rows above are only meaningful against this, and a reader should not
+            // have to do the division to know whether 22 ms is alarming.
+            let share_of_budget = diagnose::DECODE_BUDGET_SHARE * budget;
+            sink.note(&format!(
+                "decode budget at {} fps is {budget:.1} ms per frame, so a viewer \
+                 above {share_of_budget:.1} ms is too slow for its own machine",
+                share.frame_rate,
+            ));
+        }
+        sink.note(
+            "send ms is mean/peak for this viewer's socket. Nothing here changes the \
+             stream quality; the ladder runs on loss and encoder drops only.",
+        );
+    }
+
+    /// Shortened to a column width, so one very long peer name cannot push the
+    /// numbers off the side of the readout.
+    fn truncate(text: &str, width: usize) -> String {
+        if text.chars().count() <= width {
+            return text.to_string();
+        }
+        let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+        format!("{kept}…")
     }
 
     fn reset_sender(metrics: &SenderMetrics) {
@@ -2926,8 +3444,8 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_target, encode_target, worst_link, ViewerSlot, KEYFRAME_REQUEST_FLOOR,
-        VIEWER_REPORT_TTL,
+        audience_from, decode_target, encode_target, lan, roster_is_stale, worst_link, ViewerSlot,
+        KEYFRAME_REQUEST_FLOOR, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use std::time::{Duration, Instant};
 
@@ -3048,5 +3566,126 @@ mod tests {
             Instant::now().duration_since(slot.last_keyframe_request) >= KEYFRAME_REQUEST_FLOOR,
             "a brand new slot is already outside the floor, so its first request counts"
         );
+    }
+
+    /// The reported symptom: one viewer says their stream is dropping frames
+    /// while the sharer sees nothing wrong at all. The sharer's own line has to
+    /// name the cause, or the two sides of the same stream disagree about whether
+    /// anything is wrong.
+    #[test]
+    fn a_slow_viewer_decodes_are_reported_as_a_slow_decoder() {
+        let now = Instant::now();
+        let mut viewer = reported(slot("bob"), 0.4, 30.0, now);
+        viewer.connected = true;
+        viewer.diag = lan::Diagnostics {
+            // 30 fps leaves 33 ms a frame and the decoder is using almost all of
+            // it. The packets arrived; there is nothing for the ladder to send
+            // less of.
+            decode_ms: 31.0,
+            present_ms: 1.0,
+            render_drops: 0.0,
+            decode_errors: 0.0,
+            waiting_keyframe: false,
+        };
+        let line = viewer.summary(now, 30).text().to_string();
+        assert!(
+            line.contains("decoder too slow"),
+            "expected the decoder to be named, got {line:?}"
+        );
+    }
+
+    /// The three states a viewer row can be in have to stay distinguishable. In
+    /// particular a viewer that has gone quiet must not be shown as healthy: the
+    /// whole reason report freshness is tracked is so that silence stops counting
+    /// as evidence, and a row reading "ok" for a viewer who is not talking would
+    /// undo that.
+    #[test]
+    fn a_viewer_row_distinguishes_connecting_silent_and_reporting() {
+        let now = Instant::now();
+        let mut connecting = slot("new");
+        connecting.connected = false;
+        let line = connecting.summary(now, 30).text().to_string();
+        assert!(line.contains("connecting"), "got {line:?}");
+
+        let mut silent = reported(slot("quiet"), 0.0, 60.0, now);
+        silent.connected = true;
+        silent.reported = Some(now - VIEWER_REPORT_TTL - Duration::from_millis(1));
+        let line = silent.summary(now, 30).text().to_string();
+        assert!(line.contains("not reporting"), "got {line:?}");
+
+        let mut healthy = reported(slot("fine"), 0.0, 60.0, now);
+        healthy.connected = true;
+        let line = healthy.summary(now, 30).text().to_string();
+        assert!(line.contains("ok"), "got {line:?}");
+        assert!(
+            !line.contains("not reporting") && !line.contains("connecting"),
+            "a reporting viewer read as {line:?}"
+        );
+    }
+
+    /// The audience list a viewer shows ages, and a headcount that quietly stops
+    /// being true is worse than an obviously old one: it reads as fact. Nothing
+    /// arrives before the first roster, and that has to read as "not known yet"
+    /// rather than as a fresh list of nobody.
+    #[test]
+    fn an_audience_list_is_believed_until_the_sharer_goes_quiet() {
+        let now = Instant::now();
+        assert!(
+            !roster_is_stale(Some(now), now),
+            "a list that just arrived is fresh"
+        );
+        assert!(
+            roster_is_stale(Some(now - ROSTER_STALE - Duration::from_millis(1)), now),
+            "a list past the staleness window is not to be believed"
+        );
+        // Never told anything is not the same as told something and then not told
+        // again; only the second one is worth a warning.
+        assert!(
+            !roster_is_stale(None, now),
+            "no list yet is not a stale list"
+        );
+    }
+
+    /// The shared list is the only reason a viewer can tell that somebody else is
+    /// in the room. If the roster arrives it must be shown in full — including
+    /// people still connecting, since "two people are watching" and "one is
+    /// watching and one is waiting for their code" are different facts.
+    #[test]
+    fn the_viewers_audience_is_whatever_the_sharer_last_said() {
+        let roster = vec![
+            lan::RosterEntry {
+                id: "a".to_string(),
+                name: "alice".to_string(),
+                connected: true,
+            },
+            lan::RosterEntry {
+                id: "b".to_string(),
+                name: String::new(),
+                connected: false,
+            },
+        ];
+        let audience = audience_from(&roster, Some("a"), "me");
+        assert_eq!(audience.len(), 2);
+        assert_eq!(audience[0].label(), "alice");
+        assert_eq!(
+            audience[1].label(),
+            "Anonymous",
+            "a peer with no name must not render as a blank row"
+        );
+        assert!(
+            !audience[1].connected,
+            "a connecting viewer is not watching yet"
+        );
+    }
+
+    /// A manual-code session is never told anything, so the only viewer it can
+    /// know about is the one reading the screen. Showing an empty room there would
+    /// claim nobody is watching while somebody is.
+    #[test]
+    fn a_manual_session_knows_of_exactly_itself() {
+        let audience = audience_from(&[], Some("aabb"), "alice");
+        assert_eq!(audience.len(), 1);
+        assert_eq!(audience[0].id, "aabb");
+        assert_eq!(audience[0].label(), "alice");
     }
 }

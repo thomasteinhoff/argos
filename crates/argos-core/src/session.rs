@@ -27,7 +27,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::{default_runtime, Runtime};
 
 use crate::h264::{self, Packetizer};
-use crate::metrics::{SenderMetrics, StageTimer};
+use crate::metrics::{Ema, SenderMetrics, StageTimer};
 use crate::signal;
 
 pub const VIDEO_PT: u8 = 96;
@@ -266,6 +266,12 @@ struct ViewerConn {
     ever_connected: bool,
     /// When the connection was first seen without a live peer.
     down_since: Option<Instant>,
+    /// Time spent writing this viewer's share of a frame, over the connection
+    /// rather than the whole fan-out.
+    ///
+    /// Its own handle rather than a field so the write path can record into it
+    /// after releasing the map lock, which it must not hold across a socket write.
+    write: Arc<Ema>,
 }
 
 fn video_track() -> TrackLocalStaticRTP {
@@ -300,6 +306,19 @@ fn audio_track() -> TrackLocalStaticRTP {
             ..Default::default()
         }],
     ))
+}
+
+/// One viewer's destination for a packetized frame.
+///
+/// The timing handle comes along with the track so the write path can record
+/// into it without holding the map lock, and so each viewer's cost is separable:
+/// one aggregate figure across several viewers cannot say whose socket is slow,
+/// and that is exactly the question when one person's stream stutters and
+/// everyone else's does not.
+struct WriteTarget {
+    id: String,
+    track: Arc<TrackLocalStaticRTP>,
+    write: Arc<Ema>,
 }
 
 pub struct Sharer {
@@ -360,6 +379,7 @@ impl Sharer {
                 state,
                 ever_connected: false,
                 down_since: None,
+                write: Arc::new(Ema::default()),
             },
         );
         Ok(offer)
@@ -499,15 +519,15 @@ impl Sharer {
     /// someone who is on their way in — they get their first frame from the
     /// keyframe interval instead, which is the same wait anyone joining a stream
     /// already has.
-    fn video_targets(&self) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+    fn video_targets(&self) -> Vec<WriteTarget> {
         self.connected_tracks(true)
     }
 
-    fn audio_targets(&self) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+    fn audio_targets(&self) -> Vec<WriteTarget> {
         self.connected_tracks(false)
     }
 
-    fn connected_tracks(&self, video: bool) -> Vec<(String, Arc<TrackLocalStaticRTP>)> {
+    fn connected_tracks(&self, video: bool) -> Vec<WriteTarget> {
         self.viewers
             .lock()
             .map(|viewers| {
@@ -525,7 +545,11 @@ impl Sharer {
                         } else {
                             &conn.audio_track
                         };
-                        (id.clone(), Arc::clone(track))
+                        WriteTarget {
+                            id: id.clone(),
+                            track: Arc::clone(track),
+                            write: Arc::clone(&conn.write),
+                        }
                     })
                     .collect()
             })
@@ -562,12 +586,17 @@ impl Sharer {
         }
         let _write = StageTimer::new(&metrics.write);
         let mut failed = Vec::new();
-        for (id, track) in targets {
+        for target in targets {
+            // Timed per viewer as well as in aggregate. The aggregate says the
+            // send path is costing something; this says whose socket it is
+            // costing it to, which is the difference between "the stream is
+            // heavy" and "this one viewer's link is not keeping up".
+            let _viewer_write = StageTimer::new(&target.write);
             for packet in &packets {
-                if let Err(_error) = track.write_rtp(packet.clone()).await {
+                if let Err(_error) = target.track.write_rtp(packet.clone()).await {
                     metrics.write_errors.incr();
-                    if !failed.contains(&id) {
-                        failed.push(id);
+                    if !failed.contains(&target.id) {
+                        failed.push(target.id);
                     }
                     break;
                 }
@@ -601,12 +630,13 @@ impl Sharer {
             return Ok(());
         }
         let mut failed = Vec::new();
-        for (id, track) in targets {
+        for target in targets {
+            let _viewer_write = StageTimer::new(&target.write);
             for packet in &packets {
-                if let Err(_error) = track.write_rtp(packet.clone()).await {
+                if let Err(_error) = target.track.write_rtp(packet.clone()).await {
                     metrics.audio_errors.incr();
-                    if !failed.contains(&id) {
-                        failed.push(id);
+                    if !failed.contains(&target.id) {
+                        failed.push(target.id);
                     }
                     break;
                 }
@@ -620,6 +650,34 @@ impl Sharer {
     async fn drop_failed(&self, ids: &[String]) {
         for id in ids {
             self.remove_viewer(id).await;
+        }
+    }
+
+    /// How long writing this viewer's share of a frame has been taking, as
+    /// `(mean, peak)` in milliseconds. `(0.0, 0.0)` when there is no such viewer
+    /// or nothing has been written yet.
+    ///
+    /// Per viewer rather than in aggregate because the aggregate cannot answer
+    /// the question that matters when one person's stream stutters and nobody
+    /// else's does: whether their writes are slow, or the loss is happening after
+    /// the packets leave.
+    pub fn viewer_write_ms(&self, id: &str) -> (f32, f32) {
+        self.viewers
+            .lock()
+            .ok()
+            .and_then(|viewers| viewers.get(id).map(|conn| conn.write.clone()))
+            .map(|write| (write.mean_ms(), write.peak_ms()))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Clears every viewer's write timing, so a measurement window reset covers
+    /// the whole pipeline rather than leaving the per-viewer figures describing
+    /// some earlier window.
+    pub fn reset_write_timings(&self) {
+        if let Ok(viewers) = self.viewers.lock() {
+            for conn in viewers.values() {
+                conn.write.reset();
+            }
         }
     }
 

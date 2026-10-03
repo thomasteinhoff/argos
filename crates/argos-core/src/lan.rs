@@ -55,7 +55,112 @@ pub enum LanEvent {
         id: String,
         loss: f32,
         fps: f32,
+        /// Everything else the viewer measured about its own end. Diagnosis
+        /// only — nothing in the quality controller reads it.
+        diag: Diagnostics,
     },
+    /// Who else is watching the same stream, and what shape the stream is.
+    ///
+    /// Sent by the sharer because it is the only party that knows: a viewer can
+    /// see the other machines on the network, but not which of them are watching
+    /// *this* stream. Carries the source frame rate too, so a viewer can judge
+    /// its own decode time against a real frame budget rather than guessing one.
+    Roster {
+        id: String,
+        viewers: Vec<RosterEntry>,
+        source_fps: u32,
+        /// The stream's target height. `None` is the sharer's native resolution,
+        /// which is a real answer rather than a missing one.
+        source_height: Option<u32>,
+    },
+}
+
+/// Receive-side measurements that explain *why* a viewer's picture stutters, as
+/// distinct from how bad its link is.
+///
+/// Kept apart from `loss` and `fps` because those two are load-bearing for the
+/// adaptive controller and have been on the wire since the first version, while
+/// these answer a question nobody has asked the controller yet. Every field
+/// defaults, so a build from before this existed still parses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Diagnostics {
+    /// Mean time inside the H.264 decoder, in milliseconds.
+    ///
+    /// Against the stream's frame budget this is what separates "this machine
+    /// cannot decode fast enough" from "the link is dropping packets" — two
+    /// problems with the same visible symptom and opposite fixes.
+    #[serde(default)]
+    pub decode_ms: f32,
+    /// Mean time spent expanding a decoded frame to RGBA for display.
+    #[serde(default)]
+    pub present_ms: f32,
+    /// Share of decoded frames that were replaced before being displayed,
+    /// `0..100`.
+    ///
+    /// Counts frames the decode thread produced and the UI never showed, which
+    /// is a stall no amount of keyframe recovery can fix.
+    #[serde(default)]
+    pub render_drops: f32,
+    /// Decode errors per second.
+    #[serde(default)]
+    pub decode_errors: f32,
+    /// Packets are arriving but nothing is decoding: the decoder is waiting for
+    /// an intra frame it has not been given.
+    #[serde(default)]
+    pub waiting_keyframe: bool,
+}
+
+impl Diagnostics {
+    /// Whether every measurement is a real number.
+    pub fn is_finite(&self) -> bool {
+        self.decode_ms.is_finite()
+            && self.present_ms.is_finite()
+            && self.render_drops.is_finite()
+            && self.decode_errors.is_finite()
+    }
+
+    /// The measurements, brought into the ranges they claim to be in.
+    ///
+    /// One peer must not be able to hand the sharer a negative drop rate or a
+    /// 400% one and have either of them show up as fact.
+    pub fn clamped(&self) -> Self {
+        Self {
+            decode_ms: self.decode_ms.max(0.0),
+            present_ms: self.present_ms.max(0.0),
+            render_drops: self.render_drops.clamp(0.0, 100.0),
+            decode_errors: self.decode_errors.max(0.0),
+            waiting_keyframe: self.waiting_keyframe,
+        }
+    }
+}
+
+/// One viewer as the sharer sees it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RosterEntry {
+    pub id: String,
+    pub name: String,
+    /// Whether their connection is up, as opposed to still negotiating.
+    #[serde(default)]
+    pub connected: bool,
+}
+
+impl RosterEntry {
+    /// The name to show, never blank.
+    pub fn label(&self) -> &str {
+        if self.name.trim().is_empty() {
+            "Anonymous"
+        } else {
+            self.name.as_str()
+        }
+    }
+}
+
+/// What a viewer tells the sharer about its end of the stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinkReport {
+    pub loss: f32,
+    pub fps: f32,
+    pub diag: Diagnostics,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,6 +183,19 @@ struct Message {
     /// Decoded frames per second, in the `report` message.
     #[serde(default)]
     fps: f32,
+    /// Diagnosis-only measurements, in the `report` message.
+    #[serde(default)]
+    diag: Diagnostics,
+    /// Everyone the sharer is serving, in the `roster` message.
+    #[serde(default)]
+    roster: Vec<RosterEntry>,
+    /// The stream's frame rate, in the `roster` message.
+    #[serde(default)]
+    source_fps: u32,
+    /// The stream's target height in the `roster` message; absent means the
+    /// sharer's native resolution.
+    #[serde(default)]
+    source_height: Option<u32>,
 }
 
 pub struct Lan {
@@ -217,6 +335,10 @@ impl Lan {
             sdp: String::new(),
             loss: 0.0,
             fps: 0.0,
+            diag: Diagnostics::default(),
+            roster: Vec::new(),
+            source_fps: 0,
+            source_height: None,
         }
     }
 
@@ -249,10 +371,37 @@ impl Lan {
     }
 
     /// Reports this end's view of the link to a sharer.
-    pub fn send_report(&self, id: &str, loss: f32, fps: f32) {
+    ///
+    /// Goes out whether or not anything is wrong: the loss and frame rate are
+    /// what let the sharer's controller step back up when a link recovers, which
+    /// it could never infer on its own. The diagnostics ride along in the same
+    /// datagram because they are the same measurement of the same window, and a
+    /// second message would be a second thing to lose.
+    pub fn send_report(&self, id: &str, report: &LinkReport) {
         let mut message = self.message("report", id);
-        message.loss = loss;
-        message.fps = fps;
+        message.loss = report.loss;
+        message.fps = report.fps;
+        message.diag = report.diag;
+        self.send_to_peer(id, message);
+    }
+
+    /// Tells one viewer who else is watching, and what the stream looks like.
+    ///
+    /// Best-effort, and meant to be repeated: it is sent whenever the roster
+    /// changes and on a slow keepalive, because UDP loses datagrams and a
+    /// viewer that missed the only roster it would ever get would show an empty
+    /// list forever with nothing to say so.
+    pub fn send_roster(
+        &self,
+        id: &str,
+        viewers: &[RosterEntry],
+        source_fps: u32,
+        source_height: Option<u32>,
+    ) {
+        let mut message = self.message("roster", id);
+        message.roster = viewers.to_vec();
+        message.source_fps = source_fps;
+        message.source_height = source_height;
         self.send_to_peer(id, message);
     }
 }
@@ -367,6 +516,10 @@ fn discovery_loop(
                 sdp: String::new(),
                 loss: 0.0,
                 fps: 0.0,
+                diag: Diagnostics::default(),
+                roster: Vec::new(),
+                source_fps: 0,
+                source_height: None,
             };
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
@@ -444,15 +597,22 @@ fn dispatch(message: Message) -> Option<LanEvent> {
             // fabricated healthy link that would walk the sharer's ladder up on
             // evidence nobody sent. Non-finite values never get this far: they
             // serialise as `null` and fail to parse.
-            if !message.loss.is_finite() || !message.fps.is_finite() {
+            if !message.loss.is_finite() || !message.fps.is_finite() || !message.diag.is_finite() {
                 return None;
             }
             Some(LanEvent::Report {
                 id: message.id,
                 loss: message.loss.clamp(0.0, 100.0),
                 fps: message.fps.clamp(0.0, 1000.0),
+                diag: message.diag.clamped(),
             })
         }
+        "roster" => Some(LanEvent::Roster {
+            id: message.id,
+            viewers: message.roster,
+            source_fps: message.source_fps,
+            source_height: message.source_height,
+        }),
         _ => None,
     }
 }

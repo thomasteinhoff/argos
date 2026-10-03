@@ -1,3 +1,4 @@
+pub mod diagnose;
 pub mod h264;
 pub mod lan;
 pub mod metrics;

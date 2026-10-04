@@ -1,8 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+fn default_volume_percent() -> u32 {
+    100
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub name: String,
+    #[serde(default = "default_volume_percent")]
+    pub volume_percent: u32,
 }
 
 pub fn load() -> AppConfig {

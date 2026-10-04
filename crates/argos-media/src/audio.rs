@@ -749,6 +749,7 @@ pub struct AudioPlayback {
     tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    volume: Arc<std::sync::atomic::AtomicU32>,
     state: Arc<AudioState>,
     join: Option<JoinHandle<()>>,
 }
@@ -758,8 +759,11 @@ impl AudioPlayback {
         let (tx, rx) = sync_channel::<Vec<f32>>(32);
         let stop = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
+        let vol_percent = ((volume.max(0.0) * 100.0) as u32).clamp(0, 200);
+        let volume_atomic = Arc::new(std::sync::atomic::AtomicU32::new(vol_percent));
         let thread_stop = Arc::clone(&stop);
         let thread_muted = Arc::clone(&muted);
+        let thread_volume = Arc::clone(&volume_atomic);
         let state = Arc::new(AudioState::default());
         let thread_state = Arc::clone(&state);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -771,9 +775,9 @@ impl AudioPlayback {
                     rx,
                     thread_stop,
                     thread_muted,
+                    thread_volume,
                     thread_state,
                     ready_tx,
-                    volume,
                 )
             })
             .map_err(|error| error.to_string())?;
@@ -783,6 +787,7 @@ impl AudioPlayback {
                 tx,
                 stop,
                 muted,
+                volume: volume_atomic,
                 state,
                 join: Some(join),
             }),
@@ -801,6 +806,14 @@ impl AudioPlayback {
 
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_volume_percent(&self, v: u32) {
+        self.volume.store(v.clamp(0, 200), Ordering::Relaxed);
+    }
+
+    pub fn volume_percent(&self) -> u32 {
+        self.volume.load(Ordering::Relaxed)
     }
 
     /// Health of the playback thread, for the UI to display.
@@ -834,9 +847,9 @@ fn playback_loop(
     rx: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    volume: Arc<std::sync::atomic::AtomicU32>,
     state: Arc<AudioState>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
-    volume: f32,
 ) {
     // COM initialisation is per-thread and unrecoverable, so it is the only
     // failure that reports through `ready` and gives up. A device that is
@@ -858,7 +871,7 @@ fn playback_loop(
     let mut backoff = RETRY_BACKOFF;
     let mut generation = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        match run_playback(&rx, &stop, &muted, volume, &state, generation) {
+        match run_playback(&rx, &stop, &muted, &volume, &state, generation) {
             Ok(()) => return,
             Err(error) => {
                 state.fail(generation, error);
@@ -877,7 +890,7 @@ fn run_playback(
     rx: &Receiver<Vec<f32>>,
     stop: &AtomicBool,
     muted: &AtomicBool,
-    volume: f32,
+    volume: &Arc<std::sync::atomic::AtomicU32>,
     state: &AudioState,
     generation: u64,
 ) -> Result<(), String> {
@@ -959,7 +972,8 @@ fn run_playback(
         let gain = if muted.load(Ordering::Relaxed) {
             0.0
         } else {
-            volume
+            let v = volume.load(Ordering::Relaxed).clamp(0, 200) as f32;
+            v / 100.0
         };
         queue.clear();
         for sample in &out {

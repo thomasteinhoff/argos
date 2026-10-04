@@ -1556,10 +1556,14 @@ impl ArgosApp {
         let latest = Arc::new(Mutex::new(None));
         let stats = Arc::new(Mutex::new(ViewStats::default()));
         let metrics = Arc::new(ReceiverMetrics::default());
-        let (audio_playback, audio_error) = match AudioPlayback::start(1.0) {
+        let vol = self.config.volume_percent as f32 / 100.0;
+        let (audio_playback, audio_error) = match AudioPlayback::start(vol) {
             Ok(playback) => (Some(Arc::new(playback)), None),
             Err(error) => (None, Some(error)),
         };
+        if let Some(ref pb) = audio_playback {
+            pb.set_volume_percent(self.config.volume_percent);
+        }
         let callback: Arc<dyn Fn(&Packet) + Send + Sync> = Arc::new(Self::receive_callback(
             Arc::clone(&latest),
             Arc::clone(&stats),
@@ -2910,6 +2914,23 @@ impl ArgosApp {
                 if ui.button(label).clicked() {
                     playback.set_muted(!muted);
                 }
+                let mut vol = playback.volume_percent();
+                let mut vol_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Volume");
+                    if ui.add(egui::Slider::new(&mut vol, 0..=200).suffix("%")).changed() {
+                        vol_changed = true;
+                    }
+                });
+                if vol_changed {
+                    playback.set_volume_percent(vol);
+                    self.config.volume_percent = vol;
+                    let _ = config::save(&self.config);
+                    if playback.is_muted() && vol > 0 {
+                        playback.set_muted(false);
+                    }
+                }
+                // unmute on change to non-zero? if muted and vol>0, unmute? but button controls mute
                 // `Some(playback)` says the thread was started, not that the
                 // speaker is still being driven. A worker stuck in its retry
                 // backoff leaves the session silent with nothing else to show
@@ -3103,7 +3124,7 @@ fn fullscreen_view(&mut self, ctx: &egui::Context) {
         egui::Area::new(egui::Id::new("argos.hud"))
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
             .order(egui::Order::Foreground)
-            .interactable(false)
+            .interactable(true)
             .show(ctx, |ui| {
                 let frame = egui::Frame::popup(ui.style())
                     .fill(with_alpha(ui.style().visuals.panel_fill, alpha))

@@ -28,7 +28,6 @@ fn message(kind: &str) -> Message {
         diag: Diagnostics::default(),
         roster: Vec::new(),
         source_fps: 0,
-        source_height: None,
     }
 }
 
@@ -93,13 +92,11 @@ fn a_roster_carries_every_viewer_and_the_shape_of_the_stream() {
         roster_entry("bbbb", "", false),
     ];
     sent.source_fps = 30;
-    sent.source_height = Some(720);
     let bytes = serde_json::to_vec(&sent).expect("serialise");
     match dispatch(serde_json::from_slice(&bytes).expect("deserialise")) {
         Some(LanEvent::Roster {
             viewers,
             source_fps,
-            source_height,
             ..
         }) => {
             assert_eq!(viewers.len(), 2);
@@ -110,30 +107,6 @@ fn a_roster_carries_every_viewer_and_the_shape_of_the_stream() {
             assert_eq!(viewers[1].label(), "Anonymous");
             assert!(!viewers[1].connected);
             assert_eq!(source_fps, 30);
-            assert_eq!(source_height, Some(720));
-        }
-        other => panic!("expected a Roster event, got {other:?}"),
-    }
-}
-
-/// Native resolution has to be expressible. A missing height means "native"
-/// rather than "unknown", so it cannot be told apart from a datagram that lost
-/// the field — but a viewer only uses it to label the picture, and native is the
-/// honest reading in both cases.
-#[test]
-fn a_native_stream_has_no_height_and_still_parses() {
-    let mut sent = message("roster");
-    sent.source_fps = 60;
-    sent.source_height = None;
-    let bytes = serde_json::to_vec(&sent).expect("serialise");
-    match dispatch(serde_json::from_slice(&bytes).expect("deserialise")) {
-        Some(LanEvent::Roster {
-            source_fps,
-            source_height,
-            ..
-        }) => {
-            assert_eq!(source_fps, 60);
-            assert_eq!(source_height, None);
         }
         other => panic!("expected a Roster event, got {other:?}"),
     }

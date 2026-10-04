@@ -137,13 +137,19 @@ fn run(
         let acquired = unsafe { duplication.AcquireNextFrame(timeout, &mut info, &mut resource) };
         match acquired {
             Ok(()) => {
+                // The wait is over, so time it here rather than after the
+                // readback. Folding the two together produced a number that was
+                // neither the GPU's latency nor ours, and left `readback` — which
+                // the pipeline readout displays — permanently zero.
+                metrics.acquire.record(waiting.elapsed());
                 let fresh = info.LastPresentTime != 0 || first;
                 let due = last.elapsed() >= target;
                 if fresh && due {
                     if let Some(resource) = resource.as_ref() {
+                        let copying = Instant::now();
                         match readback(&device, &context, resource, &mut staging) {
                             Ok(frame) => {
-                                metrics.acquire.record(waiting.elapsed());
+                                metrics.readback.record(copying.elapsed());
                                 first = false;
                                 match tx.try_send(frame) {
                                     Ok(()) => metrics.captured.record(),
@@ -159,11 +165,9 @@ fn run(
                                 }
                                 last = Instant::now();
                             }
-                            Err(_) => metrics.acquire.record(waiting.elapsed()),
+                            Err(_) => metrics.readback.record(copying.elapsed()),
                         }
                     }
-                } else {
-                    metrics.acquire.record(waiting.elapsed());
                 }
                 // Always release: a held frame blocks the next acquire and is
                 // the path to DXGI_ERROR_ACCESS_LOST.

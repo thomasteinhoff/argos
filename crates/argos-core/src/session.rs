@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rtc::interceptor::Registry;
@@ -98,6 +98,31 @@ struct HandlerState {
     connected: bool,
 }
 
+/// Takes a lock that must never read as "empty" just because it is poisoned.
+///
+/// Poisoning records that some other thread panicked while holding the lock; it
+/// says nothing about the contents. Everything guarded here is plain owned data
+/// — a map of connections, two bools, a packetizer — so a panic mid-update leaves
+/// it internally consistent even if a logical step was skipped. Reading it as
+/// empty was the worse failure by a wide margin, because every use of that lock
+/// answers a question about the world rather than doing arithmetic:
+///
+/// * the send path collapsed "no viewers" and "lock poisoned" into one empty
+///   list, which `send_frame` treats as the normal state before anyone joins — so
+///   a single panic anywhere stopped every stream for the rest of the session,
+///   with no error raised anywhere and the sharer still reporting "Connected";
+/// * `close` drained nothing and so leaked every peer connection, its ICE agent
+///   and its sockets;
+/// * `prune` returned no ids, so dead connections were never cleaned up;
+/// * `wait_for_gathering` saw a gathering that never completed and blocked for
+///   the full `GATHER_TIMEOUT` before failing a negotiation that had finished.
+///
+/// The panic itself still prints through the default hook, so the cause is not
+/// lost — it just no longer takes the stream down with it.
+fn unpoison<T>(result: LockResult<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
+    result.unwrap_or_else(PoisonError::into_inner)
+}
+
 struct SessionHandler {
     state: Arc<Mutex<HandlerState>>,
     on_packet: Option<PacketCallback>,
@@ -107,21 +132,18 @@ struct SessionHandler {
 impl PeerConnectionEventHandler for SessionHandler {
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         if state == RTCIceGatheringState::Complete {
-            if let Ok(mut current) = self.state.lock() {
-                current.gathering_complete = true;
-            }
+            unpoison(self.state.lock()).gathering_complete = true;
         }
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        if let Ok(mut current) = self.state.lock() {
-            match state {
-                RTCPeerConnectionState::Connected => current.connected = true,
-                RTCPeerConnectionState::Disconnected
-                | RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed => current.connected = false,
-                _ => {}
-            }
+        let mut current = unpoison(self.state.lock());
+        match state {
+            RTCPeerConnectionState::Connected => current.connected = true,
+            RTCPeerConnectionState::Disconnected
+            | RTCPeerConnectionState::Failed
+            | RTCPeerConnectionState::Closed => current.connected = false,
+            _ => {}
         }
     }
 
@@ -211,11 +233,7 @@ async fn build_pc(
 async fn wait_for_gathering(state: &Mutex<HandlerState>) -> Result<(), String> {
     let started = std::time::Instant::now();
     loop {
-        if state
-            .lock()
-            .map(|current| current.gathering_complete)
-            .unwrap_or(false)
-        {
+        if unpoison(state.lock()).gathering_complete {
             return Ok(());
         }
         if started.elapsed() >= GATHER_TIMEOUT {
@@ -366,10 +384,7 @@ impl Sharer {
             .await
             .map_err(|error| error.to_string())?;
         let offer = create_offer(&pc, &state).await?;
-        let Ok(mut viewers) = self.viewers.lock() else {
-            let _ = pc.close().await;
-            return Err("sharer viewer lock poisoned".to_string());
-        };
+        let mut viewers = unpoison(self.viewers.lock());
         viewers.insert(
             id.to_string(),
             ViewerConn {
@@ -387,11 +402,9 @@ impl Sharer {
 
     /// Answers the offer belonging to one viewer.
     pub async fn set_answer(&self, id: &str, code: &str) -> Result<(), String> {
-        let pc = self
-            .viewers
-            .lock()
-            .ok()
-            .and_then(|viewers| viewers.get(id).map(|conn| Arc::clone(&conn.pc)))
+        let pc = unpoison(self.viewers.lock())
+            .get(id)
+            .map(|conn| Arc::clone(&conn.pc))
             .ok_or_else(|| "that viewer is no longer waiting for an offer".to_string())?;
         let answer =
             signal::decode(code).map_err(|error| format!("invalid answer code: {error}"))?;
@@ -402,11 +415,7 @@ impl Sharer {
 
     /// Closes one viewer's connection and forgets it.
     pub async fn remove_viewer(&self, id: &str) {
-        let conn = self
-            .viewers
-            .lock()
-            .ok()
-            .and_then(|mut viewers| viewers.remove(id));
+        let conn = unpoison(self.viewers.lock()).remove(id);
         if let Some(conn) = conn {
             let _ = conn.pc.close().await;
         }
@@ -438,17 +447,11 @@ impl Sharer {
     /// connecting screen until the viewer gave up.
     pub fn needs_reoffer(&self, id: &str) -> bool {
         let now = Instant::now();
-        let Ok(mut viewers) = self.viewers.lock() else {
-            return false;
-        };
+        let mut viewers = unpoison(self.viewers.lock());
         let Some(conn) = viewers.get_mut(id) else {
             return false;
         };
-        let connected = conn
-            .state
-            .lock()
-            .map(|state| state.connected)
-            .unwrap_or(false);
+        let connected = unpoison(conn.state.lock()).connected;
         if Self::observe(conn, connected, now) {
             return false;
         }
@@ -456,13 +459,7 @@ impl Sharer {
         // so this is a handshake in progress rather than a failed one. Without
         // this the second of two clicks inside the gather window would tear down
         // a negotiation that is about to succeed.
-        if !conn.ever_connected
-            && !conn
-                .state
-                .lock()
-                .map(|state| state.gathering_complete)
-                .unwrap_or(false)
-        {
+        if !conn.ever_connected && !unpoison(conn.state.lock()).gathering_complete {
             return false;
         }
         now.duration_since(conn.down_since.unwrap_or(now)) >= REOFFER_DELAY
@@ -477,15 +474,9 @@ impl Sharer {
         let now = Instant::now();
         let mut dead: Vec<(String, Arc<dyn PeerConnection>)> = Vec::new();
         {
-            let Ok(mut viewers) = self.viewers.lock() else {
-                return Vec::new();
-            };
+            let mut viewers = unpoison(self.viewers.lock());
             for (id, conn) in viewers.iter_mut() {
-                let connected = conn
-                    .state
-                    .lock()
-                    .map(|state| state.connected)
-                    .unwrap_or(false);
+                let connected = unpoison(conn.state.lock()).connected;
                 if Self::observe(conn, connected, now) {
                     continue;
                 }
@@ -528,32 +519,22 @@ impl Sharer {
     }
 
     fn connected_tracks(&self, video: bool) -> Vec<WriteTarget> {
-        self.viewers
-            .lock()
-            .map(|viewers| {
-                viewers
-                    .iter()
-                    .filter(|(_, conn)| {
-                        conn.state
-                            .lock()
-                            .map(|state| state.connected)
-                            .unwrap_or(false)
-                    })
-                    .map(|(id, conn)| {
-                        let track = if video {
-                            &conn.track
-                        } else {
-                            &conn.audio_track
-                        };
-                        WriteTarget {
-                            id: id.clone(),
-                            track: Arc::clone(track),
-                            write: Arc::clone(&conn.write),
-                        }
-                    })
-                    .collect()
+        unpoison(self.viewers.lock())
+            .iter()
+            .filter(|(_, conn)| unpoison(conn.state.lock()).connected)
+            .map(|(id, conn)| {
+                let track = if video {
+                    &conn.track
+                } else {
+                    &conn.audio_track
+                };
+                WriteTarget {
+                    id: id.clone(),
+                    track: Arc::clone(track),
+                    write: Arc::clone(&conn.write),
+                }
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub async fn send_frame(
@@ -565,10 +546,7 @@ impl Sharer {
         let packets = {
             let _packetize = StageTimer::new(&metrics.packetize);
             let nalus: Vec<&[u8]> = h264::AnnexBIter::new(bitstream).collect();
-            let mut packetizer = self
-                .packetizer
-                .lock()
-                .map_err(|_| "packetizer lock poisoned".to_string())?;
+            let mut packetizer = unpoison(self.packetizer.lock());
             nalus
                 .iter()
                 .enumerate()
@@ -619,10 +597,7 @@ impl Sharer {
         metrics.audio_frames.incr();
         metrics.audio_bytes.add(opus.len() as u64);
         let packets = {
-            let mut packetizer = self
-                .audio_packetizer
-                .lock()
-                .map_err(|_| "audio packetizer lock poisoned".to_string())?;
+            let mut packetizer = unpoison(self.audio_packetizer.lock());
             packetizer.packetize(opus, timestamp, true)
         };
         let targets = self.audio_targets();
@@ -662,11 +637,9 @@ impl Sharer {
     /// else's does: whether their writes are slow, or the loss is happening after
     /// the packets leave.
     pub fn viewer_write_ms(&self, id: &str) -> (f32, f32) {
-        self.viewers
-            .lock()
-            .ok()
-            .and_then(|viewers| viewers.get(id).map(|conn| conn.write.clone()))
-            .map(|write| (write.mean_ms(), write.peak_ms()))
+        unpoison(self.viewers.lock())
+            .get(id)
+            .map(|conn| (conn.write.mean_ms(), conn.write.peak_ms()))
             .unwrap_or((0.0, 0.0))
     }
 
@@ -674,22 +647,16 @@ impl Sharer {
     /// the whole pipeline rather than leaving the per-viewer figures describing
     /// some earlier window.
     pub fn reset_write_timings(&self) {
-        if let Ok(viewers) = self.viewers.lock() {
-            for conn in viewers.values() {
-                conn.write.reset();
-            }
+        for conn in unpoison(self.viewers.lock()).values() {
+            conn.write.reset();
         }
     }
 
     /// Whether one viewer's connection is up.
     pub fn viewer_connected(&self, id: &str) -> bool {
-        let Ok(viewers) = self.viewers.lock() else {
-            return false;
-        };
-        viewers
+        unpoison(self.viewers.lock())
             .get(id)
-            .and_then(|conn| conn.state.lock().ok().map(|state| state.connected))
-            .unwrap_or(false)
+            .is_some_and(|conn| unpoison(conn.state.lock()).connected)
     }
 
     /// Viewers with a live connection, and the number of slots in total.
@@ -698,21 +665,12 @@ impl Sharer {
     /// whether anyone is being served at all, the first says how many people are
     /// actually watching.
     pub fn viewer_counts(&self) -> (usize, usize) {
-        self.viewers
-            .lock()
-            .map(|viewers| {
-                let connected = viewers
-                    .values()
-                    .filter(|conn| {
-                        conn.state
-                            .lock()
-                            .map(|state| state.connected)
-                            .unwrap_or(false)
-                    })
-                    .count();
-                (connected, viewers.len())
-            })
-            .unwrap_or((0, 0))
+        let viewers = unpoison(self.viewers.lock());
+        let connected = viewers
+            .values()
+            .filter(|conn| unpoison(conn.state.lock()).connected)
+            .count();
+        (connected, viewers.len())
     }
 
     pub fn status(&self) -> &'static str {
@@ -725,19 +683,9 @@ impl Sharer {
         }
         // Every slot is still negotiating. Whether they have finished gathering
         // is the only thing left to say about it.
-        let gathering = self
-            .viewers
-            .lock()
-            .map(|viewers| {
-                viewers.values().any(|conn| {
-                    !conn
-                        .state
-                        .lock()
-                        .map(|s| s.gathering_complete)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(true);
+        let gathering = unpoison(self.viewers.lock())
+            .values()
+            .any(|conn| !unpoison(conn.state.lock()).gathering_complete);
         if gathering {
             "Gathering"
         } else {
@@ -751,11 +699,10 @@ impl Sharer {
     }
 
     pub async fn close(&self) {
-        let conns: Vec<Arc<dyn PeerConnection>> = self
-            .viewers
-            .lock()
-            .map(|mut viewers| viewers.drain().map(|(_, conn)| conn.pc).collect())
-            .unwrap_or_default();
+        let conns: Vec<Arc<dyn PeerConnection>> = unpoison(self.viewers.lock())
+            .drain()
+            .map(|(_, conn)| conn.pc)
+            .collect();
         for pc in conns {
             let _ = pc.close().await;
         }
@@ -817,19 +764,59 @@ impl Viewer {
     }
 
     pub fn status(&self) -> &'static str {
-        let current = self.state.lock().ok();
-        match current.as_deref() {
-            Some(state) if state.connected => "Connected",
-            Some(state) if state.gathering_complete => "Waiting for peer",
-            _ => "Gathering",
+        let current = unpoison(self.state.lock());
+        if current.connected {
+            "Connected"
+        } else if current.gathering_complete {
+            "Waiting for peer"
+        } else {
+            "Gathering"
         }
     }
 
     pub fn is_connected(&self) -> bool {
-        self.state.lock().map(|s| s.connected).unwrap_or(false)
+        unpoison(self.state.lock()).connected
     }
 
     pub async fn close(&self) {
         let _ = self.pc.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unpoison;
+    use std::sync::Mutex;
+
+    /// A lock poisoned by a panicking thread still holds its data.
+    ///
+    /// Every lock in this file guards a question about the world — who is
+    /// watching, what has been written, whether gathering finished — so reading
+    /// one as empty because of a poison is not a safe default, it is a wrong
+    /// answer. It was: the send path treats an empty target list as "nobody is
+    /// watching yet", which is the normal state before the first request, so one
+    /// panic anywhere silently ended every stream for the rest of the session.
+    #[test]
+    fn a_poisoned_lock_still_yields_its_contents() {
+        let lock = Mutex::new(vec![1u32, 2, 3]);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut held = lock.lock().unwrap();
+            held.push(4);
+            panic!("a thread gave up mid-update");
+        }));
+
+        assert!(
+            lock.is_poisoned(),
+            "the panic should have poisoned the lock"
+        );
+        assert_eq!(*unpoison(lock.lock()), vec![1, 2, 3, 4]);
+    }
+
+    /// The same lock, untainted, takes the ordinary path.
+    #[test]
+    fn a_healthy_lock_takes_the_same_path() {
+        let lock = Mutex::new(vec![7u32]);
+        assert_eq!(*unpoison(lock.lock()), vec![7]);
     }
 }

@@ -388,4 +388,159 @@ mod tests {
             assert!(depacketizer.push(&packet).is_none());
         }
     }
+
+    /// A keyframe too big for one packet survives the round trip byte for byte.
+    ///
+    /// The test above uses six bytes, which never leaves the single-packet path.
+    /// Fragmentation is the path every real keyframe takes: a 1080p IDR is tens
+    /// of kilobytes against a 1200-byte MTU, so an error here would break every
+    /// stream while every existing test still passed.
+    #[test]
+    fn a_fragmented_keyframe_survives_the_round_trip() {
+        use super::{Depacketizer, Packetizer};
+        let mut packetizer = Packetizer::new(0x5a5a_77e1, 96, 1200);
+        // 0x65 is an IDR slice with nal_ref_idc 3, so it also unlocks the
+        // depacketizer's keyframe gate.
+        let mut keyframe = vec![0x65u8];
+        keyframe.extend((0..20_000u32).map(|index| (index % 251) as u8));
+
+        let mut depacketizer = Depacketizer::new();
+        let mut recovered = None;
+        for packet in packetizer.packetize(&keyframe, 3000, true) {
+            recovered = depacketizer.push(&packet).or(recovered);
+        }
+
+        let access_unit = recovered.expect("a fragmented keyframe must reassemble");
+        assert_eq!(access_unit.len(), 1);
+        assert_eq!(
+            access_unit[0], keyframe,
+            "FU-A must be transparent to the bytes it carries"
+        );
+    }
+
+    /// Only the last fragment of a NALU carries the marker.
+    ///
+    /// The marker is how the receiver learns an access unit is complete, so a
+    /// marker on an early fragment hands the decoder a truncated frame — and
+    /// every later fragment then looks like the start of a new one.
+    #[test]
+    fn only_the_last_fragment_carries_the_marker() {
+        use super::Packetizer;
+        let mut packetizer = Packetizer::new(1, 96, 300);
+        let packets = packetizer.packetize(&vec![0x65u8; 1_000], 0, true);
+        assert!(packets.len() > 2, "the fixture has to fragment");
+        let last = packets.len() - 1;
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(
+                packet.header.marker,
+                index == last,
+                "fragment {index} of {} has the wrong marker",
+                packets.len()
+            );
+        }
+    }
+
+    /// Start and end bits bracket the fragments, and the NALU's own header bits
+    /// survive the transformation.
+    ///
+    /// A start bit set anywhere but the first fragment makes the reassembler
+    /// discard everything collected so far, so the frame decodes as its final
+    /// fragment alone. The type and NRI bits come back on reassembly, so losing
+    /// them here would turn every keyframe into something undecodable.
+    #[test]
+    fn fragment_bits_bracket_the_payload() {
+        use super::Packetizer;
+        let mut packetizer = Packetizer::new(1, 96, 300);
+        let packets = packetizer.packetize(&vec![0x65u8; 1_000], 0, true);
+        let last = packets.len() - 1;
+
+        for (index, packet) in packets.iter().enumerate() {
+            let (&indicator, &header) = (&packet.payload[0], &packet.payload[1]);
+            assert_eq!(indicator & 0x1f, 28, "fragment {index} is not FU-A");
+            assert_eq!(
+                indicator & 0xe0,
+                0x60,
+                "fragment {index} lost the forbidden-zero and NRI bits"
+            );
+            assert_eq!(
+                header & 0x1f,
+                5,
+                "fragment {index} lost the original NALU type"
+            );
+            assert_eq!(header & 0x80 != 0, index == 0, "start bit on {index}");
+            assert_eq!(header & 0x40 != 0, index == last, "end bit on {index}");
+        }
+    }
+
+    /// Every fragment of one NALU shares its timestamp and chains sequence
+    /// numbers.
+    ///
+    /// The reassembler throws away the entire access unit when the timestamp
+    /// changes and again on a sequence gap, so fragments that disagree on either
+    /// are discarded rather than decoded. No single-packet test can see that,
+    /// because a one-packet NALU has nothing to disagree with.
+    #[test]
+    fn fragments_agree_on_the_timestamp_and_the_sequence_numbers() {
+        use super::Packetizer;
+        let mut packetizer = Packetizer::new(1, 96, 300);
+        let packets = packetizer.packetize(&vec![0x65u8; 1_000], 7_500, true);
+        assert!(packets.len() > 2, "the fixture has to fragment");
+        for packet in &packets {
+            assert_eq!(packet.header.timestamp, 7_500);
+            assert!(
+                packet.payload.len() <= 300,
+                "a fragment of {} bytes does not fit the MTU",
+                packet.payload.len()
+            );
+        }
+        for pair in packets.windows(2) {
+            assert_eq!(
+                pair[1].header.sequence_number,
+                pair[0].header.sequence_number.wrapping_add(1),
+                "sequence numbers must be consecutive or the frame is dropped"
+            );
+        }
+    }
+
+    /// Start codes are found in both lengths, and an empty unit is skipped.
+    ///
+    /// openh264 writes four-byte codes; a hand-written Annex B stream may use
+    /// three. Two codes back to back leave a zero-length unit between them, which
+    /// the reassembler cannot type and the decoder cannot accept — so it must not
+    /// be yielded as a NALU of its own.
+    #[test]
+    fn annexb_yields_every_unit_and_skips_the_empty_ones() {
+        use super::AnnexBIter;
+
+        let four_byte = [
+            0u8, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert_eq!(
+            AnnexBIter::new(&four_byte).collect::<Vec<_>>(),
+            vec![
+                &[0x67u8, 0x42][..],
+                &[0x68u8, 0xce][..],
+                &[0x65u8, 0x88][..],
+            ]
+        );
+
+        let three_byte = [0u8, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(
+            AnnexBIter::new(&three_byte).collect::<Vec<_>>(),
+            vec![&[0x67u8, 0x42][..], &[0x65u8, 0x88][..]]
+        );
+
+        let empty_between = [0u8, 0, 0, 1, 0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(
+            AnnexBIter::new(&empty_between).collect::<Vec<_>>(),
+            vec![&[0x65u8, 0x88][..]]
+        );
+
+        // A trailing unit with no start code after it is still a unit.
+        let trailing = [0u8, 0, 0, 1, 0x65, 0x88, 0x99];
+        assert_eq!(
+            AnnexBIter::new(&trailing).collect::<Vec<_>>(),
+            vec![&[0x65u8, 0x88, 0x99][..]]
+        );
+    }
 }

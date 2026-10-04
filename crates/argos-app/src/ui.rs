@@ -451,6 +451,50 @@ fn worst_link(slots: &[ViewerSlot], now: Instant) -> Option<(f32, f32)> {
 /// to, and holding the slot for them means holding it against their next request.
 const VIEWER_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Turned into its own type so the sampling rule can be tested without a peer
+/// connection.
+///
+/// It is asked for a number once per incoming viewer report, so several viewers
+/// watching means several calls per interval. Sampling per call measured a
+/// fraction of the interval each time, and the baseline moved a few milliseconds
+/// after the previous viewer spoke: one refused frame against a two-frame
+/// remainder read as 50%, well past the threshold the controller reacts to. Every
+/// controller test assumes one report per interval, which is exactly the
+/// assumption that made this invisible.
+#[derive(Default)]
+struct LoadSampler {
+    offered: u64,
+    dropped: u64,
+    sampled_at: Option<Instant>,
+    rate: f32,
+}
+
+impl LoadSampler {
+    /// `offered` and `dropped` are the lifetime handoff counters. The answer is a
+    /// percentage over whole report intervals; calls that arrive before the
+    /// interval is up repeat the last one rather than measuring a sliver.
+    fn sample(&mut self, offered: u64, dropped: u64, now: Instant) -> f32 {
+        if let Some(at) = self.sampled_at {
+            if now.duration_since(at) < REPORT_INTERVAL {
+                return self.rate;
+            }
+        }
+        let offered_delta = offered.saturating_sub(self.offered);
+        let dropped_delta = dropped.saturating_sub(self.dropped);
+        self.offered = offered;
+        self.dropped = dropped;
+        self.sampled_at = Some(now);
+        self.rate = if offered_delta == 0 {
+            // Nothing was offered, so nothing was refused. Absence of demand is
+            // not evidence of pressure.
+            0.0
+        } else {
+            dropped_delta as f32 / offered_delta as f32 * 100.0
+        };
+        self.rate
+    }
+}
+
 struct ShareSession {
     sharer: Arc<session::Sharer>,
     /// Viewers being served, in the order they arrived.
@@ -476,6 +520,12 @@ struct ShareSession {
     audio_capture: Option<AudioCapture>,
     audio_encoder: Option<OpusAudioEncoder>,
     audio_error: Option<String>,
+    /// How system audio is being captured, e.g. that Discord is being excluded.
+    ///
+    /// Standing state rather than a symptom, which is why it is not folded into
+    /// `audio_error`: a recovered worker should stop claiming a failure, but the
+    /// loopback mode it settled on is still true.
+    audio_notice: Option<String>,
     audio_timestamp: u32,
     audio_frames_sent: u64,
     /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
@@ -496,8 +546,9 @@ struct ShareSession {
     quality_note: Option<String>,
     /// Encoder-handoff counters as of the last report, so the drop *rate* over
     /// the interval — not the lifetime total — can be fed to the controller.
-    load_offered: u64,
-    load_dropped: u64,
+    /// The encode handoff's drop rate. Sampled on a clock; see
+    /// [`LoadSampler`].
+    load: LoadSampler,
     /// Set by a viewer's keyframe request, consumed by the encode worker.
     ///
     /// One flag for the whole share rather than one per viewer, and that is the
@@ -536,14 +587,14 @@ impl ShareSession {
 
     /// Pushes the audience list to every viewer, on change or on the keepalive.
     ///
-    /// Includes the stream's frame rate and height because a viewer cannot work
-    /// either out: it knows what it decoded and not what it was sent. The frame
-    /// rate is what makes its own decode time readable as fast or slow, so
-    /// without it the diagnosis would have no budget to compare against.
+    /// Includes the stream's frame rate because a viewer cannot work it out: it
+    /// knows what it decoded and not what it was sent. The frame rate is what
+    /// makes its own decode time readable as fast or slow, so without it the
+    /// diagnosis would have no budget to compare against.
     ///
     /// Rate-limited rather than sent on every change because a join and a leave
     /// can happen back to back, and each of those is a datagram per viewer.
-    fn broadcast_roster(&mut self, height: Option<u32>, lan: &lan::Lan) {
+    fn broadcast_roster(&mut self, lan: &lan::Lan) {
         let now = Instant::now();
         let audience = self.audience();
         let signature: Vec<String> = audience
@@ -563,29 +614,22 @@ impl ShareSession {
             // working — they sent a request and answered an offer over it — and
             // this way the list is correct before their first frame arrives
             // rather than appearing a keyframe interval later.
-            lan.send_roster(&slot.id, &audience, self.frame_rate, height);
+            lan.send_roster(&slot.id, &audience, self.frame_rate);
         }
     }
 
-    /// Frames the encode handoff discarded since the last call, as a percentage
+    /// Frames the encode handoff discarded since the last sample, as a percentage
     /// of those it was offered.
     ///
     /// The lifetime counters only report the average since the stream started,
     /// which decays as clean periods accumulate and eventually stops seeing a
     /// fresh overload. The controller wants the rate over the report interval.
-    fn encoder_drops(&mut self) -> f32 {
-        let offered = self.metrics.queued.frames();
-        let dropped = self.metrics.queued.dropped();
-        let offered_delta = offered.saturating_sub(self.load_offered);
-        let dropped_delta = dropped.saturating_sub(self.load_dropped);
-        self.load_offered = offered;
-        self.load_dropped = dropped;
-        if offered_delta == 0 {
-            // Nothing was offered, so nothing was refused. Absence of demand is
-            // not evidence of pressure.
-            return 0.0;
-        }
-        dropped_delta as f32 / offered_delta as f32 * 100.0
+    fn encoder_drops(&mut self, now: Instant) -> f32 {
+        self.load.sample(
+            self.metrics.queued.frames(),
+            self.metrics.queued.dropped(),
+            now,
+        )
     }
 }
 
@@ -648,13 +692,6 @@ struct Quality {
     /// The one failure no amount of keyframe recovery fixes: the frame decoded
     /// fine and the machine could not show it.
     render_drops: f32,
-    /// Worst `decode_errors` seen since the counters were last cleared.
-    ///
-    /// Carried across windows because a burst that recovers between two reports
-    /// is still a burst, and a per-window rate would quietly drop it.
-    decode_errors_peak: f32,
-    /// Worst `render_drops` seen since the counters were last cleared.
-    render_drops_peak: f32,
     /// Counter baselines for the two rates above, read once when the window
     /// closed so a rate is a difference between two samples rather than a
     /// division of two separately-taken reads of the same counter.
@@ -684,8 +721,6 @@ impl Default for Quality {
             starved: false,
             decode_errors: 0.0,
             render_drops: 0.0,
-            decode_errors_peak: 0.0,
-            render_drops_peak: 0.0,
             last_errors: 0,
             last_dropped: 0,
             last_shown: 0,
@@ -696,10 +731,13 @@ impl Default for Quality {
 impl Quality {
     /// This viewer's measurements, as sent to the sharer.
     ///
-    /// Peaks rather than window rates for the two failure counts, because what a
-    /// sharer needs to know is whether this viewer has *ever* been in trouble
-    /// recently, not whether it happened to be clean in the half-second window
-    /// that happened to contain a report.
+    /// The two failure counts are window rates, not running peaks. A peak can
+    /// only span reports by accumulating, and an accumulating peak pins the
+    /// diagnosis to whatever it saw first: one decode error an hour ago would
+    /// blame the wire forever, overriding the `Decode` verdict the whole
+    /// subsystem exists to reach. A window rate still cannot miss a burst —
+    /// the burst lands in the window it happened in, and the report covering
+    /// that window carries it.
     ///
     /// The stage means cover recent frames rather than the whole session. This
     /// number exists to be compared against a frame budget, and a session mean
@@ -719,8 +757,8 @@ impl Quality {
                     .present
                     .recent_mean_ms(DIAG_DECODE_SAMPLES)
                     .unwrap_or(0.0),
-                render_drops: self.render_drops_peak,
-                decode_errors: self.decode_errors_peak,
+                render_drops: self.render_drops,
+                decode_errors: self.decode_errors,
                 waiting_keyframe: self.starved,
             },
         }
@@ -772,8 +810,6 @@ struct ViewSession {
     /// The stream's frame rate, which is what makes a decode time readable as
     /// fast or slow. Zero until the sharer says.
     source_fps: u32,
-    /// The stream's target height; `None` means native.
-    source_height: Option<u32>,
     /// This viewer's own peer id, so it can mark itself in the audience list.
     ///
     /// The sharer's roster is keyed by peer id, and a viewer has its own id from
@@ -1018,6 +1054,10 @@ pub struct ArgosApp {
     config: AppConfig,
     screen: Screen,
     show_settings: bool,
+    /// Why the last attempt to write the profile failed, shown in the Profile
+    /// window. Kept separate from the in-memory `config` so the window can stay
+    /// open on a failure instead of closing as though the save had worked.
+    settings_error: Option<String>,
     /// Always-on-top pipeline readout, toggled with Ctrl+D. Exists because the
     /// interesting numbers (stage means, peak stalls, drop rates) are the ones
     /// that explain a freeze, and they have to be readable *while* it freezes.
@@ -1096,6 +1136,7 @@ impl ArgosApp {
             config,
             screen: Screen::Home,
             show_settings: false,
+            settings_error: None,
             show_metrics: false,
             metrics_since: Instant::now(),
         }
@@ -1174,15 +1215,27 @@ impl ArgosApp {
                         .desired_width(260.0),
                 );
                 ui.add_space(8.0);
+                if let Some(error) = &self.settings_error {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         let name = self.name_input.trim().to_string();
                         self.config.name = name.clone();
-                        config::save(&self.config);
-                        if let Some(lan) = &self.lan {
-                            lan.set_name(name);
+                        // Close only on a save that worked. Closing on failure
+                        // left the name changed for the session and reverted on
+                        // the next launch, which is the worst of both: it looks
+                        // saved and is not.
+                        match config::save(&self.config) {
+                            Ok(()) => {
+                                self.settings_error = None;
+                                if let Some(lan) = &self.lan {
+                                    lan.set_name(name);
+                                }
+                                self.show_settings = false;
+                            }
+                            Err(error) => self.settings_error = Some(format!("not saved: {error}")),
                         }
-                        self.show_settings = false;
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_settings = false;
@@ -1330,6 +1383,10 @@ impl ArgosApp {
                     (None, None, error)
                 }
             };
+        // Read before the capture handle is moved into the session below: the
+        // worker may already have settled on a loopback mode, and starting blank
+        // would hide that for a frame.
+        let audio_notice = audio_capture.as_ref().and_then(AudioCapture::notice);
         if let Some(lan) = &self.lan {
             lan.set_sharing(true);
         }
@@ -1352,14 +1409,14 @@ impl ArgosApp {
             audio_capture,
             audio_encoder,
             audio_error,
+            audio_notice,
             audio_timestamp: 0,
             audio_frames_sent: 0,
             quality: QualityController::at_height(self.share_height),
             frame_rate: self.frame_rate,
             target_height,
             quality_note: None,
-            load_offered: 0,
-            load_dropped: 0,
+            load: LoadSampler::default(),
             force_keyframe,
             roster_sent: None,
             roster_signature: Vec::new(),
@@ -1617,7 +1674,6 @@ impl ArgosApp {
             roster: Vec::new(),
             roster_received: None,
             source_fps: 0,
-            source_height: None,
             self_id: self.lan.as_ref().map(|lan| lan.id().to_string()),
             self_name: self.config.name.clone(),
             fullscreen: false,
@@ -1759,7 +1815,6 @@ impl ArgosApp {
                     id,
                     viewers,
                     source_fps,
-                    source_height,
                 } => {
                     // Only from the sharer being watched. Anyone else on the
                     // network could send one of these, and acting on it would
@@ -1776,7 +1831,6 @@ impl ArgosApp {
                         view.roster = viewers;
                         view.roster_received = Some(Instant::now());
                         view.source_fps = source_fps;
-                        view.source_height = source_height;
                     }
                 }
             }
@@ -1786,9 +1840,8 @@ impl ArgosApp {
         // absent from it for one keepalive interval. Costs one comparison per
         // frame in the common case and a datagram per viewer when it matters.
         if let Some(lan) = self.lan.as_ref() {
-            let height = self.share_height;
             if let Some(share) = self.share.as_mut() {
-                share.broadcast_roster(height, lan);
+                share.broadcast_roster(lan);
             }
         }
     }
@@ -1829,7 +1882,7 @@ impl ArgosApp {
         // the encoder half of the report is measured here. It is the only
         // evidence available when the link is lossless and the machine is the
         // limit.
-        let drops = share.encoder_drops();
+        let drops = share.encoder_drops(now);
         let Decision::Step(_) = share.quality.update(Report { loss, fps, drops }, now) else {
             return;
         };
@@ -2080,14 +2133,18 @@ impl ArgosApp {
         // The capture worker retries a dead device on its own and only reports the
         // failures it wants surfaced, so taking them here cannot hide a later
         // one behind an earlier.
-        if let Some(notice) = share
+        if let Some(error) = share
             .audio_capture
             .as_ref()
             .and_then(AudioCapture::try_error)
         {
-            share.audio_error = Some(notice);
+            share.audio_error = Some(error);
         }
         // A worker that has been recovering on its own should stop saying so.
+        //
+        // Only the failure. `is_alive` is also true of a worker that has just
+        // posted a notice, and clearing the one message slot on that basis is
+        // what hid the loopback mode from this panel.
         if share
             .audio_capture
             .as_ref()
@@ -2095,6 +2152,9 @@ impl ArgosApp {
         {
             share.audio_error = None;
         }
+        // Standing state about how audio is being captured, re-read each frame
+        // rather than taken, so it keeps showing for as long as it is true.
+        share.audio_notice = share.audio_capture.as_ref().and_then(AudioCapture::notice);
         if !share.sharer.is_connected() {
             return;
         }
@@ -2193,19 +2253,6 @@ impl ArgosApp {
                     view.quality.last_errors = errors;
                     view.quality.last_dropped = dropped;
                     view.quality.last_shown = shown;
-                    // Warnings are carried forward rather than recomputed from a
-                    // single window: a decode error that recovers between two
-                    // reports would otherwise blink out of existence and the
-                    // sharer would see a viewer whose errors stopped, which is
-                    // the opposite of what happened.
-                    view.quality.decode_errors_peak = view
-                        .quality
-                        .decode_errors_peak
-                        .max(view.quality.decode_errors);
-                    view.quality.render_drops_peak = view
-                        .quality
-                        .render_drops_peak
-                        .max(view.quality.render_drops);
                 }
             }
         }
@@ -2621,6 +2668,9 @@ impl ArgosApp {
             } else {
                 ui.label(RichText::new(audio_label).color(Color32::from_rgb(220, 200, 120)));
             }
+            if let Some(notice) = &share.audio_notice {
+                ui.label(RichText::new(notice).weak());
+            }
             if let Some(error) = &share.audio_error {
                 ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
             }
@@ -2928,6 +2978,9 @@ impl ArgosApp {
                 if vol_changed {
                     playback.set_volume_percent(vol);
                     self.config.volume_percent = vol;
+                    // Ignored deliberately: the new value is already live in the
+                    // player, and the next drag or the Profile window's Save
+                    // retries the write. Only the explicit Save needs to report.
                     let _ = config::save(&self.config);
                     if playback.is_muted() && vol > 0 {
                         playback.set_muted(false);
@@ -3229,7 +3282,6 @@ impl ArgosApp {
         sink.heading(name);
         Self::stage_row(sink, "  device io", &audio.device_io);
         Self::stage_row(sink, "  convert", &audio.convert);
-        Self::stage_row(sink, "  codec", &audio.codec);
         Self::counter_row(
             sink,
             "  periods",
@@ -3336,6 +3388,24 @@ impl ArgosApp {
             }
             if let Some(metrics) = self.view.as_ref().map(|view| &view.metrics) {
                 Self::reset_receiver(metrics);
+            }
+            // The audio workers keep their metrics across device rebuilds, which
+            // is why they need clearing explicitly rather than falling out with
+            // the share session.
+            for audio in [
+                self.share
+                    .as_ref()
+                    .and_then(|share| share.audio_capture.as_ref())
+                    .map(|capture| capture.state().metrics()),
+                self.view
+                    .as_ref()
+                    .and_then(|view| view.audio_playback.as_ref())
+                    .map(|playback| playback.state().metrics()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                Self::reset_audio(audio);
             }
         }
     }
@@ -3677,6 +3747,28 @@ impl ArgosApp {
         }
     }
 
+    /// One audio device worker's counters.
+    ///
+    /// The audio rows were the one family the Reset button left alone, so
+    /// resetting everything else while these kept counting produced rates like
+    /// `450000.0/s` in a panel whose header claimed a window of 0 s.
+    fn reset_audio(metrics: &AudioMetrics) {
+        for stage in [&metrics.device_io, &metrics.convert] {
+            stage.reset();
+        }
+        for frames in [&metrics.underruns, &metrics.overruns] {
+            frames.reset();
+        }
+        for counter in [
+            &metrics.periods,
+            &metrics.device_errors,
+            &metrics.restarts,
+            &metrics.drift_samples,
+        ] {
+            counter.reset();
+        }
+    }
+
     fn content(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
@@ -3830,13 +3922,50 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        audience_from, decode_target, encode_target, lan, roster_is_stale, worst_link, ViewerSlot,
-        KEYFRAME_REQUEST_FLOOR, ROSTER_STALE, VIEWER_REPORT_TTL,
+        audience_from, decode_target, encode_target, lan, roster_is_stale, worst_link, LoadSampler,
+        ViewerSlot, KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use std::time::{Duration, Instant};
 
     fn slot(name: &str) -> ViewerSlot {
         ViewerSlot::new(name, name, Instant::now())
+    }
+
+    /// Several viewers reporting inside one interval must produce one sample.
+    ///
+    /// Sampling per call instead advanced the baseline a few milliseconds after
+    /// the previous viewer spoke, so the same interval was measured once per
+    /// viewer over a sliver of it. That is what turned a 10% refusal rate into
+    /// 50% and walked the ladder down for a sharer under no pressure at all.
+    #[test]
+    fn reports_inside_one_interval_do_not_resample() {
+        let start = Instant::now();
+        let mut sampler = LoadSampler::default();
+
+        // Establish the baseline, then a whole interval: 100 offered, 10 refused.
+        assert_eq!(sampler.sample(0, 0, start), 0.0);
+        assert_eq!(sampler.sample(100, 10, start + REPORT_INTERVAL), 10.0);
+
+        // Four more viewers report before the next interval is up. One further
+        // frame refused in the meantime must not be measured against the two
+        // frames since the previous viewer spoke.
+        for viewer in 1..=4 {
+            let at = start + REPORT_INTERVAL + Duration::from_millis(50 * viewer);
+            assert_eq!(sampler.sample(100 + viewer, 10 + viewer, at), 10.0);
+        }
+
+        // Once the interval is up it measures again, over all of it.
+        assert_eq!(sampler.sample(200, 20, start + REPORT_INTERVAL * 2), 10.0);
+    }
+
+    /// A sharer nobody is streaming to is not under load, however often it is
+    /// asked. Returning zero here is what keeps an idle sharer off the ladder.
+    #[test]
+    fn no_demand_is_not_evidence_of_pressure() {
+        let start = Instant::now();
+        let mut sampler = LoadSampler::default();
+        assert_eq!(sampler.sample(0, 0, start), 0.0);
+        assert_eq!(sampler.sample(0, 0, start + REPORT_INTERVAL * 10), 0.0);
     }
 
     /// Marks the slot as having reported `loss`/`fps` as of `at`.

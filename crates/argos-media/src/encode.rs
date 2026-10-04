@@ -26,7 +26,18 @@ impl H264Encoder {
             (30.0, 4_000_000)
         };
         let config = EncoderConfig::new()
-            .usage_type(UsageType::CameraVideoRealTime)
+            // Screen content, not camera video. OpenH264 has a separate rate
+            // control path for it, and it is the right one here: screen frames
+            // are mostly flat areas and sharp text, where the camera-tuned
+            // quantiser spends bits on detail the eye resolves and starves the
+            // edges that are actually readable. It also holds a still screen at a
+            // far smaller frame, which matters when the same desktop is on screen
+            // for minutes at a time.
+            //
+            // Nothing downstream depends on which of the two was chosen — the
+            // packetizer and the quality ladder both work from whatever comes out
+            // — so this changes picture quality and bitrate, not correctness.
+            .usage_type(UsageType::ScreenContentRealTime)
             .bitrate(BitRate::from_bps(bitrate))
             .max_frame_rate(FrameRate::from_hz(fps))
             .complexity(Complexity::Low)

@@ -287,6 +287,41 @@ mod tests {
         assert_eq!(diagnose(&diag, 0.1, 60), Bottleneck::Link);
     }
 
+    /// A viewer that erred in one window and is clean in the next gets a fresh
+    /// verdict, not the one from the bad window.
+    ///
+    /// This is the contract the two counts on the wire have to keep: they are
+    /// the window's own rate, so a clean window reports zero. They used to be
+    /// running maxima, which could only be carried between reports by
+    /// accumulating — so a single decode error outranked every later verdict for
+    /// the rest of the session and `Decode` was unreachable after it.
+    #[test]
+    fn a_viewer_that_recovered_is_diagnosed_again() {
+        // Errors with the decoder comfortably inside its budget: the damaged
+        // frames are the only symptom there is, so the wire is to blame.
+        let mut diag = Diagnostics {
+            decode_ms: 3.0,
+            present_ms: 1.1,
+            render_drops: 0.0,
+            decode_errors: 8.0,
+            waiting_keyframe: false,
+        };
+        assert_eq!(diagnose(&diag, 0.0, 30), Bottleneck::Link);
+
+        // The next window is clean, and the decoder's real cost — the thing this
+        // subsystem exists to name — is finally reachable.
+        diag.decode_errors = 0.0;
+        diag.decode_ms = 31.0;
+        assert_eq!(diagnose(&diag, 0.0, 30), Bottleneck::Decode);
+
+        // And the same holds for render drops.
+        diag.decode_ms = 3.0;
+        diag.render_drops = 25.0;
+        assert_eq!(diagnose(&diag, 0.0, 30), Bottleneck::Render);
+        diag.render_drops = 0.0;
+        assert_eq!(diagnose(&diag, 0.0, 30), Bottleneck::Ok);
+    }
+
     /// A loss figure that is not a number cannot be compared with the threshold,
     /// and treating it as zero would claim a healthy link that was never
     /// measured.

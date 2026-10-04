@@ -69,9 +69,6 @@ pub enum LanEvent {
         id: String,
         viewers: Vec<RosterEntry>,
         source_fps: u32,
-        /// The stream's target height. `None` is the sharer's native resolution,
-        /// which is a real answer rather than a missing one.
-        source_height: Option<u32>,
     },
 }
 
@@ -192,10 +189,6 @@ struct Message {
     /// The stream's frame rate, in the `roster` message.
     #[serde(default)]
     source_fps: u32,
-    /// The stream's target height in the `roster` message; absent means the
-    /// sharer's native resolution.
-    #[serde(default)]
-    source_height: Option<u32>,
 }
 
 pub struct Lan {
@@ -338,7 +331,6 @@ impl Lan {
             diag: Diagnostics::default(),
             roster: Vec::new(),
             source_fps: 0,
-            source_height: None,
         }
     }
 
@@ -391,17 +383,10 @@ impl Lan {
     /// changes and on a slow keepalive, because UDP loses datagrams and a
     /// viewer that missed the only roster it would ever get would show an empty
     /// list forever with nothing to say so.
-    pub fn send_roster(
-        &self,
-        id: &str,
-        viewers: &[RosterEntry],
-        source_fps: u32,
-        source_height: Option<u32>,
-    ) {
+    pub fn send_roster(&self, id: &str, viewers: &[RosterEntry], source_fps: u32) {
         let mut message = self.message("roster", id);
         message.roster = viewers.to_vec();
         message.source_fps = source_fps;
-        message.source_height = source_height;
         self.send_to_peer(id, message);
     }
 }
@@ -519,7 +504,6 @@ fn discovery_loop(
                 diag: Diagnostics::default(),
                 roster: Vec::new(),
                 source_fps: 0,
-                source_height: None,
             };
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
@@ -611,7 +595,6 @@ fn dispatch(message: Message) -> Option<LanEvent> {
             id: message.id,
             viewers: message.roster,
             source_fps: message.source_fps,
-            source_height: message.source_height,
         }),
         _ => None,
     }

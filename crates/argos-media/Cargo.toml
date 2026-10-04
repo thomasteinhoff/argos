@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Which screen-capture backend is compiled in. `capture-native` is our own
-# Desktop Duplication implementation; `capture-xcap` keeps the previous library
-# available for one-release rollback / A-B comparison. Exactly one must be on.
+# Screen capture goes through our own Desktop Duplication implementation. The
+# previous `xcap`-based backend was kept alongside it for a one-release A-B
+# comparison; it never gained a test and was never built by a documented command,
+# so it is gone rather than being a fallback nobody had exercised.
 default = ["capture-native"]
 capture-native = [
     "windows/Win32_Graphics_Direct3D",
@@ -16,11 +17,9 @@ capture-native = [
     "windows/Win32_Graphics_Gdi",
     "windows/Win32_UI_WindowsAndMessaging",
 ]
-capture-xcap = ["dep:xcap"]
 
 [dependencies]
 argos-core = { path = "../argos-core" }
-xcap = { version = "0.9.8", optional = true }
 openh264 = "0.9.8"
 wasapi = "0.24.0"
 opus-rs = "0.1.33"

@@ -1,2 +1,5 @@
 /target
 *.log
+# A release build copied out here. 12.9 MB of executable does not belong in the
+# history, and it was tracked here before this line existed.
+/argos-app-release.exe

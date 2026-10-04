@@ -16,6 +16,5 @@ if-addrs = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
-argos-media = { path = "../argos-media" }
 anyhow = "1"
 tokio = { version = "1", features = ["time"] }

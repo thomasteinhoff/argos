@@ -104,17 +104,6 @@ impl Ema {
         self.peak_micros.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
-    /// Seconds elapsed in the current window, derived from the time the first
-    /// observation was recorded. Used to turn a sample count into a rate.
-    ///
-    /// Returns `None` before the first sample, since there is no baseline yet.
-    pub fn window_secs(&self, started: Instant) -> Option<f32> {
-        if self.samples() == 0 {
-            return None;
-        }
-        Some(started.elapsed().as_secs_f32().max(1e-3))
-    }
-
     /// Mean observation over the most recent `window` observations, or `None` before
     /// `window` of them exist.
     ///
@@ -391,11 +380,19 @@ pub struct ReceiverMetrics {
 pub struct AudioMetrics {
     /// Time inside the WASAPI read or write call.
     pub device_io: Ema,
-    /// Time spent converting device bytes into samples.
+    /// Time spent converting between the device's byte format and working
+    /// samples: expanding interleaved bytes on the way in, applying gain and
+    /// packing on the way out.
+    ///
+    /// Timed separately from `device_io` because a stalled conversion and a
+    /// stalled device look identical from the outside and have nothing to do
+    /// with each other.
     pub convert: Ema,
-    /// Time inside the Opus encoder or decoder.
-    pub codec: Ema,
-
+    // No codec timing. The Opus calls run on the UI thread and the transport
+    // callback rather than on either device worker, so there is no worker here
+    // for one to belong to. `SenderMetrics`/`ReceiverMetrics` already count
+    // encoded and decoded audio frames; wiring a handle through both of those to
+    // time one call would be plumbing for a number nobody reads.
     /// Device periods served.
     pub periods: Counter,
     /// The jitter buffer was short and silence had to be inserted. The drop

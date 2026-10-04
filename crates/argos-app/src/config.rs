@@ -15,6 +15,12 @@ pub fn load() -> AppConfig {
     confy::load("argos", None).unwrap_or_default()
 }
 
-pub fn save(config: &AppConfig) {
-    let _ = confy::store("argos", None, config);
+/// Writes the profile, or says why it could not.
+///
+/// The error used to be discarded, which made a failed save invisible: the user
+/// changes a setting, watches it take effect, and finds it reverted on the next
+/// launch with nothing to explain it. The likeliest cause is a config directory
+/// that cannot be written — a read-only or redirected roaming profile.
+pub fn save(config: &AppConfig) -> Result<(), String> {
+    confy::store("argos", None, config).map_err(|error| error.to_string())
 }

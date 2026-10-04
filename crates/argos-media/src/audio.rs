@@ -68,8 +68,17 @@ fn sleep_interrupted(duration: Duration, stop: &AtomicBool) -> bool {
 #[derive(Debug, Default)]
 pub struct AudioState {
     metrics: Arc<AudioMetrics>,
-    /// The most recent error or notice, waiting to be picked up by the UI.
+    /// The most recent failure, waiting to be picked up by the UI.
     last_error: Mutex<Option<String>>,
+    /// How the worker is currently set up, for the UI to display.
+    ///
+    /// Deliberately a different slot from `last_error`. A notice is standing
+    /// state rather than a symptom — "sharing full system audio" stays true for
+    /// as long as Discord is shut — so it must outlive the recovery that clears
+    /// an error. Sharing one slot meant the success path wiped the notice
+    /// microseconds after the worker set it, and the Discord exclusion status
+    /// was never displayed at all.
+    notice: Mutex<Option<String>>,
     /// True only while a device client is open and being serviced.
     alive: AtomicBool,
     /// Bumped every time the worker rebuilds its device client, so the UI can
@@ -112,16 +121,29 @@ impl AudioState {
     /// Records a non-fatal notice (e.g. falling back to full loopback) without
     /// claiming the worker is unhealthy.
     pub fn notice(&self, notice: impl Into<String>) {
-        if let Ok(mut slot) = self.last_error.lock() {
+        if let Ok(mut slot) = self.notice.lock() {
             *slot = Some(notice.into());
         }
     }
 
-    /// Takes the pending error or notice, leaving the slot empty.
+    /// The standing notice, if there is one.
+    ///
+    /// Cloned rather than taken, because it describes how the worker is set up
+    /// right now and the UI redraws continuously without consuming it.
+    pub fn current_notice(&self) -> Option<String> {
+        self.notice.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Takes the pending error, leaving the slot empty.
     pub fn take_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    /// Forgets a failure the worker has recovered from.
+    ///
+    /// Only the error slot. A notice is not a failure and does not stop being
+    /// true when the worker starts working again, which is why clearing both
+    /// here is what hid the loopback mode from the UI.
     pub fn clear_error(&self) {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = None;
@@ -402,11 +424,16 @@ impl AudioCapture {
         self.rx.try_recv().ok()
     }
 
-    /// Takes the next pending notice (e.g. Discord exclusion falling back to
-    /// full loopback, or a device failure the worker has already recovered
-    /// from).
+    /// Takes the next pending device failure, including one the worker has already
+    /// recovered from.
     pub fn try_error(&self) -> Option<String> {
         self.state.take_error()
+    }
+
+    /// How capture is currently set up, e.g. that Discord audio is being
+    /// excluded. Standing state, not a symptom: it persists while the mode holds.
+    pub fn notice(&self) -> Option<String> {
+        self.state.current_notice()
     }
 
     /// True while the capture thread is servicing a device.
@@ -561,7 +588,14 @@ fn run_capture(
                 }
             }
 
-            if let Err(error) = capture_client.read_from_device_to_deque(&mut bytes) {
+            // The device call and the conversion out of its byte format are timed
+            // separately. Folding them together left `convert` at zero for the
+            // lifetime of the process, so the row the readout showed for it could
+            // never say anything.
+            let reading = Instant::now();
+            let read = capture_client.read_from_device_to_deque(&mut bytes);
+            state.metrics().device_io.record(reading.elapsed());
+            if let Err(error) = read {
                 // A device change invalidates the client. Report it, then fall out
                 // of this inner loop so the outer one can build a fresh client
                 // against the new default device.
@@ -569,7 +603,12 @@ fn run_capture(
                 rebuild = true;
                 break;
             }
-            while pop_frame(&mut bytes, &mut samples) {
+            loop {
+                let converting = Instant::now();
+                if !pop_frame(&mut bytes, &mut samples) {
+                    break;
+                }
+                state.metrics().convert.record(converting.elapsed());
                 let _ = tx.try_send(samples.clone());
             }
             state.metrics().periods.incr();
@@ -964,7 +1003,7 @@ fn run_playback(
             continue;
         }
 
-        let started = Instant::now();
+        let filling = Instant::now();
         let _real = jitter.fill(&mut out, want_frames * CHANNELS);
         // Mute is applied by scaling to zero rather than by stopping the stream,
         // so the device keeps advancing in real time and unmuting resumes in
@@ -985,6 +1024,9 @@ fn run_playback(
         if queue.len() < needed {
             queue.resize(needed, 0);
         }
+        state.metrics().convert.record(filling.elapsed());
+
+        let writing = Instant::now();
         render_client
             .write_to_device_from_deque(want_frames, &mut queue, None)
             .map_err(|error| {
@@ -994,7 +1036,7 @@ fn run_playback(
                 state.fail(generation, format!("audio playback failed: {error}"));
                 error.to_string()
             })?;
-        state.metrics().device_io.record(started.elapsed());
+        state.metrics().device_io.record(writing.elapsed());
         state.metrics().periods.incr();
 
         if event.wait_for_event(EVENT_WAIT_MS).is_err() {
@@ -1011,10 +1053,48 @@ fn run_playback(
 
 #[cfg(test)]
 mod tests {
-    use super::{pop_frame, select_discord_root, JitterBuffer, CHANNELS, FRAME_SAMPLES};
+    use super::{
+        pop_frame, select_discord_root, AudioState, JitterBuffer, CHANNELS, FRAME_SAMPLES,
+    };
     use argos_core::metrics::AudioMetrics;
     use std::collections::VecDeque;
     use std::sync::Arc;
+
+    /// A notice outlives the clear that follows it.
+    ///
+    /// The two shared one slot, so the worker's success path called
+    /// `clear_error` microseconds after setting the notice and wiped it. The
+    /// Discord exclusion status was therefore never displayed once.
+    #[test]
+    fn a_notice_survives_the_clear_that_follows_it() {
+        let state = AudioState::default();
+        state.notice("Discord not running: sharing full system audio");
+        state.clear_error();
+        assert_eq!(
+            state.current_notice().as_deref(),
+            Some("Discord not running: sharing full system audio")
+        );
+    }
+
+    /// Recovering forgets the failure, and does not take the notice with it.
+    #[test]
+    fn recovering_clears_the_failure_but_keeps_the_notice() {
+        let state = AudioState::default();
+        state.fail(0, "audio capture read failed");
+        state.notice("sharing full system audio");
+        assert_eq!(
+            state.take_error().as_deref(),
+            Some("audio capture read failed")
+        );
+        assert!(!state.is_alive());
+
+        state.clear_error();
+        assert_eq!(state.take_error(), None);
+        assert_eq!(
+            state.current_notice().as_deref(),
+            Some("sharing full system audio")
+        );
+    }
 
     /// One 20 ms frame of interleaved stereo.
     const FRAME: usize = FRAME_SAMPLES * CHANNELS;

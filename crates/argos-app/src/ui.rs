@@ -370,6 +370,61 @@ impl ViewerSlot {
 /// is now rather than as it was when the session started.
 const DIAG_DECODE_SAMPLES: usize = 60;
 
+/// Largest the video is ever shown in the windowed UI.
+///
+/// A 1080p source used to land exactly here, so any lower resolution now scales
+/// up to match. Fullscreen passes an unbounded maximum instead: the cap exists to
+/// keep a large stream from becoming a postage stamp in a sidebar, and a
+/// fullscreen window is not a sidebar.
+const VIEWER_IMAGE_CAP: egui::Vec2 = egui::vec2(1024.0, 576.0);
+
+/// How long the fullscreen controls stay on screen after the mouse last moved.
+///
+/// Long enough to reach for a button without a panic, short enough that the
+/// picture ends up alone. A HUD that never went away would sit permanently on
+/// top of the thing the user went fullscreen to look at, which is the one thing
+/// fullscreen is for.
+const HUD_LINGER: Duration = Duration::from_secs(3);
+
+/// How long the controls take to fade out once the linger is up.
+///
+/// Long enough that a pointer which strays across the bottom of the screen for
+/// half a second does not make the controls blink, short enough that a
+/// deliberate hand is already moving by the time they are gone.
+const HUD_FADE: Duration = Duration::from_secs(1);
+
+/// Whether this frame's input asks to toggle fullscreen.
+///
+/// Three keys for one action, because none of them is sufficient alone. F11 is
+/// what every other program uses and what a person will try first. Plain F is
+/// what works when a laptop's function keys need a modifier to reach. Escape is
+/// the way out from anywhere, and for exactly that reason it only counts while
+/// fullscreen is already on: swallowing Escape in a windowed dialog would leave
+/// it with no way to dismiss itself.
+///
+/// The modifiers on `F` are checked because a bare letter shortcut that fires
+/// through Ctrl and Alt is a well-worn way to make a program's own shortcuts
+/// stop working, and Ctrl here is already the pipeline readout. Alt and Shift are
+/// excluded even though nothing else claims them, because the day something does
+/// it will be too late to work out which of the two should have won.
+///
+/// `fullscreen` is the current state rather than whether a session exists. The
+/// caller only reaches this with a view in hand, and F11 on a share screen with
+/// nothing to enlarge should do nothing at all rather than emptying the window.
+fn fullscreen_key(input: &egui::InputState, fullscreen: bool) -> bool {
+    if input.key_pressed(egui::Key::F11) {
+        return true;
+    }
+    if input.key_pressed(egui::Key::Escape) && fullscreen {
+        return true;
+    }
+    input.key_pressed(egui::Key::F)
+        && !input.modifiers.ctrl
+        && !input.modifiers.alt
+        && !input.modifiers.command
+        && !input.modifiers.shift
+}
+
 /// The measurement the adaptive controller should act on, as `(loss, fps)`.
 ///
 /// One encode feeds everyone and the ladder has one rung to move, so it has to
@@ -729,6 +784,27 @@ struct ViewSession {
     self_id: Option<String>,
     /// This viewer's own name, for the fallback list a manual-code session has.
     self_name: String,
+    /// Whether the window is showing this stream alone.
+    ///
+    /// Kept on the session rather than the app so that it cannot outlive the
+    /// thing it is a property of: a fullscreen flag that survived `stop_view`
+    /// would leave the user staring at a black fullscreen window with no session
+    /// behind it and no obvious way back.
+    fullscreen: bool,
+    /// When the mouse last moved, so the fullscreen controls can fade out.
+    ///
+    /// The HUD has to be reachable while the pointer is being moved towards it,
+    /// so the fade is measured from the last movement rather than from the last
+    /// frame. An idle timer would make the controls vanish under the pointer
+    /// exactly when they are being aimed at.
+    hud_idle_since: Instant,
+    /// Where the pointer was last frame, or `None` if it has never been over the
+    /// window.
+    ///
+    /// Compared rather than read as "did it move", because the comparison is the
+    /// only thing that notices a pointer which has come to rest — a delta reports
+    /// motion once and then nothing at all.
+    last_pointer: Option<egui::Pos2>,
 }
 
 impl ViewSession {
@@ -738,6 +814,34 @@ impl ViewSession {
     /// that is complete.
     fn audience(&self) -> Vec<lan::RosterEntry> {
         audience_from(&self.roster, self.self_id.as_deref(), &self.self_name)
+    }
+
+    /// How visible the fullscreen controls should be right now, `0.0` to `1.0`.
+    ///
+    /// Fully opaque while the pointer is over them, whatever the idle clock says.
+    /// A control that fades out while the pointer is on it is a control that
+    /// cannot be pressed, and the pointer arriving is the strongest possible
+    /// signal that the controls are wanted.
+    ///
+    /// `idle` is passed in rather than read from the clock so the arithmetic can
+    /// be stated once and tested at the boundaries, which is where a fade of this
+    /// shape goes wrong: a frame or a millisecond either side of a threshold is
+    /// the difference between controls that come back and controls that stay
+    /// invisible.
+    fn hud_alpha(&self, idle: Duration) -> f32 {
+        let fade_start = HUD_LINGER.saturating_sub(HUD_FADE);
+        if idle <= fade_start {
+            return 1.0;
+        }
+        if idle >= HUD_LINGER {
+            return 0.0;
+        }
+        (HUD_LINGER.saturating_sub(idle)).as_secs_f32() / HUD_FADE.as_secs_f32()
+    }
+
+    /// How long the pointer has been still.
+    fn hud_idle(&self, now: Instant) -> Duration {
+        now.duration_since(self.hud_idle_since)
     }
 }
 
@@ -787,16 +891,78 @@ const ROSTER_STALE: Duration = Duration::from_secs(9);
 /// a few bytes and makes the wrong answer self-correcting.
 const ROSTER_KEEPALIVE: Duration = Duration::from_secs(3);
 
+/// Scales a colour's alpha, so a whole widget can be faded by hand.
+///
+/// egui has no per-widget opacity: a colour is either opaque or it is not, and
+/// there is no way to say "draw this at 40%" and have it apply to the label, the
+/// border and the fill together. Anything that fades therefore has to be handed
+/// the fade as a number and apply it itself, which is why the audience list takes
+/// one instead of being drawn with colours that happen to be pale.
+fn with_alpha(colour: Color32, alpha: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        colour.r(),
+        colour.g(),
+        colour.b(),
+        (colour.a() as f32 * alpha.clamp(0.0, 1.0)) as u8,
+    )
+}
+
+/// The current style with every colour in it faded.
+///
+/// Covers the parts of the HUD that egui draws rather than us, which is mainly
+/// the buttons. Applied to a `Ui` rather than to the whole context, so the
+/// restore is automatic at the end of the scope and the rest of the window is
+/// unaffected.
+///
+/// Deliberately does not include `override_text_color`, which would flatten the
+/// green and amber the audience list uses into one grey — a faded control is
+/// allowed to lose its colour, a faded *list* is not, because the colour there is
+/// carrying meaning.
+fn faded_style(base: &egui::Style, alpha: f32) -> egui::Style {
+    let mut style = base.clone();
+    let visuals = &mut style.visuals;
+    // Both text colours are options in egui, and `None` means "inherit". Reading
+    // them through their accessors resolves the inheritance against the style
+    // this is a copy of, which is what makes the result a drop-in replacement
+    // rather than a style whose labels have quietly stopped being bold.
+    visuals.weak_text_color = Some(with_alpha(visuals.weak_text_color(), alpha));
+    visuals.override_text_color = Some(with_alpha(visuals.strong_text_color(), alpha));
+    visuals.hyperlink_color = with_alpha(visuals.hyperlink_color, alpha);
+    for widget in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.fg_stroke.color = with_alpha(widget.fg_stroke.color, alpha);
+        widget.bg_fill = with_alpha(widget.bg_fill, alpha);
+        widget.weak_bg_fill = with_alpha(widget.weak_bg_fill, alpha);
+        widget.bg_stroke.color = with_alpha(widget.bg_stroke.color, alpha);
+    }
+    style
+}
+
 /// The audience list, rendered the same way on both sides.
 ///
 /// One function for both because the two sides already know the same things about
-/// each other and a viewer who is told "nobody else is watching" while the sharer
-/// shows three rows would have no way to tell which is true.
+/// each other, and a viewer who is told "nobody else is watching" while the sharer
+/// shows three rows would have no way to tell which of the two is true.
 ///
 /// `me` is the local peer id, empty on the sharer's side where every row is
 /// somebody else. `stale` is only ever true for a viewer: the sharer can read the
 /// list straight out of its own slot list and has no reason to doubt it.
-fn viewer_list(ui: &mut egui::Ui, audience: &[lan::RosterEntry], me: &str, stale: bool) {
+///
+/// `alpha` is `1.0` everywhere except inside the fullscreen HUD. The colours here
+/// say something — green means connected, amber means waiting — and scaling them
+/// keeps them saying it at any opacity, where simply drawing them at reduced
+/// opacity over black would shift what they mean.
+fn viewer_list(
+    ui: &mut egui::Ui,
+    audience: &[lan::RosterEntry],
+    me: &str,
+    stale: bool,
+    alpha: f32,
+) {
     let connected = audience.iter().filter(|entry| entry.connected).count();
     if audience.is_empty() {
         ui.label(RichText::new("Nobody is watching yet.").weak());
@@ -810,10 +976,9 @@ fn viewer_list(ui: &mut egui::Ui, audience: &[lan::RosterEntry], me: &str, stale
     if stale {
         // Said out loud, because the alternative is a headcount that quietly
         // stops being true and reads as fact.
-        ui.label(
-            RichText::new(format!("{summary} · list may be out of date"))
-                .color(Color32::from_rgb(220, 200, 120)),
-        );
+        ui.label(RichText::new(format!("{summary} · list may be out of date")).color(
+            with_alpha(Color32::from_rgb(220, 200, 120), alpha),
+        ));
     } else {
         ui.label(RichText::new(summary).weak());
     }
@@ -825,9 +990,10 @@ fn viewer_list(ui: &mut egui::Ui, audience: &[lan::RosterEntry], me: &str, stale
             entry.label().to_string()
         };
         let state = if entry.connected {
-            RichText::new("watching").color(Color32::from_rgb(150, 220, 150))
+            RichText::new("watching").color(with_alpha(Color32::from_rgb(150, 220, 150), alpha))
         } else {
-            RichText::new("connecting…").color(Color32::from_rgb(220, 200, 120))
+            RichText::new("connecting…")
+                .color(with_alpha(Color32::from_rgb(220, 200, 120), alpha))
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).strong());
@@ -841,11 +1007,11 @@ fn viewer_list(ui: &mut egui::Ui, audience: &[lan::RosterEntry], me: &str, stale
 /// A viewer's own copy of the sharer's list, plus the staleness warning. Kept as
 /// its own wrapper because it has to answer two questions the sharer's call does
 /// not: is this list current, and which of these people am I.
-fn viewer_audience(ui: &mut egui::Ui, view: &ViewSession) {
+fn viewer_audience(ui: &mut egui::Ui, view: &ViewSession, alpha: f32) {
     let audience = view.audience();
     let stale = roster_is_stale(view.roster_received, Instant::now());
     let me = view.self_id.as_deref().unwrap_or_default();
-    viewer_list(ui, &audience, me, stale);
+    viewer_list(ui, &audience, me, stale, alpha);
 }
 
 pub struct ArgosApp {
@@ -1450,6 +1616,11 @@ impl ArgosApp {
             source_height: None,
             self_id: self.lan.as_ref().map(|lan| lan.id().to_string()),
             self_name: self.config.name.clone(),
+            fullscreen: false,
+            // Started idle rather than fresh, so the controls are not sitting on
+            // top of the picture for the first three seconds of a session.
+            hud_idle_since: Instant::now() - HUD_LINGER,
+            last_pointer: None,
         });
     }
 
@@ -1461,7 +1632,14 @@ impl ArgosApp {
         self.pending_view = Some(id.to_string());
     }
 
-    fn stop_view(&mut self) {
+    fn stop_view(&mut self, ctx: &egui::Context) {
+        // Before the session is dropped, while there is still something to ask.
+        // A window left fullscreen after the stream stopped is a black screen
+        // with no session behind it and Escape handled by a view that no longer
+        // exists.
+        if self.view.as_ref().is_some_and(|view| view.fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
         if let Some(view) = self.view.take() {
             session::block_on(view.viewer.close());
         }
@@ -1470,7 +1648,34 @@ impl ArgosApp {
         self.screen = Screen::Home;
     }
 
+    /// Puts the window into or out of fullscreen, if there is anything to show.
+    ///
+    /// Both directions are worth doing unconditionally rather than only on
+    /// failure. A viewer can press F11, change their mind, and press it again
+    /// faster than the window manager applies the first request, in which case
+    /// the two commands race and whichever the OS handled last wins. Sending the
+    /// state we want every time is the only version of this that cannot end up
+    /// disagreeing with the app.
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        view.fullscreen = on;
+        // Reset on the way in so the controls are there for the moment the
+        // window changes, and on the way out so a pointer that has not moved
+        // does not come back to a faded HUD.
+        view.hud_idle_since = Instant::now();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+
     fn view_visible(&self) -> bool {
+        // Fullscreen means the stream is the entire window. Whatever screen the
+        // user navigated to underneath — and whatever they will navigate to when
+        // they come back out — the decoder must keep being fed, because this
+        // function is what tells `poll_view` whether to consume frames.
+        if self.view.as_ref().is_some_and(|view| view.fullscreen) {
+            return true;
+        }
         match &self.screen {
             Screen::Peer(id) => {
                 self.view
@@ -2123,24 +2328,25 @@ impl ArgosApp {
         }
     }
 
-    /// Draws the decoded frame into a fixed box, stretched to fill it.
+    /// Draws the decoded frame into a box no larger than `max`, stretched to fill it.
     ///
-    /// The box depends only on the available space and the source aspect, never
-    /// on the decoded resolution, and it is drawn at the source aspect so a
+    /// The box depends only on the available space, the source aspect and `max`,
+    /// never on the decoded resolution, and it is drawn at the source aspect so a
     /// non-16:9 monitor is not distorted. A resolution drop therefore stretches
     /// the pixels into the same rectangle instead of shrinking the video, which
     /// is the point: the window no longer jumps size as the sharer's adaptive
     /// controller moves up and down the ladder.
-    fn render_image(ui: &mut egui::Ui, preview: &Preview, aspect: f32) {
+    ///
+    /// `max` is how far the picture is allowed to grow, and only fullscreen passes
+    /// something larger than the window. Everywhere else the cap is what keeps a
+    /// 4K stream from filling a sidebar with a postage stamp of itself.
+    fn render_image(ui: &mut egui::Ui, preview: &Preview, aspect: f32, max: egui::Vec2) {
         if !aspect.is_finite() || aspect <= 0.0 {
             return;
         }
-        // Largest the video is ever shown. A 1080p source used to land exactly
-        // here, so any lower resolution now scales up to match.
-        let cap = egui::vec2(1024.0, 576.0);
         let available = ui.available_size();
-        let box_width = cap.x.min(available.x.max(1.0));
-        let box_height = cap.y.min(available.y.max(1.0));
+        let box_width = max.x.min(available.x.max(1.0));
+        let box_height = max.y.min(available.y.max(1.0));
         let width = box_width.min(box_height * aspect);
         let height = width / aspect;
         ui.image((preview.texture.id(), egui::vec2(width, height)));
@@ -2426,7 +2632,7 @@ impl ArgosApp {
             // they are the same fact: a disagreement between the two lists would
             // be read as a bug in one of them.
             let audience = share.audience();
-            viewer_list(ui, &audience, "", false);
+            viewer_list(ui, &audience, "", false, 1.0);
             let now = Instant::now();
             let source_fps = share.frame_rate;
             for slot in &share.viewers {
@@ -2452,7 +2658,7 @@ impl ArgosApp {
                 ));
                 ui.add_space(8.0);
                 let aspect = preview.width as f32 / preview.height.max(1) as f32;
-                Self::render_image(ui, preview, aspect);
+                Self::render_image(ui, preview, aspect, VIEWER_IMAGE_CAP);
             }
         } else if self.live {
             ui.label(RichText::new("Press Preview to see your screen here.").weak());
@@ -2625,7 +2831,7 @@ impl ArgosApp {
         }
     }
 
-    fn peer_view(&mut self, ui: &mut egui::Ui, id: &str) {
+    fn peer_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: &str) {
         let name = self
             .lan
             .as_ref()
@@ -2642,7 +2848,7 @@ impl ArgosApp {
             .and_then(|view| view.sharer_id.as_deref())
             == Some(id);
         if connected {
-            self.watch_view(ui);
+            self.watch_view(ui, ctx);
             return;
         }
 
@@ -2687,8 +2893,9 @@ impl ArgosApp {
         }
     }
 
-    fn watch_view(&mut self, ui: &mut egui::Ui) {
+    fn watch_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut request_stop = false;
+        let mut toggle_fullscreen = false;
         if let Some(view) = self.view.as_mut() {
             ui.heading("Watching");
             ui.label(format!("Status: {}", view.viewer.status()));
@@ -2782,7 +2989,7 @@ impl ArgosApp {
                 let aspect = view
                     .display_aspect
                     .unwrap_or(preview.width as f32 / preview.height as f32);
-                Self::render_image(ui, preview, aspect);
+                Self::render_image(ui, preview, aspect, VIEWER_IMAGE_CAP);
             } else if view.stats.lock().map(|s| s.packets).unwrap_or(0) > 0 {
                 ui.label(
                     RichText::new("Receiving stream data but no decoded picture yet…")
@@ -2799,7 +3006,7 @@ impl ArgosApp {
             // the sharer, so the two sides can never disagree about what this
             // machine measured — only about what to do about it.
             ui.add_space(6.0);
-            viewer_audience(ui, view);
+            viewer_audience(ui, view, 1.0);
             let mine = view.quality.link_report(&view.metrics);
             let verdict = diagnose(&mine.diag, mine.loss, view.source_fps);
             let verdict_text = format!("Your end: {}", verdict.describe(view.source_fps));
@@ -2812,13 +3019,154 @@ impl ArgosApp {
             if ui.button("Stop watching").clicked() {
                 request_stop = true;
             }
+            ui.add_space(6.0);
+            if ui
+                .button(if view.fullscreen {
+                    "Leave fullscreen (Esc)"
+                } else {
+                    "Fullscreen (F11)"
+                })
+                .clicked()
+            {
+                toggle_fullscreen = true;
+            }
         }
         if request_stop {
-            self.stop_view();
+            self.stop_view(ctx);
+        }
+        if toggle_fullscreen {
+            let on = self.view.as_ref().is_some_and(|view| view.fullscreen);
+            self.set_fullscreen(ctx, !on);
         }
     }
 
-    fn welcome(&self, ui: &mut egui::Ui) {
+    /// The picture, alone, filling the window, with the controls floating over it.
+///
+/// Deliberately not the normal panel layout with the video hidden. A sidebar, a
+/// status line and a scrolling column would all be sitting on top of the thing
+/// the user went fullscreen to look at, and the honest version of fullscreen for
+/// a stream is the stream.
+///
+/// The controls have to come with it, though. Everything the windowed panel
+/// offers that is still meaningful without the panel — leaving fullscreen,
+/// muting, who else is watching — moves into a HUD that fades. Otherwise the
+/// user has to leave fullscreen to change the volume, which makes the volume
+/// control unreachable exactly when it is wanted.
+fn fullscreen_view(&mut self, ctx: &egui::Context) {
+    let mut request_stop = false;
+    let mut leave = false;
+    let mut set_muted = None;
+    let now = Instant::now();
+    egui::CentralPanel::default()
+        // Letterboxed with black rather than the panel background: the bars are
+        // not part of the picture and should not look like they are.
+        .frame(egui::Frame::NONE.fill(Color32::BLACK))
+        .show(ctx, |ui| {
+            let Some(view) = self.view.as_ref() else {
+                return;
+            };
+            if let Some(preview) = &view.texture {
+                let aspect = view
+                    .display_aspect
+                    .unwrap_or(preview.width as f32 / preview.height.max(1) as f32);
+                // No cap. This is the one place the video is allowed to be as
+                // large as the display can show it.
+                Self::render_image(ui, preview, aspect, egui::vec2(f32::INFINITY, f32::INFINITY));
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Waiting for the stream…").color(Color32::GRAY),
+                    );
+                });
+            }
+        });
+    let pointer = ctx.input(|input| input.pointer.latest_pos());
+    // Read the HUD state and update the idle clock in one borrow, then let it
+    // go: the window below needs `self` again, and holding the session across it
+    // would not compile.
+    let (alpha, muted, has_audio) = {
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        if pointer != view.last_pointer {
+            view.hud_idle_since = now;
+        }
+        view.last_pointer = pointer;
+        let playback = view.audio_playback.as_ref();
+        (
+            view.hud_alpha(view.hud_idle(now)),
+            playback.is_some_and(|playback| playback.is_muted()),
+            playback.is_some(),
+        )
+    };
+    if alpha > 0.0 {
+        egui::Area::new(egui::Id::new("argos.hud"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                let frame = egui::Frame::popup(ui.style())
+                    .fill(with_alpha(ui.style().visuals.panel_fill, alpha))
+                    // No shadow: a shadow is a solid shape at the edge of the
+                    // picture, and a faded HUD with a solid shadow under it looks
+                    // like a bug rather than a fade.
+                    .shadow(egui::Shadow::NONE);
+                frame.show(ui, |ui| {
+                    ui.set_style(faded_style(ui.style(), alpha));
+                    ui.horizontal(|ui| {
+                        if ui.button("Leave fullscreen (Esc)").clicked() {
+                            leave = true;
+                        }
+                        // Only when there is a speaker to control. A mute button
+                        // that silently does nothing is worse than none at all.
+                        if has_audio
+                            && ui
+                                .button(if muted { "Unmute" } else { "Mute" })
+                                .clicked()
+                        {
+                            set_muted = Some(!muted);
+                        }
+                        if ui.button("Stop watching").clicked() {
+                            request_stop = true;
+                        }
+                    });
+                    ui.separator();
+                    if let Some(view) = self.view.as_ref() {
+                        viewer_audience(ui, view, alpha);
+                    }
+                });
+            });
+    }
+    if leave {
+        self.set_fullscreen(ctx, false);
+    }
+    if let Some(muted) = set_muted {
+        if let Some(playback) = self
+            .view
+            .as_ref()
+            .and_then(|view| view.audio_playback.as_ref())
+        {
+            playback.set_muted(muted);
+        }
+    }
+    if request_stop {
+        self.stop_view(ctx);
+    }
+    // Repaint while the HUD is still fading, and settle to a slow tick once it is
+    // gone: nothing else on screen changes, and a fullscreen video that keeps
+    // asking for frames at 60 Hz for no reason is the whole battery.
+    let settling = self
+        .view
+        .as_ref()
+        .is_some_and(|view| now.duration_since(view.hud_idle_since) < HUD_LINGER);
+    ctx.request_repaint_after(if settling {
+        Duration::from_millis(16)
+    } else {
+        Duration::from_millis(250)
+    });
+}
+
+fn welcome(&self, ui: &mut egui::Ui) {
         ui.heading("Argos");
         ui.add_space(6.0);
         ui.label("Pick someone to watch, or press Share to stream your screen.");
@@ -3311,8 +3659,8 @@ impl ArgosApp {
                 .show(ui, |ui| match self.screen.clone() {
                     Screen::Home => self.welcome(ui),
                     Screen::Share => self.share_view(ui),
-                    Screen::Peer(id) => self.peer_view(ui, &id),
-                    Screen::View => self.watch_view(ui),
+                    Screen::Peer(id) => self.peer_view(ui, ctx, &id),
+                    Screen::View => self.watch_view(ui, ctx),
                 });
         });
     }
@@ -3397,10 +3745,19 @@ impl eframe::App for ArgosApp {
         if ctx.input_mut(|input| input.key_pressed(egui::Key::D) && input.modifiers.ctrl) {
             self.show_metrics = !self.show_metrics;
         }
+        let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
+        if ctx.input(|input| fullscreen_key(input, fullscreen)) {
+            self.set_fullscreen(ctx, !fullscreen);
+        }
         ctx.set_visuals(egui::Visuals::dark());
         self.poll_lan_events();
-        self.top_bar(ctx);
-        self.side_bar(ctx);
+        // Read after the events, because an event can finish the session the
+        // fullscreen flag belonged to.
+        let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
+        if !fullscreen {
+            self.top_bar(ctx);
+            self.side_bar(ctx);
+        }
         if self.capture.is_some() {
             let active = self.update_capture_active();
             self.poll_capture(ctx);
@@ -3424,7 +3781,11 @@ impl eframe::App for ArgosApp {
                 Duration::from_millis(250)
             });
         }
-        self.content(ctx);
+        if fullscreen {
+            self.fullscreen_view(ctx);
+        } else {
+            self.content(ctx);
+        }
         if self.show_metrics {
             // The overlay is the only thing that redraws while nothing else
             // would, so a stall that has already stopped the pipeline still
@@ -3435,7 +3796,7 @@ impl eframe::App for ArgosApp {
         if self.lan.is_some() && self.capture.is_none() && self.view.is_none() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        if self.show_settings {
+        if self.show_settings && !fullscreen {
             self.settings_window(ctx);
         }
     }

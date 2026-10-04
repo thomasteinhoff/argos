@@ -451,6 +451,20 @@ fn worst_link(slots: &[ViewerSlot], now: Instant) -> Option<(f32, f32)> {
 /// to, and holding the slot for them means holding it against their next request.
 const VIEWER_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a viewer waits for an offer before giving up on it.
+///
+/// Deliberately longer than the sharer's `GATHER_TIMEOUT`, which is 10 seconds:
+/// gathering ICE candidates can legitimately take that long, and a deadline
+/// shorter than it would abandon connections that were about to work.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Gap between repeats of the viewer's request.
+///
+/// The request is a single UDP datagram, and UDP loses them. Retrying is what
+/// separates "that machine did not hear me" from "that machine cannot reach me",
+/// and only the second one is worth reporting as a failure.
+const CONNECT_RETRY: Duration = Duration::from_secs(5);
+
 /// Turned into its own type so the sampling rule can be tested without a peer
 /// connection.
 ///
@@ -493,6 +507,53 @@ impl LoadSampler {
         };
         self.rate
     }
+}
+
+/// A viewer's request for a stream, waiting for the offer that answers it.
+///
+/// Its own type rather than a bare id because the attempt has a deadline and a
+/// retry schedule, and three parallel `Option` fields that have to be set
+/// together is three ways to forget one.
+struct PendingView {
+    id: String,
+    /// When the first request went out. The deadline runs from here rather than
+    /// from the most recent retry, so resending cannot keep a hopeless attempt
+    /// alive forever.
+    since: Instant,
+    /// When the last request went out, so retries are spaced instead of going
+    /// out once per frame.
+    sent: Instant,
+}
+
+/// What a waiting connect attempt needs next.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectStep {
+    /// Still inside the retry gap. Nothing to do.
+    Wait,
+    /// The request has not been repeated often enough.
+    Resend,
+    /// The deadline has passed.
+    GiveUp,
+}
+
+/// Decides what a connect attempt needs, given its clocks.
+///
+/// Its own function so the schedule can be tested without a network, a sharer,
+/// or fifteen seconds of real time.
+///
+/// This exists because the sharer cannot report a failed connect. Its message
+/// kinds are request, offer, answer, report, roster and keyframe — none of which
+/// means "I could not connect you" — so when its ICE gather fails, or the
+/// request datagram is lost, the viewer is told nothing at all and waits
+/// indefinitely on a spinner.
+fn connect_step(since: Instant, sent: Instant, now: Instant) -> ConnectStep {
+    if now.duration_since(since) >= CONNECT_TIMEOUT {
+        return ConnectStep::GiveUp;
+    }
+    if now.duration_since(sent) >= CONNECT_RETRY {
+        return ConnectStep::Resend;
+    }
+    ConnectStep::Wait
 }
 
 struct ShareSession {
@@ -1084,13 +1145,18 @@ pub struct ArgosApp {
     live: bool,
     view: Option<ViewSession>,
     view_error: Option<String>,
+    /// Why the last restart attempt did not happen. Its own slot because
+    /// restarting is not the same act as connecting, and someone who pressed it
+    /// must not have the failure reported as a connection problem they never
+    /// asked about.
+    restart_error: Option<String>,
     /// Adaptive resolution toggle. Off means the sharer ignores viewer reports
     /// and only the user's choice applies, which is the escape hatch if the
     /// controller ever fights a link it should not be judging.
     auto_quality: bool,
     lan: Option<lan::Lan>,
     lan_error: Option<String>,
-    pending_view: Option<String>,
+    pending_view: Option<PendingView>,
     /// When the sharer last swept its viewer slots for finished connections.
     last_viewer_sweep: Instant,
     radmin_exe: Option<std::path::PathBuf>,
@@ -1126,6 +1192,7 @@ impl ArgosApp {
             live: false,
             view: None,
             view_error: None,
+            restart_error: None,
             auto_quality: true,
             lan,
             lan_error,
@@ -1689,7 +1756,12 @@ impl ArgosApp {
         if let Some(lan) = &self.lan {
             lan.send_request(id, &self.config.name);
         }
-        self.pending_view = Some(id.to_string());
+        let now = Instant::now();
+        self.pending_view = Some(PendingView {
+            id: id.to_string(),
+            since: now,
+            sent: now,
+        });
     }
 
     fn stop_view(&mut self, ctx: &egui::Context) {
@@ -1706,6 +1778,35 @@ impl ArgosApp {
         self.pending_view = None;
         self.view_error = None;
         self.screen = Screen::Home;
+    }
+
+    /// Starts a fresh copy of the app from its own executable, then kills this one.
+    ///
+    /// The recovery path for the states no other button can undo: an encode
+    /// worker wedged halfway through a share, a capture device that will not
+    /// reopen, a window showing black with a live session behind it. Only a new
+    /// process clears all of that at once, which is why it is a button and not
+    /// advice in a README.
+    ///
+    /// `current_exe` rather than a configured path, so it relaunches whatever is
+    /// actually running instead of guessing at a release build that may not be
+    /// the one on screen.
+    ///
+    /// Exits hard rather than closing the window. The old copy is holding the
+    /// discovery port and the new one is already on its way to that same port,
+    /// and dying releases everything faster than waiting on Drop. Nothing is
+    /// lost by skipping Drop: the profile is written by its own Save button, and
+    /// a stream is expected not to survive a restart.
+    fn restart(&mut self) -> Result<(), String> {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("Could not find this program's own path: {error}"))?;
+        std::process::Command::new(exe)
+            .spawn()
+            .map_err(|error| format!("Could not start a new copy: {error}"))?;
+        // Only reached if the copy above actually started. A failure returns
+        // instead, so the user is left in a working app with an explanation
+        // rather than in no app at all.
+        std::process::exit(0);
     }
 
     /// Puts the window into or out of fullscreen, if there is anything to show.
@@ -1753,18 +1854,22 @@ impl ArgosApp {
         // has already had its dead connections cleared out, and so the roster
         // that follows reflects those clearings.
         self.sweep_viewers();
-        let Some(lan) = self.lan.as_ref() else {
-            return;
-        };
+        // No early return when there is no LAN, so the connect deadline below
+        // still runs. A pending view with nowhere to send a request is the most
+        // hopeless state there is, and the deadline is the only thing that ends
+        // it — making it conditional on discovery being up would leave exactly
+        // the machines least able to connect also unable to be told so.
         let mut events = Vec::new();
-        while let Some(event) = lan.try_event() {
-            events.push(event);
+        if let Some(lan) = self.lan.as_ref() {
+            while let Some(event) = lan.try_event() {
+                events.push(event);
+            }
         }
         for event in events {
             match event {
                 lan::LanEvent::Request { id, name } => self.on_view_request(&id, &name),
                 lan::LanEvent::Offer { id, sdp } => {
-                    if self.pending_view.as_deref() == Some(id.as_str()) {
+                    if self.pending_view.as_ref().is_some_and(|p| p.id == id) {
                         self.pending_view = None;
                         self.start_view(sdp, Some(id));
                     }
@@ -1835,6 +1940,9 @@ impl ArgosApp {
                 }
             }
         }
+        // After the events, so an offer that arrived in this same frame beats the
+        // deadline it happened to share a frame with.
+        self.drive_pending_view();
         // After the events, so a viewer who has just joined is already in the
         // list the moment the others are told about them, rather than being
         // absent from it for one keepalive interval. Costs one comparison per
@@ -1842,6 +1950,40 @@ impl ArgosApp {
         if let Some(lan) = self.lan.as_ref() {
             if let Some(share) = self.share.as_mut() {
                 share.broadcast_roster(lan);
+            }
+        }
+    }
+
+    /// Repeats a waiting request, and gives up on one that has waited long enough.
+    ///
+    /// The sharer has no message that means "I could not connect you" — its kinds
+    /// are request, offer, answer, report, roster and keyframe — so a failed ICE
+    /// gather, or a request datagram lost to a network that drops them, is
+    /// indistinguishable from a sharer that is not listening. Both left the
+    /// viewer on "Connecting…" with no way out but picking something else.
+    fn drive_pending_view(&mut self) {
+        let Some(pending) = self.pending_view.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        match connect_step(pending.since, pending.sent, now) {
+            ConnectStep::Wait => {}
+            ConnectStep::Resend => {
+                let id = pending.id.clone();
+                if let Some(lan) = &self.lan {
+                    lan.send_request(&id, &self.config.name);
+                }
+                if let Some(pending) = self.pending_view.as_mut() {
+                    pending.sent = now;
+                }
+            }
+            ConnectStep::GiveUp => {
+                self.pending_view = None;
+                self.view_error = Some(
+                    "No answer from that machine. They may not be live, or the network \
+                     may be blocking peer messages."
+                        .to_string(),
+                );
             }
         }
     }
@@ -2372,10 +2514,11 @@ impl ArgosApp {
             }
         };
         if let Some(peer) = action {
-            if let Some(lan) = &self.lan {
-                lan.send_request(&peer, &self.config.name);
-            }
-            self.pending_view = Some(peer);
+            // Through the one place that starts a request, so a reconnect gets
+            // the same offer deadline as a first attempt. Otherwise a reconnect
+            // whose offer never arrives is the same indefinite spinner again,
+            // just with a different reason for being here.
+            self.request_view(&peer);
         }
     }
 
@@ -2866,6 +3009,26 @@ impl ArgosApp {
                             ui.label(RichText::new("Your reply code").strong());
                             Self::code_widget(ui, code, 2);
                         }
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "Starts a new copy of Argos and closes this one. Use it when \
+                                 something is wedged and nothing else helps; it drops any \
+                                 stream in progress.",
+                            )
+                            .weak(),
+                        );
+                        if ui.button("Restart Argos").clicked() {
+                            // Inside the click, not after the loop: on success
+                            // this process is gone before the frame finishes,
+                            // so nothing below it will run either way.
+                            if let Err(error) = self.restart() {
+                                self.restart_error = Some(error);
+                            }
+                        }
+                        if let Some(error) = &self.restart_error {
+                            ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                        }
                     });
             });
 
@@ -2907,7 +3070,7 @@ impl ArgosApp {
         }
 
         ui.heading(&name);
-        let pending = self.pending_view.as_deref() == Some(id);
+        let pending = self.pending_view.as_ref().is_some_and(|p| p.id == id);
         if pending {
             ui.label(RichText::new("Connecting…").color(Color32::from_rgb(220, 200, 120)));
         } else {
@@ -3922,13 +4085,87 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        audience_from, decode_target, encode_target, lan, roster_is_stale, worst_link, LoadSampler,
-        ViewerSlot, KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
+        audience_from, connect_step, decode_target, encode_target, lan, roster_is_stale,
+        worst_link, ConnectStep, LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT,
+        KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use std::time::{Duration, Instant};
 
     fn slot(name: &str) -> ViewerSlot {
         ViewerSlot::new(name, name, Instant::now())
+    }
+
+    /// A waiting request repeats on schedule and then gives up, once.
+    ///
+    /// The give-up is the point of the whole thing. The sharer has no message
+    /// that means "I could not connect you", so before this existed a lost
+    /// request datagram left the viewer on a spinner with no deadline, no
+    /// retry, and no way out but picking something else.
+    #[test]
+    fn a_waiting_request_repeats_then_gives_up() {
+        let start = Instant::now();
+
+        // Straight after the first request: inside the retry gap, nothing to do.
+        assert_eq!(
+            connect_step(start, start, start + Duration::from_millis(10)),
+            ConnectStep::Wait
+        );
+
+        // Each time the gap elapses the request goes out again. `since` stays at
+        // `start` throughout: the deadline must not move with the retries.
+        assert_eq!(
+            connect_step(start, start, start + CONNECT_RETRY),
+            ConnectStep::Resend
+        );
+        let second_resend = start + CONNECT_RETRY * 2;
+        assert_eq!(
+            connect_step(start, start + CONNECT_RETRY, second_resend),
+            ConnectStep::Resend
+        );
+
+        // Inside the deadline but past the retry gap, so it still goes out.
+        assert_eq!(
+            connect_step(
+                start,
+                start + Duration::from_secs(2),
+                start + CONNECT_RETRY + Duration::from_secs(2)
+            ),
+            ConnectStep::Resend
+        );
+
+        // And on the deadline it stops, even though the last retry was a whole
+        // retry gap ago.
+        assert_eq!(
+            connect_step(start, second_resend, start + CONNECT_TIMEOUT),
+            ConnectStep::GiveUp
+        );
+    }
+
+    /// A retry must not be able to postpone the deadline.
+    ///
+    /// If the clock ran from the most recent request instead of the first, then
+    /// resending would hold the attempt open forever and the spinner would be
+    /// exactly as infinite as it was before — with retries added on top.
+    #[test]
+    fn retrying_does_not_extend_the_deadline() {
+        let start = Instant::now();
+        let mut sent = start;
+        let mut now = start;
+        while now - start < CONNECT_TIMEOUT {
+            assert_ne!(
+                connect_step(start, sent, now),
+                ConnectStep::GiveUp,
+                "gave up early at {:?}",
+                now - start
+            );
+            if connect_step(start, sent, now) == ConnectStep::Resend {
+                sent = now;
+            }
+            now += Duration::from_millis(100);
+        }
+        // However many retries it managed, the deadline is where it always was.
+        assert_eq!(sent - start, CONNECT_TIMEOUT - CONNECT_RETRY);
+        assert_eq!(connect_step(start, sent, now), ConnectStep::GiveUp);
     }
 
     /// Several viewers reporting inside one interval must produce one sample.

@@ -976,9 +976,10 @@ fn viewer_list(
     if stale {
         // Said out loud, because the alternative is a headcount that quietly
         // stops being true and reads as fact.
-        ui.label(RichText::new(format!("{summary} · list may be out of date")).color(
-            with_alpha(Color32::from_rgb(220, 200, 120), alpha),
-        ));
+        ui.label(
+            RichText::new(format!("{summary} · list may be out of date"))
+                .color(with_alpha(Color32::from_rgb(220, 200, 120), alpha)),
+        );
     } else {
         ui.label(RichText::new(summary).weak());
     }
@@ -992,8 +993,7 @@ fn viewer_list(
         let state = if entry.connected {
             RichText::new("watching").color(with_alpha(Color32::from_rgb(150, 220, 150), alpha))
         } else {
-            RichText::new("connecting…")
-                .color(with_alpha(Color32::from_rgb(220, 200, 120), alpha))
+            RichText::new("connecting…").color(with_alpha(Color32::from_rgb(220, 200, 120), alpha))
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).strong());
@@ -2918,7 +2918,10 @@ impl ArgosApp {
                 let mut vol_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Volume");
-                    if ui.add(egui::Slider::new(&mut vol, 0..=200).suffix("%")).changed() {
+                    if ui
+                        .add(egui::Slider::new(&mut vol, 0..=200).suffix("%"))
+                        .changed()
+                    {
                         vol_changed = true;
                     }
                 });
@@ -3062,132 +3065,133 @@ impl ArgosApp {
     }
 
     /// The picture, alone, filling the window, with the controls floating over it.
-///
-/// Deliberately not the normal panel layout with the video hidden. A sidebar, a
-/// status line and a scrolling column would all be sitting on top of the thing
-/// the user went fullscreen to look at, and the honest version of fullscreen for
-/// a stream is the stream.
-///
-/// The controls have to come with it, though. Everything the windowed panel
-/// offers that is still meaningful without the panel — leaving fullscreen,
-/// muting, who else is watching — moves into a HUD that fades. Otherwise the
-/// user has to leave fullscreen to change the volume, which makes the volume
-/// control unreachable exactly when it is wanted.
-fn fullscreen_view(&mut self, ctx: &egui::Context) {
-    let mut request_stop = false;
-    let mut leave = false;
-    let mut set_muted = None;
-    let now = Instant::now();
-    egui::CentralPanel::default()
-        // Letterboxed with black rather than the panel background: the bars are
-        // not part of the picture and should not look like they are.
-        .frame(egui::Frame::NONE.fill(Color32::BLACK))
-        .show(ctx, |ui| {
-            let Some(view) = self.view.as_ref() else {
+    ///
+    /// Deliberately not the normal panel layout with the video hidden. A sidebar, a
+    /// status line and a scrolling column would all be sitting on top of the thing
+    /// the user went fullscreen to look at, and the honest version of fullscreen for
+    /// a stream is the stream.
+    ///
+    /// The controls have to come with it, though. Everything the windowed panel
+    /// offers that is still meaningful without the panel — leaving fullscreen,
+    /// muting, who else is watching — moves into a HUD that fades. Otherwise the
+    /// user has to leave fullscreen to change the volume, which makes the volume
+    /// control unreachable exactly when it is wanted.
+    fn fullscreen_view(&mut self, ctx: &egui::Context) {
+        let mut request_stop = false;
+        let mut leave = false;
+        let mut set_muted = None;
+        let now = Instant::now();
+        egui::CentralPanel::default()
+            // Letterboxed with black rather than the panel background: the bars are
+            // not part of the picture and should not look like they are.
+            .frame(egui::Frame::NONE.fill(Color32::BLACK))
+            .show(ctx, |ui| {
+                let Some(view) = self.view.as_ref() else {
+                    return;
+                };
+                if let Some(preview) = &view.texture {
+                    let aspect = view
+                        .display_aspect
+                        .unwrap_or(preview.width as f32 / preview.height.max(1) as f32);
+                    // No cap. This is the one place the video is allowed to be as
+                    // large as the display can show it.
+                    Self::render_image(
+                        ui,
+                        preview,
+                        aspect,
+                        egui::vec2(f32::INFINITY, f32::INFINITY),
+                    );
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Waiting for the stream…").color(Color32::GRAY));
+                    });
+                }
+            });
+        let pointer = ctx.input(|input| input.pointer.latest_pos());
+        // Read the HUD state and update the idle clock in one borrow, then let it
+        // go: the window below needs `self` again, and holding the session across it
+        // would not compile.
+        let (alpha, muted, has_audio) = {
+            let Some(view) = self.view.as_mut() else {
                 return;
             };
-            if let Some(preview) = &view.texture {
-                let aspect = view
-                    .display_aspect
-                    .unwrap_or(preview.width as f32 / preview.height.max(1) as f32);
-                // No cap. This is the one place the video is allowed to be as
-                // large as the display can show it.
-                Self::render_image(ui, preview, aspect, egui::vec2(f32::INFINITY, f32::INFINITY));
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Waiting for the stream…").color(Color32::GRAY),
-                    );
-                });
+            if pointer != view.last_pointer {
+                view.hud_idle_since = now;
             }
-        });
-    let pointer = ctx.input(|input| input.pointer.latest_pos());
-    // Read the HUD state and update the idle clock in one borrow, then let it
-    // go: the window below needs `self` again, and holding the session across it
-    // would not compile.
-    let (alpha, muted, has_audio) = {
-        let Some(view) = self.view.as_mut() else {
-            return;
+            view.last_pointer = pointer;
+            let playback = view.audio_playback.as_ref();
+            (
+                view.hud_alpha(view.hud_idle(now)),
+                playback.is_some_and(|playback| playback.is_muted()),
+                playback.is_some(),
+            )
         };
-        if pointer != view.last_pointer {
-            view.hud_idle_since = now;
-        }
-        view.last_pointer = pointer;
-        let playback = view.audio_playback.as_ref();
-        (
-            view.hud_alpha(view.hud_idle(now)),
-            playback.is_some_and(|playback| playback.is_muted()),
-            playback.is_some(),
-        )
-    };
-    if alpha > 0.0 {
-        egui::Area::new(egui::Id::new("argos.hud"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
-            .order(egui::Order::Foreground)
-            .interactable(true)
-            .show(ctx, |ui| {
-                let frame = egui::Frame::popup(ui.style())
-                    .fill(with_alpha(ui.style().visuals.panel_fill, alpha))
-                    // No shadow: a shadow is a solid shape at the edge of the
-                    // picture, and a faded HUD with a solid shadow under it looks
-                    // like a bug rather than a fade.
-                    .shadow(egui::Shadow::NONE);
-                frame.show(ui, |ui| {
-                    ui.set_style(faded_style(ui.style(), alpha));
-                    ui.horizontal(|ui| {
-                        if ui.button("Leave fullscreen (Esc)").clicked() {
-                            leave = true;
-                        }
-                        // Only when there is a speaker to control. A mute button
-                        // that silently does nothing is worse than none at all.
-                        if has_audio
-                            && ui
-                                .button(if muted { "Unmute" } else { "Mute" })
-                                .clicked()
-                        {
-                            set_muted = Some(!muted);
-                        }
-                        if ui.button("Stop watching").clicked() {
-                            request_stop = true;
+        if alpha > 0.0 {
+            egui::Area::new(egui::Id::new("argos.hud"))
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let frame = egui::Frame::popup(ui.style())
+                        .fill(with_alpha(ui.style().visuals.panel_fill, alpha))
+                        // No shadow: a shadow is a solid shape at the edge of the
+                        // picture, and a faded HUD with a solid shadow under it looks
+                        // like a bug rather than a fade.
+                        .shadow(egui::Shadow::NONE);
+                    frame.show(ui, |ui| {
+                        ui.set_style(faded_style(ui.style(), alpha));
+                        ui.horizontal(|ui| {
+                            if ui.button("Leave fullscreen (Esc)").clicked() {
+                                leave = true;
+                            }
+                            // Only when there is a speaker to control. A mute button
+                            // that silently does nothing is worse than none at all.
+                            if has_audio
+                                && ui.button(if muted { "Unmute" } else { "Mute" }).clicked()
+                            {
+                                set_muted = Some(!muted);
+                            }
+                            if ui.button("Stop watching").clicked() {
+                                request_stop = true;
+                            }
+                        });
+                        ui.separator();
+                        if let Some(view) = self.view.as_ref() {
+                            viewer_audience(ui, view, alpha);
                         }
                     });
-                    ui.separator();
-                    if let Some(view) = self.view.as_ref() {
-                        viewer_audience(ui, view, alpha);
-                    }
                 });
-            });
-    }
-    if leave {
-        self.set_fullscreen(ctx, false);
-    }
-    if let Some(muted) = set_muted {
-        if let Some(playback) = self
+        }
+        if leave {
+            self.set_fullscreen(ctx, false);
+        }
+        if let Some(muted) = set_muted {
+            if let Some(playback) = self
+                .view
+                .as_ref()
+                .and_then(|view| view.audio_playback.as_ref())
+            {
+                playback.set_muted(muted);
+            }
+        }
+        if request_stop {
+            self.stop_view(ctx);
+        }
+        // Repaint while the HUD is still fading, and settle to a slow tick once it is
+        // gone: nothing else on screen changes, and a fullscreen video that keeps
+        // asking for frames at 60 Hz for no reason is the whole battery.
+        let settling = self
             .view
             .as_ref()
-            .and_then(|view| view.audio_playback.as_ref())
-        {
-            playback.set_muted(muted);
-        }
+            .is_some_and(|view| now.duration_since(view.hud_idle_since) < HUD_LINGER);
+        ctx.request_repaint_after(if settling {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
+        });
     }
-    if request_stop {
-        self.stop_view(ctx);
-    }
-    // Repaint while the HUD is still fading, and settle to a slow tick once it is
-    // gone: nothing else on screen changes, and a fullscreen video that keeps
-    // asking for frames at 60 Hz for no reason is the whole battery.
-    let settling = self
-        .view
-        .as_ref()
-        .is_some_and(|view| now.duration_since(view.hud_idle_since) < HUD_LINGER);
-    ctx.request_repaint_after(if settling {
-        Duration::from_millis(16)
-    } else {
-        Duration::from_millis(250)
-    });
-}
 
-fn welcome(&self, ui: &mut egui::Ui) {
+    fn welcome(&self, ui: &mut egui::Ui) {
         ui.heading("Argos");
         ui.add_space(6.0);
         ui.label("Pick someone to watch, or press Share to stream your screen.");

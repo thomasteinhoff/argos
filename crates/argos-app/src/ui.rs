@@ -11,7 +11,7 @@ use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics, Sta
 use argos_core::quality::{Controller as QualityController, Decision, Report};
 use argos_core::{h264, lan, session, Packet};
 use argos_media::audio::{
-    AudioCapture, AudioPlayback, OpusAudioDecoder, OpusAudioEncoder, FRAME_SAMPLES,
+    AudioCapture, AudioPlayback, AudioSender, OpusAudioDecoder, OpusAudioEncoder,
 };
 use argos_media::capture::{self, CaptureSession, MonitorInfo};
 use argos_media::decode::{DecodedFrame, H264Decoder};
@@ -579,7 +579,7 @@ struct ShareSession {
     metrics: Arc<SenderMetrics>,
     last_encode: Instant,
     audio_capture: Option<AudioCapture>,
-    audio_encoder: Option<OpusAudioEncoder>,
+    audio_sender: Option<AudioSender>,
     audio_error: Option<String>,
     /// How system audio is being captured, e.g. that Discord is being excluded.
     ///
@@ -587,8 +587,6 @@ struct ShareSession {
     /// `audio_error`: a recovered worker should stop claiming a failure, but the
     /// loopback mode it settled on is still true.
     audio_notice: Option<String>,
-    audio_timestamp: u32,
-    audio_frames_sent: u64,
     /// Adaptive resolution, driven by the viewer's reports over the LAN channel.
     /// Pure state machine: see `argos_core::quality`.
     quality: QualityController,
@@ -1416,11 +1414,12 @@ impl ArgosApp {
         let worker_force_keyframe = Arc::clone(&force_keyframe);
         let target_height = Arc::new(AtomicI32::new(encode_target(self.share_height)));
         let worker_target_height = Arc::clone(&target_height);
-        let worker_metrics = self
+        let metrics = self
             .capture
             .as_ref()
             .map(|capture| Arc::clone(capture.metrics()))
             .unwrap_or_default();
+        let worker_metrics = Arc::clone(&metrics);
         let join = match thread::Builder::new()
             .name("argos-encode".to_string())
             .spawn(move || {
@@ -1442,14 +1441,18 @@ impl ArgosApp {
                 return Err(message);
             }
         };
-        let (audio_capture, audio_encoder, audio_error) =
-            match (AudioCapture::start(), OpusAudioEncoder::new()) {
-                (Ok(capture), Ok(encoder)) => (Some(capture), Some(encoder), None),
-                (capture, encoder) => {
-                    let error = capture.err().or_else(|| encoder.err());
-                    (None, None, error)
-                }
-            };
+        let (audio_capture, audio_sender, audio_error) = match (
+            AudioCapture::start(),
+            OpusAudioEncoder::new().and_then(|encoder| {
+                AudioSender::start(encoder, Arc::clone(&sharer), Arc::clone(&metrics))
+            }),
+        ) {
+            (Ok(capture), Ok(sender)) => (Some(capture), Some(sender), None),
+            (capture, sender) => {
+                let error = capture.err().or_else(|| sender.err());
+                (None, None, error)
+            }
+        };
         // Read before the capture handle is moved into the session below: the
         // worker may already have settled on a loopback mode, and starting blank
         // would hide that for a frame.
@@ -1467,18 +1470,12 @@ impl ArgosApp {
             tx,
             join: Some(join),
             stats,
-            metrics: self
-                .capture
-                .as_ref()
-                .map(|capture| Arc::clone(capture.metrics()))
-                .unwrap_or_default(),
+            metrics,
             last_encode: Instant::now(),
             audio_capture,
-            audio_encoder,
+            audio_sender,
             audio_error,
             audio_notice,
-            audio_timestamp: 0,
-            audio_frames_sent: 0,
             quality: QualityController::at_height(self.share_height),
             frame_rate: self.frame_rate,
             target_height,
@@ -2294,36 +2291,34 @@ impl ArgosApp {
         {
             share.audio_error = None;
         }
+        // The sender walks a separate path from the capture worker: the device
+        // recovering says nothing about whether the sender's last encode or
+        // write went out, so its first failure is surfaced after the re-alive
+        // blanking, not before.
+        if let Some(sender) = share.audio_sender.as_ref() {
+            if let Some(error) = sender.try_error() {
+                share.audio_error = Some(error);
+            }
+        }
         // Standing state about how audio is being captured, re-read each frame
         // rather than taken, so it keeps showing for as long as it is true.
         share.audio_notice = share.audio_capture.as_ref().and_then(AudioCapture::notice);
-        if !share.sharer.is_connected() {
+        // Shuttle frames from the capture queue into the sender. Encoding and
+        // the RTP write are the sender thread's job; this loop only moves
+        // buffers between two workers, which is why it can live in the UI
+        // frame. Draining while disconnected now matters more than it did: the
+        // sender drops the frames (there is nothing to encode for), and a full
+        // capture queue would make the capture worker throw its own frames
+        // away instead.
+        let Some(sender) = share.audio_sender.as_ref() else {
             return;
-        }
-        let metrics = Arc::clone(&share.metrics);
+        };
         while let Some(frame) = share
             .audio_capture
             .as_ref()
             .and_then(AudioCapture::try_frame)
         {
-            let Some(encoder) = share.audio_encoder.as_mut() else {
-                break;
-            };
-            let packet = match encoder.encode(&frame) {
-                Ok(packet) => packet,
-                Err(error) => {
-                    share.audio_error = Some(error);
-                    break;
-                }
-            };
-            let timestamp = share.audio_timestamp;
-            share.audio_timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
-            let sharer = Arc::clone(&share.sharer);
-            if let Err(error) = session::block_on(sharer.send_audio(&packet, timestamp, &metrics)) {
-                share.audio_error = Some(error);
-                break;
-            }
-            share.audio_frames_sent += 1;
+            sender.push(frame);
         }
     }
 
@@ -2796,7 +2791,7 @@ impl ArgosApp {
             // Presence of the objects only proves the thread started. The state
             // handle is what says whether a device is actually being serviced
             // right now, which is the question the panel is really asking.
-            let audio_label = match (&share.audio_capture, &share.audio_encoder) {
+            let audio_label = match (&share.audio_capture, &share.audio_sender) {
                 (Some(capture), Some(_)) if capture.is_alive() => "Audio: system sound shared",
                 (Some(_), Some(_)) => "Audio: reconnecting to the sound device",
                 _ => "Audio: not available",
@@ -2990,7 +2985,10 @@ impl ArgosApp {
                                 .unwrap_or((0, 0.0, 0));
                             ui.label(format!(
                                 "{} frames sent, {:.1} ms/frame, {} encode errors, {} audio frames",
-                                frames_sent, encode_ms, encode_errors, share.audio_frames_sent
+                                frames_sent,
+                                encode_ms,
+                                encode_errors,
+                                share.metrics.audio_frames.get()
                             ));
                         }
                         ui.add(

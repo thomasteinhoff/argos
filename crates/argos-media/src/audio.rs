@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use argos_core::metrics::AudioMetrics;
+use argos_core::metrics::{AudioMetrics, SenderMetrics};
+use argos_core::session;
 use opus_rs::{Application, OpusDecoder, OpusEncoder};
 use wasapi::{
     initialize_mta, AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
@@ -451,6 +452,132 @@ impl AudioCapture {
 }
 
 impl Drop for AudioCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// First error wins, once, until it is taken.
+///
+/// The pattern the capture state already uses, minus the generation round-trips
+/// `AudioState` needs for worker *death*. A sender failure is a bad encode or a
+/// blocked write — transient — and the first one is the informative one.
+#[derive(Default)]
+struct FirstError {
+    slot: Mutex<Option<String>>,
+}
+
+impl FirstError {
+    fn set(&self, message: String) {
+        if let Ok(mut slot) = self.slot.lock() {
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.slot.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+/// Encodes captured audio and hands it to the transport, off the UI thread.
+///
+/// The outbound half of the pipeline the app used to run inside the render
+/// loop: drain the capture queue, run Opus, block on the RTP write, advance
+/// the timestamp — all in the UI frame, so a slow encode or a stalled write
+/// froze the whole window. The UI's role is now only the cheap half of the
+/// shuttle (push captured frames here); this thread owns the encoder, the
+/// timestamp and the write, and one channel's worth of slack is the cost of
+/// never blocking the renderer on the transport.
+pub struct AudioSender {
+    tx: SyncSender<Vec<f32>>,
+    /// First encode or write failure, for the UI to surface.
+    error: Arc<FirstError>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AudioSender {
+    pub fn start(
+        encoder: OpusAudioEncoder,
+        sharer: Arc<session::Sharer>,
+        metrics: Arc<SenderMetrics>,
+    ) -> Result<Self, String> {
+        let (tx, rx) = sync_channel::<Vec<f32>>(8);
+        let error = Arc::new(FirstError::default());
+        let thread_error = Arc::clone(&error);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let join = thread::Builder::new()
+            .name("argos-audio-send".to_string())
+            .spawn(move || {
+                let mut encoder = encoder;
+                // RTP timestamps advance by a fixed 20 ms step (960 samples at
+                // 48 kHz), the slot size the receiver's jitter buffer expects.
+                // The counter starts at 0 per share, as it did in the UI.
+                let mut timestamp: u32 = 0;
+                loop {
+                    let frame = match rx.recv_timeout(Duration::from_millis(20)) {
+                        Ok(frame) => frame,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if thread_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    // Nothing to encode for, so nothing worth encoding. The gate
+                    // used to sit in the UI's drain loop; it lives here now, and
+                    // the capture worker's next frame is fresher than this one
+                    // anyway.
+                    if !sharer.is_connected() {
+                        continue;
+                    }
+                    let packet = match encoder.encode(&frame) {
+                        Ok(packet) => packet,
+                        Err(message) => {
+                            thread_error.set(message);
+                            continue;
+                        }
+                    };
+                    let produced = timestamp;
+                    timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+                    if let Err(message) =
+                        session::block_on(sharer.send_audio(&packet, produced, &metrics))
+                    {
+                        thread_error.set(message);
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start the audio sender thread: {error}"))?;
+        Ok(Self {
+            tx,
+            error,
+            stop,
+            join: Some(join),
+        })
+    }
+
+    /// Hands one captured frame to the sender, dropping when the channel is
+    /// full. A sender that far behind is discarding frames anyway, and
+    /// blocking the UI on it would be the reason this thread exists coming
+    /// back.
+    pub fn push(&self, frame: Vec<f32>) {
+        let _ = self.tx.try_send(frame);
+    }
+
+    /// First encode or write failure, taken (cleared) by the call.
+    pub fn try_error(&self) -> Option<String> {
+        self.error.take()
+    }
+}
+
+impl Drop for AudioSender {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
@@ -1054,7 +1181,8 @@ fn run_playback(
 #[cfg(test)]
 mod tests {
     use super::{
-        pop_frame, select_discord_root, AudioState, JitterBuffer, CHANNELS, FRAME_SAMPLES,
+        pop_frame, select_discord_root, AudioState, FirstError, JitterBuffer, CHANNELS,
+        FRAME_SAMPLES,
     };
     use argos_core::metrics::AudioMetrics;
     use std::collections::VecDeque;
@@ -1094,6 +1222,19 @@ mod tests {
             state.current_notice().as_deref(),
             Some("sharing full system audio")
         );
+    }
+
+    /// The sender's failure channel: the first failure is the only one until the
+    /// UI takes it, so a flurry of write errors cannot overwrite the first cause
+    /// with noise.
+    #[test]
+    fn a_first_error_is_reported_once_until_taken() {
+        let first = FirstError::default();
+        assert_eq!(first.take(), None);
+        first.set("encode failed".to_string());
+        first.set("later write failed".to_string());
+        assert_eq!(first.take(), Some("encode failed".to_string()));
+        assert_eq!(first.take(), None);
     }
 
     /// One 20 ms frame of interleaved stereo.

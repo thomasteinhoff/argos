@@ -479,7 +479,7 @@ impl FirstError {
         }
     }
 
-    fn take(&self) -> Option<String> {
+    pub(crate) fn take(&self) -> Option<String> {
         self.slot.lock().ok().and_then(|mut slot| slot.take())
     }
 

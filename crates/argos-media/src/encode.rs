@@ -1,6 +1,18 @@
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use argos_core::h264;
+use argos_core::metrics::{SenderMetrics, StageTimer};
+use argos_core::session;
+
 use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, UsageType};
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
+
+use crate::audio::FirstError;
 
 pub struct H264Encoder {
     encoder: Encoder,
@@ -255,6 +267,203 @@ fn chroma_u(r: i32, g: i32, b: i32) -> u8 {
 #[inline]
 fn chroma_v(r: i32, g: i32, b: i32) -> u8 {
     (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+}
+
+/// Fallback interval for periodic intra frames.
+///
+/// This used to be 2 s and was the sharer's *only* recovery mechanism, because
+/// the rtc transport offers no RTCP feedback path (see `session.rs`). It is
+/// now a backstop behind on-demand requests over the LAN channel: every
+/// keyframe is a burst on a Radmin tunnel, and a burst is what causes loss in
+/// the first place.
+pub const KEYFRAME_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Floor between keyframes forced on a viewer's request.
+///
+/// A keyframe costs a full-frame burst. Honouring every request from a viewer
+/// on a bad link would turn a recovery mechanism into a denial of service, so
+/// this rate-limits a peer regardless of how often it asks.
+pub const KEYFRAME_REQUEST_FLOOR: Duration = Duration::from_millis(500);
+
+/// Packs a resolution choice into the atomic the encode worker polls.
+///
+/// A negative value means "native" (no scaling); anything else is a target
+/// height in pixels. The target travels as an atomic rather than as a message
+/// because it must not share the frame queue: that queue is full exactly when
+/// this matters (the encoder is behind), and a control message behind a
+/// backlog of stale frames would be dropped or applied minutes late.
+pub fn encode_target(height: Option<u32>) -> i32 {
+    height.map_or(-1, |height| height as i32)
+}
+
+pub fn decode_target(value: i32) -> Option<u32> {
+    (value >= 0).then_some(value as u32)
+}
+
+/// One captured frame handed to the encode worker.
+pub struct EncodeMsg {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Encodes captured frames and hands the bitstream to the transport, on its
+/// own thread.
+///
+/// The send side of the share used to live as a free function in the app's UI
+/// file, together with the resolution and keyframe policy it runs. Moving it
+/// here put the worker next to the encoder it drives, gave the loss counters a
+/// crate where they are read without a UI mutex, and left the UI file with
+/// just the frame pushes. The worker's only exit is the frame channel
+/// disconnecting, so the queue sender must be dropped before joining it.
+pub struct EncodeWorker {
+    join: Option<JoinHandle<()>>,
+    /// First encode or write failure, surfaced by [`Self::take_error`].
+    error: Arc<FirstError>,
+}
+
+impl EncodeWorker {
+    pub fn spawn(
+        rx: Receiver<EncodeMsg>,
+        sharer: Arc<session::Sharer>,
+        mut encoder: H264Encoder,
+        metrics: Arc<SenderMetrics>,
+        force_keyframe: Arc<AtomicBool>,
+        target_height: Arc<AtomicI32>,
+    ) -> Result<Self, String> {
+        let error = Arc::new(FirstError::default());
+        let thread_error = Arc::clone(&error);
+        let join = thread::Builder::new()
+            .name("argos-encode".to_string())
+            .spawn(move || {
+                // RTP timestamps come from elapsed wall time, not from the frame
+                // rate. The counter form (`timestamp += 90_000 / fps`) claims a
+                // fixed interval per frame, which is false for any frame that is
+                // late, coalesced or dropped — so the sender's clock outruns real
+                // time and the receiver has to discard good frames to stay in
+                // sync. The frame rate now lives only in the encoder's own
+                // configuration, set before this thread starts.
+                let clock = h264::Clock::new();
+                let mut last_keyframe = Instant::now();
+                // The target the encoder is currently configured for. Compared
+                // against the shared atomic on every frame, so a resolution
+                // change is picked up on the next frame regardless of how backed
+                // up the frame queue is.
+                let mut applied_target = target_height.load(Ordering::Relaxed);
+                // Set when an intra frame has been asked for but not yet
+                // encoded. The flag outlives the request, because the frame that
+                // carries the intra arrives later — and that frame's size is the
+                // number worth measuring, not the request's.
+                let mut pending_keyframe = false;
+                while let Ok(msg) = rx.recv() {
+                    metrics.captured_width.set(msg.width as u64);
+                    metrics.captured_height.set(msg.height as u64);
+                    // Pick up an adaptive or user resolution change. This is
+                    // polled rather than queued: the frame queue fills up
+                    // precisely when the encoder is behind, which is exactly when
+                    // the controller is trying to lower the resolution, so a
+                    // queued control message would be dropped by the very
+                    // congestion it exists to relieve.
+                    let target = target_height.load(Ordering::Relaxed);
+                    if target != applied_target {
+                        applied_target = target;
+                        encoder.set_target_height(decode_target(target));
+                        // A resolution change is unviewable until the next intra
+                        // frame, so this one is never optional.
+                        encoder.force_keyframe();
+                        last_keyframe = Instant::now();
+                        pending_keyframe = true;
+                    }
+                    // A viewer asking for recovery. An atomic flag rather than a
+                    // message: the frame queue below is small and fills up
+                    // exactly when the machine is struggling, and a dropped
+                    // request would strand a viewer waiting for an intra frame it
+                    // was promised. Requests that arrive faster than the floor
+                    // are coalesced — one intra frame serves every request in the
+                    // interval.
+                    let requested = force_keyframe.swap(false, Ordering::Relaxed);
+                    // Backstop for a request that never arrived: the LAN channel
+                    // is UDP, and a manual-code session has no channel at all.
+                    let overdue = last_keyframe.elapsed() >= KEYFRAME_INTERVAL;
+                    if (requested && last_keyframe.elapsed() >= KEYFRAME_REQUEST_FLOOR) || overdue {
+                        encoder.force_keyframe();
+                        last_keyframe = Instant::now();
+                        pending_keyframe = true;
+                    }
+                    // Conversion and encoding are timed separately: they have very
+                    // different costs and very different fixes. The conversion is
+                    // our own scalar code and, when it scales, does five integer
+                    // divisions per output pixel; the encode is openh264.
+                    let converted = {
+                        let _convert = StageTimer::new(&metrics.convert);
+                        encoder.convert(&msg.rgba, msg.width, msg.height)
+                    };
+                    let bitstream = match converted {
+                        Ok(dims) => {
+                            metrics.encoded_width.set(dims.0 as u64);
+                            metrics.encoded_height.set(dims.1 as u64);
+                            let _encode = StageTimer::new(&metrics.encode);
+                            encoder.encode_planes(dims.0, dims.1)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match bitstream {
+                        Ok(bitstream) => {
+                            // Sampled at send time, not at receipt: the clock is
+                            // measuring how long this frame waited, which is
+                            // exactly the latency a receiver has to absorb.
+                            let ts = clock.ticks(Instant::now());
+                            let size = bitstream.len() as u64;
+                            metrics.encoded_bytes.add(size);
+                            if pending_keyframe {
+                                // The frame following a forced intra is an IDR, so
+                                // this is the size of the burst that goes out on
+                                // the wire. If this number is large, it is a
+                                // plausible cause of the loss it is meant to help
+                                // recover from.
+                                metrics.keyframes.incr();
+                                metrics.last_keyframe_bytes.set(size);
+                                pending_keyframe = false;
+                            }
+                            match session::block_on(sharer.send_frame(&bitstream, ts, &metrics)) {
+                                Ok(()) => metrics.encoded.record(),
+                                Err(message) => thread_error.set(message),
+                            }
+                        }
+                        Err(message) => {
+                            metrics.encode_errors.incr();
+                            thread_error.set(message);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start the encode worker thread: {error}"))?;
+        Ok(Self {
+            join: Some(join),
+            error,
+        })
+    }
+
+    /// First encode or write failure, taken (cleared) by the call.
+    pub fn take_error(&self) -> Option<String> {
+        self.error.take()
+    }
+
+    /// Waits for the worker to finish. The frame queue sender must be dropped
+    /// first: the loop only exits when its `recv` sees the channel disconnect.
+    pub fn join(mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for EncodeWorker {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 #[cfg(test)]

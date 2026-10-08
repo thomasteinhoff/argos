@@ -10,11 +10,9 @@ use argos_core::diagnose::{self, diagnose, Bottleneck};
 use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics, StageTimer};
 use argos_core::quality::{Controller as QualityController, Decision, Report};
 use argos_core::{h264, lan, session, Packet};
-use argos_media::audio::{
-    AudioCapture, AudioPlayback, AudioSender, OpusAudioDecoder, OpusAudioEncoder,
-};
+use argos_media::audio::{AudioCapture, AudioPlayback, AudioSender, OpusAudioEncoder};
 use argos_media::capture::{self, CaptureSession, MonitorInfo};
-use argos_media::decode::{DecodedFrame, H264Decoder};
+use argos_media::decode::{DecodeSink, DecodedFrame};
 use argos_media::encode::H264Encoder;
 
 use crate::config::{self, AppConfig};
@@ -692,26 +690,6 @@ impl ShareSession {
     }
 }
 
-#[derive(Default)]
-struct ViewStats {
-    packets: u64,
-    bytes: u64,
-    aus: u64,
-    decoded: u64,
-    decode_errors: u64,
-    decode_none: u64,
-    first_width: u32,
-    first_height: u32,
-    first_error: Option<String>,
-    audio_packets: u64,
-    audio_decoded: u64,
-    audio_errors: u64,
-    audio_error: Option<String>,
-    base_seq: Option<u16>,
-    highest_seq: Option<u16>,
-    lost: u64,
-}
-
 struct Quality {
     last: Instant,
     last_decoded: u64,
@@ -834,7 +812,9 @@ struct ViewSession {
     answer_code: Option<String>,
     error: Option<String>,
     latest: Arc<Mutex<Option<DecodedFrame>>>,
-    stats: Arc<Mutex<ViewStats>>,
+    /// The receive pipeline: depacketize, demux, decode, present. Held here so
+    /// the diagnostics panel can read its first-error strings.
+    sink: Arc<Mutex<DecodeSink>>,
     /// Lock-free counters and stage timings for this receive session, shared
     /// with the transport's packet callback.
     metrics: Arc<ReceiverMetrics>,
@@ -1675,7 +1655,6 @@ impl ArgosApp {
             session::block_on(existing.viewer.close());
         }
         let latest = Arc::new(Mutex::new(None));
-        let stats = Arc::new(Mutex::new(ViewStats::default()));
         let metrics = Arc::new(ReceiverMetrics::default());
         let vol = self.config.volume_percent as f32 / 100.0;
         let (audio_playback, audio_error) = match AudioPlayback::start(vol) {
@@ -1685,12 +1664,19 @@ impl ArgosApp {
         if let Some(ref pb) = audio_playback {
             pb.set_volume_percent(self.config.volume_percent);
         }
-        let callback: Arc<dyn Fn(&Packet) + Send + Sync> = Arc::new(Self::receive_callback(
+        let sink = Arc::new(Mutex::new(DecodeSink::new(
             Arc::clone(&latest),
-            Arc::clone(&stats),
-            Arc::clone(&metrics),
             audio_playback.clone(),
-        ));
+            Arc::clone(&metrics),
+        )));
+        let callback: Arc<dyn Fn(&Packet) + Send + Sync> = {
+            let sink = Arc::clone(&sink);
+            Arc::new(move |packet: &Packet| {
+                if let Ok(mut sink) = sink.lock() {
+                    sink.on_packet(packet);
+                }
+            })
+        };
         let udp = vec!["0.0.0.0:0".to_string()];
         let viewer = match session::block_on(session::Viewer::new(udp, callback)) {
             Ok(viewer) => Arc::new(viewer),
@@ -1720,7 +1706,7 @@ impl ArgosApp {
             answer_code,
             error: None,
             latest,
-            stats,
+            sink,
             metrics,
             texture: None,
             display_aspect: None,
@@ -2034,159 +2020,6 @@ impl ArgosApp {
             .store(encode_target(height), Ordering::Relaxed);
     }
 
-    fn receive_callback(
-        latest: Arc<Mutex<Option<DecodedFrame>>>,
-        stats: Arc<Mutex<ViewStats>>,
-        metrics: Arc<ReceiverMetrics>,
-        audio_playback: Option<Arc<AudioPlayback>>,
-    ) -> impl Fn(&Packet) + Send + Sync {
-        struct Pipeline {
-            depacketizer: h264::Depacketizer,
-            decoder: Option<H264Decoder>,
-            audio_decoder: Option<OpusAudioDecoder>,
-        }
-        let pipeline = Arc::new(Mutex::new(Pipeline {
-            depacketizer: h264::Depacketizer::new(),
-            decoder: H264Decoder::new().ok(),
-            audio_decoder: OpusAudioDecoder::new().ok(),
-        }));
-        move |packet: &Packet| {
-            // Total time inside the callback. If this mean approaches the packet
-            // arrival interval, the callback is the bottleneck and the receiver
-            // cannot keep up no matter how much spare CPU the decoder has.
-            let _receive = StageTimer::new(&metrics.receive);
-            // Counters are atomics, not the `stats` mutex. At 500+ video packets
-            // a second this callback was taking that lock three or four times
-            // per packet, and the UI thread reads it every frame; the contention
-            // was itself a source of jitter. `ViewStats` still records the
-            // session-long numbers the existing panels show.
-            metrics.packets.incr();
-            metrics.bytes.add(packet.payload.len() as u64);
-            if packet.header.payload_type == session::AUDIO_PT {
-                metrics.audio_packets.incr();
-                metrics.audio_bytes.add(packet.payload.len() as u64);
-                if let Ok(mut stats) = stats.lock() {
-                    stats.audio_packets += 1;
-                }
-                let Some(playback) = &audio_playback else {
-                    return;
-                };
-                let Ok(mut pipeline) = pipeline.lock() else {
-                    return;
-                };
-                let Some(decoder) = pipeline.audio_decoder.as_mut() else {
-                    return;
-                };
-                match decoder.decode(&packet.payload) {
-                    Ok(samples) => {
-                        playback.push(samples);
-                        metrics.audio_decoded.record();
-                        if let Ok(mut stats) = stats.lock() {
-                            stats.audio_decoded += 1;
-                        }
-                    }
-                    Err(error) => {
-                        metrics.audio_errors.incr();
-                        if let Ok(mut stats) = stats.lock() {
-                            if stats.audio_error.is_none() {
-                                stats.audio_error = Some(error);
-                            }
-                            stats.audio_errors += 1;
-                        }
-                    }
-                }
-                return;
-            }
-            {
-                let Ok(mut stats) = stats.lock() else {
-                    return;
-                };
-                stats.packets += 1;
-                stats.bytes += packet.payload.len() as u64;
-                let seq = packet.header.sequence_number;
-                match stats.highest_seq {
-                    None => {
-                        stats.base_seq = Some(seq);
-                        stats.highest_seq = Some(seq);
-                    }
-                    Some(highest) => {
-                        if seq != highest && seq.wrapping_sub(highest) < 0x8000 {
-                            let gap = seq.wrapping_sub(highest) as u64 - 1;
-                            stats.lost += gap;
-                            // A gap here means the packet never arrived, and with
-                            // no retransmission buffer in the transport the frame
-                            // it belonged to is unrecoverable. This is the number
-                            // that explains a stalled viewer.
-                            metrics.sequence_losses.add(gap);
-                            stats.highest_seq = Some(seq);
-                        }
-                    }
-                }
-            }
-            let Ok(mut pipeline) = pipeline.lock() else {
-                return;
-            };
-            let nalus = {
-                let _depacketize = StageTimer::new(&metrics.depacketize);
-                pipeline.depacketizer.push(packet)
-            };
-            let Some(nalus) = nalus else {
-                return;
-            };
-            metrics.access_units.incr();
-            if let Ok(mut stats) = stats.lock() {
-                stats.aus += 1;
-            }
-            let Some(decoder) = pipeline.decoder.as_mut() else {
-                return;
-            };
-            let access_unit = h264::access_unit_to_annexb(&nalus);
-            match decoder.decode(&access_unit, &metrics) {
-                Ok(Some(frame)) => {
-                    if let Ok(mut stats) = stats.lock() {
-                        if stats.first_width == 0 {
-                            stats.first_width = frame.width;
-                            stats.first_height = frame.height;
-                        }
-                        stats.decoded += 1;
-                    }
-                    // Only the newest frame matters. If the UI has not consumed
-                    // the previous one, it is stale by definition, so replacing
-                    // it is the correct behaviour and the drop is counted so the
-                    // present rate can be compared against the decode rate.
-                    if let Ok(mut slot) = latest.lock() {
-                        if slot.is_some() {
-                            metrics.presented.drop_frame();
-                        } else {
-                            metrics.presented.record();
-                        }
-                        *slot = Some(frame);
-                    }
-                }
-                Ok(None) => {
-                    metrics.no_picture.incr();
-                    if let Ok(mut stats) = stats.lock() {
-                        stats.decode_none += 1;
-                    }
-                }
-                Err(error) => {
-                    // The decoder lost sync (e.g. a keyframe was lost): drop
-                    // everything until the next keyframe rather than feeding
-                    // it error-prone frames; the depacketizer's sync gate
-                    // handles that once reset.
-                    pipeline.depacketizer.reset();
-                    metrics.decode_errors.incr();
-                    if let Ok(mut stats) = stats.lock() {
-                        if stats.first_error.is_none() {
-                            stats.first_error = Some(error);
-                        }
-                        stats.decode_errors += 1;
-                    }
-                }
-            }
-        }
-    }
-
     fn poll_capture(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let interval = self.frame_interval();
@@ -2326,11 +2159,15 @@ impl ArgosApp {
         if self.view.is_none() {
             return;
         }
-        let snapshot = self.view.as_mut().and_then(|view| {
-            view.stats
-                .lock()
-                .ok()
-                .map(|s| (s.packets, s.decoded, s.bytes, s.lost, s.audio_packets))
+        let snapshot = self.view.as_ref().map(|view| {
+            let m = &view.metrics;
+            (
+                m.packets.get(),
+                m.decoded.frames(),
+                m.bytes.get(),
+                m.sequence_losses.get(),
+                m.audio_packets.get(),
+            )
         });
         {
             let Some(view) = self.view.as_mut() else {
@@ -3173,38 +3010,41 @@ impl ArgosApp {
             egui::CollapsingHeader::new("Diagnostics")
                 .default_open(false)
                 .show(ui, |ui| {
-                    if let Ok(stats) = view.stats.lock() {
-                        ui.label(format!(
-                            "Video: {} packets, {} frames assembled, {} decoded (first {}x{}), {} no-picture, {} decode errors",
-                            stats.packets,
-                            stats.aus,
-                            stats.decoded,
-                            stats.first_width,
-                            stats.first_height,
-                            stats.decode_none,
-                            stats.decode_errors
-                        ));
-                        if let Some(first_error) = &stats.first_error {
+                    let m = &view.metrics;
+                    ui.label(format!(
+                        "Video: {} packets, {} frames assembled, {} decoded (first {}x{}), {} no-picture, {} decode errors",
+                        m.packets.get(),
+                        m.access_units.get(),
+                        m.decoded.frames(),
+                        m.first_width.get(),
+                        m.first_height.get(),
+                        m.no_picture.get(),
+                        m.decode_errors.get()
+                    ));
+                    if let Ok(sink) = view.sink.lock() {
+                        if let Some(first_error) = sink.first_video_error() {
                             ui.label(
                                 RichText::new(format!("First decode error: {first_error}"))
                                     .color(Color32::from_rgb(220, 120, 120)),
                             );
                         }
-                        // "on" must mean the speaker is actually being driven. Presence of the
-                        // object only means the thread was started, which is how
-                        // a dead audio thread used to look healthy.
-                        let playing = view
-                            .audio_playback
-                            .as_ref()
-                            .is_some_and(|playback| playback.is_alive());
-                        ui.label(format!(
-                            "Audio ({}): {} packets, {} decoded, {} errors",
-                            if playing { "on" } else { "off" },
-                            stats.audio_packets,
-                            stats.audio_decoded,
-                            stats.audio_errors
-                        ));
-                        if let Some(error) = &stats.audio_error {
+                    }
+                    // "on" must mean the speaker is actually being driven. Presence of the
+                    // object only means the thread was started, which is how
+                    // a dead audio thread used to look healthy.
+                    let playing = view
+                        .audio_playback
+                        .as_ref()
+                        .is_some_and(|playback| playback.is_alive());
+                    ui.label(format!(
+                        "Audio ({}): {} packets, {} decoded, {} errors",
+                        if playing { "on" } else { "off" },
+                        m.audio_packets.get(),
+                        m.audio_decoded.frames(),
+                        m.audio_errors.get()
+                    ));
+                    if let Ok(sink) = view.sink.lock() {
+                        if let Some(error) = sink.first_audio_error() {
                             ui.label(
                                 RichText::new(format!("First audio error: {error}"))
                                     .color(Color32::from_rgb(220, 120, 120)),
@@ -3228,7 +3068,7 @@ impl ArgosApp {
                     .display_aspect
                     .unwrap_or(preview.width as f32 / preview.height as f32);
                 Self::render_image(ui, preview, aspect, VIEWER_IMAGE_CAP);
-            } else if view.stats.lock().map(|s| s.packets).unwrap_or(0) > 0 {
+            } else if view.metrics.packets.get() > 0 {
                 ui.label(
                     RichText::new("Receiving stream data but no decoded picture yet…")
                         .color(Color32::from_rgb(220, 200, 120)),
@@ -3903,6 +3743,8 @@ impl ArgosApp {
             &metrics.access_units,
             &metrics.no_picture,
             &metrics.decode_errors,
+            &metrics.first_width,
+            &metrics.first_height,
         ] {
             counter.reset();
         }

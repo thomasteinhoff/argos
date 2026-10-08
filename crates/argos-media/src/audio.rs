@@ -466,12 +466,12 @@ impl Drop for AudioCapture {
 /// `AudioState` needs for worker *death*. A sender failure is a bad encode or a
 /// blocked write — transient — and the first one is the informative one.
 #[derive(Default)]
-struct FirstError {
+pub(crate) struct FirstError {
     slot: Mutex<Option<String>>,
 }
 
 impl FirstError {
-    fn set(&self, message: String) {
+    pub(crate) fn set(&self, message: String) {
         if let Ok(mut slot) = self.slot.lock() {
             if slot.is_none() {
                 *slot = Some(message);
@@ -481,6 +481,11 @@ impl FirstError {
 
     fn take(&self) -> Option<String> {
         self.slot.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Read without clearing: session-long state shown for as long as it holds.
+    pub(crate) fn peek(&self) -> Option<String> {
+        self.slot.lock().ok().and_then(|slot| slot.clone())
     }
 }
 

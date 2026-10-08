@@ -360,6 +360,13 @@ pub struct ReceiverMetrics {
     pub access_units: Counter,
     /// Frames the decoder produced.
     pub decoded: DropCounter,
+    /// Dimensions of the first decoded frame, for the diagnostics panel.
+    ///
+    /// The sharer can drop its resolution mid-stream; this is the shape the
+    /// session *started* with. Written once by the receive sink, read by the
+    /// UI.
+    pub first_width: Counter,
+    pub first_height: Counter,
     /// Decode calls that returned no picture.
     pub no_picture: Counter,
     /// Decode errors; each one means waiting for the next keyframe.

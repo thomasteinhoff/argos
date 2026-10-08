@@ -60,6 +60,9 @@ fn every_kind_reaches_its_handler() {
         over_the_wire("answer"),
         Some(LanEvent::Answer { .. })
     ));
+    // Sent just before a viewer's hard exit, so the sharer frees its slot
+    // instead of counting a ghost forever.
+    assert!(matches!(over_the_wire("bye"), Some(LanEvent::Bye { .. })));
     // The two that carry recovery. Without these two the viewer is stuck
     // waiting for an intra frame that will only arrive on the 4 s backstop,
     // and the sharer never learns what its link looks like.

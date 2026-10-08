@@ -361,8 +361,8 @@ enum ConnectStep {
 /// or fifteen seconds of real time.
 ///
 /// This exists because the sharer cannot report a failed connect. Its message
-/// kinds are request, offer, answer, report, roster and keyframe — none of which
-/// means "I could not connect you" — so when its ICE gather fails, or the
+/// kinds are request, offer, answer, bye, report, roster and keyframe — none of
+/// which means "I could not connect you" — so when its ICE gather fails, or the
 /// request datagram is lost, the viewer is told nothing at all and waits
 /// indefinitely on a spinner.
 fn connect_step(since: Instant, sent: Instant, now: Instant) -> ConnectStep {
@@ -1599,6 +1599,18 @@ impl ArgosApp {
         // Only reached if the copy above actually started. A failure returns
         // instead, so the user is left in a working app with an explanation
         // rather than in no app at all.
+        //
+        // Tell the sharer we are leaving before the hard exit. Nothing else
+        // does: `process::exit` closes no sockets cleanly, so the sharer's
+        // dead-peer detection never fires and the old copy would keep counting
+        // as a viewer — and swallow the new copy's reconnect — until an ICE
+        // timeout nobody has measured. The bye is a directed UDP datagram,
+        // already handed to the OS by the time we exit.
+        if let (Some(lan), Some(view)) = (self.lan.as_ref(), self.view.as_ref()) {
+            if let Some(sharer) = view.sharer_id.as_deref() {
+                lan.send_bye(sharer);
+            }
+        }
         std::process::exit(0);
     }
 
@@ -1681,6 +1693,22 @@ impl ArgosApp {
                         }
                     }
                 }
+                lan::LanEvent::Bye { id } => {
+                    // A viewer announcing it is leaving, normally because it is
+                    // restarting: that path hard-exits, so the transport can
+                    // never notice on its own and the stale slot would count
+                    // against the share (and eat the new copy's reconnect) until
+                    // an ICE timeout nobody has measured. Unlike the prune
+                    // sweep, no grace period — the message is authoritative,
+                    // not an inference from silence.
+                    let Some(share) = self.share.as_mut() else {
+                        continue;
+                    };
+                    if share.viewers.iter().any(|slot| slot.id == id) {
+                        session::block_on(share.sharer.remove_viewer(&id));
+                        share.viewers.retain(|slot| slot.id != id);
+                    }
+                }
                 lan::LanEvent::Keyframe { id } => {
                     let now = Instant::now();
                     let Some(share) = self.share.as_mut() else {
@@ -1750,8 +1778,8 @@ impl ArgosApp {
     /// Repeats a waiting request, and gives up on one that has waited long enough.
     ///
     /// The sharer has no message that means "I could not connect you" — its kinds
-    /// are request, offer, answer, report, roster and keyframe — so a failed ICE
-    /// gather, or a request datagram lost to a network that drops them, is
+    /// are request, offer, answer, bye, report, roster and keyframe — so a failed
+    /// ICE gather, or a request datagram lost to a network that drops them, is
     /// indistinguishable from a sharer that is not listening. Both left the
     /// viewer on "Connecting…" with no way out but picking something else.
     fn drive_pending_view(&mut self) {

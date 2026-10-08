@@ -39,6 +39,16 @@ pub enum LanEvent {
         id: String,
         sdp: String,
     },
+    /// A viewer announcing it is leaving, sent just before its process exits.
+    ///
+    /// Nothing else tells the sharer a peer is gone: a hard exit closes no
+    /// sockets cleanly, so the transport's dead-peer detection never fires and
+    /// the old viewer would count against the sharer — and eat a restart's
+    /// reconnect — until some ICE timeout nobody has measured. The message is
+    /// authoritative, unlike the silence the sharer's prune sweep infers from.
+    Bye {
+        id: String,
+    },
     /// The viewer lost packets and needs a fresh intra frame.
     ///
     /// The rtc transport offers no way to ask for this: both codecs negotiate
@@ -352,6 +362,17 @@ impl Lan {
         self.send_to_peer(id, message);
     }
 
+    /// Announces to a sharer that this viewer is leaving, just before it exits.
+    ///
+    /// Best-effort and deliberately the last thing sent: there is no comeback
+    /// path, because the sending process is about to die either way. The sharer
+    /// frees the viewer's slot immediately rather than waiting on dead-peer
+    /// detection that a hard exit never triggers.
+    pub fn send_bye(&self, id: &str) {
+        let message = self.message("bye", id);
+        self.send_to_peer(id, message);
+    }
+
     /// Asks a sharer for an immediate intra frame.
     ///
     /// Best-effort. UDP, and the request is only useful while the sharer is
@@ -574,6 +595,7 @@ fn dispatch(message: Message) -> Option<LanEvent> {
             id: message.id,
             sdp: message.sdp,
         }),
+        "bye" => Some(LanEvent::Bye { id: message.id }),
         "keyframe" => Some(LanEvent::Keyframe { id: message.id }),
         "report" => {
             // A datagram whose measurements are absent rather than zero

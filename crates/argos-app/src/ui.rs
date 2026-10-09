@@ -53,6 +53,58 @@ const VIEWER_REPORT_TTL: Duration = Duration::from_secs(3);
 /// anything.
 const VIEWER_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The visible language of the app, in one place.
+///
+/// Argos is a screen-watching tool for a trusted network: it runs dark, in a
+/// corner, while the real work happens elsewhere. The palette is that brief —
+/// quiet graphite surfaces so the single loud thing, whether a friend is
+/// *live*, is unmissable. Every status color used to live as a bare
+/// `Color32::from_rgb` at its own call site; they live here now, so the app's
+/// voice is one statement rather than thirty-seven.
+mod theme {
+    use eframe::egui::{self, Color32, Visuals};
+
+    /// Panel background — a graphite near-black, deliberately not pure black.
+    pub const BG: Color32 = Color32::from_rgb(20, 22, 25);
+    /// Floating or emphasised panels: windows, the sidebar.
+    pub const SURFACE: Color32 = Color32::from_rgb(28, 31, 36);
+    /// Hairlines between sections of a dark surface.
+    pub const BORDER: Color32 = Color32::from_rgb(42, 46, 53);
+    /// Secondary text: anything that must hold still while status changes.
+    pub const MUTED: Color32 = Color32::from_rgb(138, 145, 156);
+    /// The brand — a watch blue, this app's own identity.
+    pub const ACCENT: Color32 = Color32::from_rgb(160, 190, 255);
+    /// A peer is live and watching.
+    pub const OK: Color32 = Color32::from_rgb(150, 220, 150);
+    /// Something is being waited on.
+    pub const WARN: Color32 = Color32::from_rgb(220, 200, 120);
+    /// Something is wrong.
+    pub const ERR: Color32 = Color32::from_rgb(220, 120, 120);
+
+    /// Installs the palette into egui's global visuals.
+    ///
+    /// Text follows egui's dark defaults — the palette only moves surfaces and
+    /// status — so `.weak()` and friends keep their meaning.
+    pub fn apply(ctx: &egui::Context) {
+        let mut visuals = Visuals::dark();
+        visuals.panel_fill = BG;
+        visuals.window_fill = SURFACE;
+        visuals.extreme_bg_color = Color32::from_rgb(13, 14, 16);
+        visuals.faint_bg_color = Color32::from_rgb(23, 26, 30);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 38, 44);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(35, 38, 44);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 52, 60);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(56, 61, 70);
+        // Any hairline egui draws — separators, widget outlines — is the palette's
+        // BORDER, not the default dark-theme grey.
+        visuals.widgets.noninteractive.bg_stroke.color = BORDER;
+        visuals.widgets.noninteractive.fg_stroke.color = BORDER;
+        visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
+        visuals.hyperlink_color = ACCENT;
+        ctx.set_visuals(visuals);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum Screen {
     Home,
@@ -158,11 +210,10 @@ impl ViewerSlot {
                 self.label(),
                 now.duration_since(self.offered).as_secs()
             ))
-            .color(Color32::from_rgb(220, 200, 120));
+            .color(theme::WARN);
         }
         if !fresh {
-            return RichText::new(format!("{}: not reporting", self.label()))
-                .color(Color32::from_rgb(220, 200, 120));
+            return RichText::new(format!("{}: not reporting", self.label())).color(theme::WARN);
         }
         let verdict = diagnose(&self.diag, self.loss, source_fps);
         let numbers = format!("{:.0} fps, {:.1}% loss", self.fps, self.loss);
@@ -177,7 +228,7 @@ impl ViewerSlot {
             // Anything that is not "ok" is worth interrupting a list for. The
             // whole reason these numbers cross the network is that one person
             // said their stream was stuttering and the sharer could not see it.
-            RichText::new(text).color(Color32::from_rgb(220, 200, 120))
+            RichText::new(text).color(theme::WARN)
         }
     }
 }
@@ -874,7 +925,7 @@ fn viewer_list(
         // stops being true and reads as fact.
         ui.label(
             RichText::new(format!("{summary} · list may be out of date"))
-                .color(with_alpha(Color32::from_rgb(220, 200, 120), alpha)),
+                .color(with_alpha(theme::WARN, alpha)),
         );
     } else {
         ui.label(RichText::new(summary).weak());
@@ -887,9 +938,9 @@ fn viewer_list(
             entry.label().to_string()
         };
         let state = if entry.connected {
-            RichText::new("watching").color(with_alpha(Color32::from_rgb(150, 220, 150), alpha))
+            RichText::new("watching").color(with_alpha(theme::OK, alpha))
         } else {
-            RichText::new("connecting…").color(with_alpha(Color32::from_rgb(220, 200, 120), alpha))
+            RichText::new("connecting…").color(with_alpha(theme::WARN, alpha))
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).strong());
@@ -1028,9 +1079,7 @@ impl ArgosApp {
                 }
                 ui.separator();
                 if ui
-                    .button(
-                        RichText::new(self.profile_label()).color(Color32::from_rgb(160, 190, 255)),
-                    )
+                    .button(RichText::new(self.profile_label()).color(theme::ACCENT))
                     .on_hover_text("Your name, as friends will see it")
                     .clicked()
                 {
@@ -1038,7 +1087,7 @@ impl ArgosApp {
                     self.show_settings = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(self.status_text()).color(Color32::GRAY));
+                    ui.label(RichText::new(self.status_text()).color(theme::MUTED));
                 });
             });
         });
@@ -1082,7 +1131,7 @@ impl ArgosApp {
                 );
                 ui.add_space(8.0);
                 if let Some(error) = &self.settings_error {
-                    ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                    ui.label(RichText::new(error).color(theme::ERR));
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -2222,7 +2271,7 @@ impl ArgosApp {
             None => {
                 ui.label(
                     RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
-                        .color(Color32::from_rgb(220, 200, 120)),
+                        .color(theme::WARN),
                 );
                 if self.radmin_exe.is_some() {
                     if ui.button("Launch Radmin VPN").clicked() {
@@ -2234,7 +2283,7 @@ impl ArgosApp {
                     );
                 }
                 if let Some(error) = &self.radmin_error {
-                    ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                    ui.label(RichText::new(error).color(theme::ERR));
                 }
             }
         }
@@ -2253,13 +2302,13 @@ impl ArgosApp {
     fn quality_line(ui: &mut egui::Ui, view: &ViewSession) {
         let quality = &view.quality;
         let color = if quality.mbps <= 0.0 {
-            Color32::GRAY
+            theme::MUTED
         } else if quality.loss > 5.0 || quality.fps < 15.0 {
-            Color32::from_rgb(220, 120, 120)
+            theme::ERR
         } else if quality.loss > 1.0 || quality.fps < 24.0 {
-            Color32::from_rgb(220, 200, 120)
+            theme::WARN
         } else {
-            Color32::from_rgb(150, 220, 150)
+            theme::OK
         };
         let resolution = view
             .texture
@@ -2285,7 +2334,7 @@ impl ArgosApp {
                         "Requesting keyframes from {peer} — {:.1}% loss",
                         quality.loss
                     ))
-                    .color(Color32::from_rgb(220, 200, 120)),
+                    .color(theme::WARN),
                 );
             } else if view.quality.recoveries > 0 && since < Duration::from_secs(10) {
                 ui.label(
@@ -2307,7 +2356,7 @@ impl ArgosApp {
         }
         if self.monitors.is_empty() {
             ui.heading("Share");
-            ui.label(RichText::new("No monitor found").color(Color32::from_rgb(220, 120, 120)));
+            ui.label(RichText::new("No monitor found").color(theme::ERR));
             return;
         }
 
@@ -2379,7 +2428,7 @@ impl ArgosApp {
                         share.quality.smoothed_loss(),
                         share.quality.smoothed_drops()
                     ))
-                    .color(Color32::from_rgb(220, 200, 120)),
+                    .color(theme::WARN),
                 );
                 if let Some(reason) = &share.quality_note {
                     ui.label(RichText::new(reason).weak());
@@ -2456,7 +2505,7 @@ impl ArgosApp {
             do_preview = true;
         }
         if let Some(error) = &self.preview_error {
-            ui.label(RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)));
+            ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
 
         ui.add_space(6.0);
@@ -2477,16 +2526,16 @@ impl ArgosApp {
             {
                 ui.label(RichText::new(audio_label).weak());
             } else {
-                ui.label(RichText::new(audio_label).color(Color32::from_rgb(220, 200, 120)));
+                ui.label(RichText::new(audio_label).color(theme::WARN));
             }
             if let Some(notice) = &share.audio_notice {
                 ui.label(RichText::new(notice).weak());
             }
             if let Some(error) = &share.audio_error {
-                ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                ui.label(RichText::new(error).color(theme::ERR));
             }
             if let Some(error) = &share.error {
-                ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                ui.label(RichText::new(error).color(theme::ERR));
             }
             // Who is actually watching. With one stream going to several people
             // this is the only place a viewer count exists, and it is what tells
@@ -2505,13 +2554,10 @@ impl ArgosApp {
                 ui.label(line);
             }
         } else if self.live {
-            ui.label(
-                RichText::new("Waiting for someone to join…")
-                    .color(Color32::from_rgb(150, 220, 150)),
-            );
+            ui.label(RichText::new("Waiting for someone to join…").color(theme::OK));
         }
         if let Some(error) = &self.share_error {
-            ui.label(RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)));
+            ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
 
         ui.add_space(8.0);
@@ -2570,6 +2616,20 @@ impl ArgosApp {
 
                 for peer in &peers {
                     ui.horizontal(|ui| {
+                        // The app's one loud element: a filled dot for a live
+                        // peer, an open ring for someone present but not
+                        // sharing. Everything after it stays quiet.
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+                        if peer.sharing {
+                            ui.painter().circle_filled(dot.center(), 3.0_f32, theme::OK);
+                        } else {
+                            ui.painter().circle_stroke(
+                                dot.center(),
+                                3.0_f32,
+                                egui::Stroke::new(1.0_f32, theme::MUTED),
+                            );
+                        }
                         if peer.sharing {
                             let selected =
                                 matches!(&self.screen, Screen::Peer(id) if id == &peer.id);
@@ -2582,20 +2642,17 @@ impl ArgosApp {
                             {
                                 self.screen = Screen::Peer(peer.id.clone());
                             }
-                            ui.label(RichText::new("Live").color(Color32::from_rgb(150, 220, 150)));
                         } else {
-                            ui.label(RichText::new(&peer.name).color(Color32::GRAY));
+                            ui.label(RichText::new(&peer.name).color(theme::MUTED));
                         }
                     });
                 }
 
                 if self.pending_view.is_some() {
-                    ui.label(RichText::new("Connecting…").color(Color32::from_rgb(220, 200, 120)));
+                    ui.label(RichText::new("Connecting…").color(theme::WARN));
                 }
                 if let Some(error) = &self.view_error {
-                    ui.label(
-                        RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)),
-                    );
+                    ui.label(RichText::new(error.to_string()).color(theme::ERR));
                 }
                 // Reported here as well as in the Watching panel: a viewer whose
                 // speaker died during setup never reaches that panel, and an
@@ -2603,8 +2660,7 @@ impl ArgosApp {
                 if let Some(view) = self.view.as_ref() {
                     if let Some(error) = &view.audio_error {
                         ui.label(
-                            RichText::new(format!("Audio unavailable: {error}"))
-                                .color(Color32::from_rgb(220, 120, 120)),
+                            RichText::new(format!("Audio unavailable: {error}")).color(theme::ERR),
                         );
                     }
                 }
@@ -2692,7 +2748,7 @@ impl ArgosApp {
                             }
                         }
                         if let Some(error) = &self.restart_error {
-                            ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                            ui.label(RichText::new(error).color(theme::ERR));
                         }
                     });
             });
@@ -2737,12 +2793,12 @@ impl ArgosApp {
         ui.heading(&name);
         let pending = self.pending_view.as_ref().is_some_and(|p| p.id == id);
         if pending {
-            ui.label(RichText::new("Connecting…").color(Color32::from_rgb(220, 200, 120)));
+            ui.label(RichText::new("Connecting…").color(theme::WARN));
         } else {
             ui.label(RichText::new("Not watching yet.").weak());
         }
         if let Some(error) = &self.view_error {
-            ui.label(RichText::new(error.to_string()).color(Color32::from_rgb(220, 120, 120)));
+            ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
         ui.add_space(8.0);
 
@@ -2821,8 +2877,7 @@ impl ArgosApp {
                 // for it.
                 if !playback.is_alive() {
                     ui.label(
-                        RichText::new("Audio: reconnecting to the speaker")
-                            .color(Color32::from_rgb(220, 200, 120)),
+                        RichText::new("Audio: reconnecting to the speaker").color(theme::WARN),
                     );
                 }
                 if let Some(error) = playback.try_error() {
@@ -2832,10 +2887,7 @@ impl ArgosApp {
                 }
             }
             if view.reconnect.is_some() {
-                ui.label(
-                    RichText::new("Connection lost — reconnecting…")
-                        .color(Color32::from_rgb(220, 200, 120)),
-                );
+                ui.label(RichText::new("Connection lost — reconnecting…").color(theme::WARN));
             }
             egui::CollapsingHeader::new("Diagnostics")
                 .default_open(false)
@@ -2855,7 +2907,7 @@ impl ArgosApp {
                         if let Some(first_error) = sink.first_video_error() {
                             ui.label(
                                 RichText::new(format!("First decode error: {first_error}"))
-                                    .color(Color32::from_rgb(220, 120, 120)),
+                                    .color(theme::ERR),
                             );
                         }
                     }
@@ -2877,19 +2929,19 @@ impl ArgosApp {
                         if let Some(error) = sink.first_audio_error() {
                             ui.label(
                                 RichText::new(format!("First audio error: {error}"))
-                                    .color(Color32::from_rgb(220, 120, 120)),
+                                    .color(theme::ERR),
                             );
                         }
                     }
                     if let Some(error) = &view.audio_error {
                         ui.label(
                             RichText::new(format!("Audio unavailable: {error}"))
-                                .color(Color32::from_rgb(220, 120, 120)),
+                                .color(theme::ERR),
                         );
                     }
                 });
             if let Some(error) = &view.error {
-                ui.label(RichText::new(error).color(Color32::from_rgb(220, 120, 120)));
+                ui.label(RichText::new(error).color(theme::ERR));
             }
             ui.add_space(8.0);
             if let Some(preview) = &view.texture {
@@ -2901,10 +2953,10 @@ impl ArgosApp {
             } else if view.metrics.packets.get() > 0 {
                 ui.label(
                     RichText::new("Receiving stream data but no decoded picture yet…")
-                        .color(Color32::from_rgb(220, 200, 120)),
+                        .color(theme::WARN),
                 );
             } else {
-                ui.label(RichText::new("Waiting for stream data…").color(Color32::GRAY));
+                ui.label(RichText::new("Waiting for stream data…").color(theme::MUTED));
             }
             // Who else is watching, and what this end measured. Under the picture
             // rather than above it, because the picture is the point and both of
@@ -2921,7 +2973,7 @@ impl ArgosApp {
             if verdict == Bottleneck::Ok {
                 ui.label(RichText::new(verdict_text).weak());
             } else {
-                ui.label(RichText::new(verdict_text).color(Color32::from_rgb(220, 200, 120)));
+                ui.label(RichText::new(verdict_text).color(theme::WARN));
             }
             ui.add_space(8.0);
             if ui.button("Stop watching").clicked() {
@@ -2987,7 +3039,7 @@ impl ArgosApp {
                     );
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Waiting for the stream…").color(Color32::GRAY));
+                        ui.label(RichText::new("Waiting for the stream…").color(theme::MUTED));
                     });
                 }
             });
@@ -3699,7 +3751,7 @@ impl eframe::App for ArgosApp {
         if ctx.input(|input| fullscreen_key(input, fullscreen)) {
             self.set_fullscreen(ctx, !fullscreen);
         }
-        ctx.set_visuals(egui::Visuals::dark());
+        theme::apply(ctx);
         self.poll_lan_events();
         // Read after the events, because an event can finish the session the
         // fullscreen flag belonged to.

@@ -26,38 +26,11 @@ impl H264Encoder {
     }
 
     pub fn new_at(fps: f32) -> Result<Self, String> {
-        // Sane bitrate targets for desktop screen content at the stream
-        // quality (720p by default). 30-60 Mbps is far beyond useful for
-        // screen sharing: it makes the software encoder frame-bound (the fps
-        // collapses) and floods the network with tens of thousands of RTP
-        // packets per second, which drops keyframes on WiFi and desyncs the
-        // receiver's decoder.
-        let (fps, bitrate) = if fps >= 45.0 {
-            (60.0, 6_000_000)
-        } else {
-            (30.0, 4_000_000)
-        };
-        let config = EncoderConfig::new()
-            // Screen content, not camera video. OpenH264 has a separate rate
-            // control path for it, and it is the right one here: screen frames
-            // are mostly flat areas and sharp text, where the camera-tuned
-            // quantiser spends bits on detail the eye resolves and starves the
-            // edges that are actually readable. It also holds a still screen at a
-            // far smaller frame, which matters when the same desktop is on screen
-            // for minutes at a time.
-            //
-            // Nothing downstream depends on which of the two was chosen — the
-            // packetizer and the quality ladder both work from whatever comes out
-            // — so this changes picture quality and bitrate, not correctness.
-            .usage_type(UsageType::ScreenContentRealTime)
-            .bitrate(BitRate::from_bps(bitrate))
-            .max_frame_rate(FrameRate::from_hz(fps))
-            .complexity(Complexity::Low)
-            .skip_frames(false)
-            .scene_change_detect(false)
-            .adaptive_quantization(false);
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(|error| error.to_string())?;
+        let encoder = Encoder::with_api_config(
+            OpenH264API::from_source(),
+            encoder_config(UsageType::CameraVideoRealTime, fps, 0),
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             encoder,
             planes: Vec::new(),
@@ -143,6 +116,55 @@ impl H264Encoder {
     pub fn force_keyframe(&mut self) {
         self.encoder.force_intra_frame();
     }
+}
+
+/// Encoder configuration, shared by the production encoder and the preset
+/// benchmark so a knob the bench measures is the knob the pipeline uses.
+///
+/// `threads` is passed straight to OpenH264: 0 is auto (default), >1 pins a
+/// fixed count. The preset is the only argument that changes behaviour; the
+/// bitrate/fps budget is repicked internally from `fps` exactly as before.
+pub fn encoder_config(usage: UsageType, fps: f32, threads: u16) -> EncoderConfig {
+    // Sane bitrate targets for desktop screen content at the stream
+    // quality (720p by default). 30-60 Mbps is far beyond useful for
+    // screen sharing: it makes the software encoder frame-bound (the fps
+    // collapses) and floods the network with tens of thousands of RTP
+    // packets per second, which drops keyframes on WiFi and desyncs the
+    // receiver's decoder.
+    let (fps, bitrate) = if fps >= 45.0 {
+        (60.0, 6_000_000)
+    } else {
+        (30.0, 4_000_000)
+    };
+    EncoderConfig::new()
+        // Camera video tuning, not screen content, is what OpenH264 encodes
+        // fastest on this shape of input. Chosen on a measured comparison
+        // (`encoder_preset_bench`, synthetic 1080p desktop frame):
+        //
+        //   preset              720p   360p  1080p  IDR@360p
+        //   ScreenContentReal   22.9ms 5.9ms 58.5ms 20.6ms
+        //   CameraVideoReal      5.4ms 1.5ms 28.3ms 13.2ms
+        //
+        // The screen-content rate control costs ~4x on every rung, which is the
+        // cost that forces the quality ladder down (its "encoder cannot keep
+        // up" path) and fills the handoff queue. At the ladder's resting rung
+        // the 22.5ms the Pipeline readout showed was mostly the descent phase,
+        // this preset at 360p is ~1.5ms.
+        //
+        // The trade is the one screen-content mode buys at that price: it holds
+        // a still screen on a smaller frame and spends its bits on the edges of
+        // text rather than the flat fields between them. Both matter less than
+        // the fps win — the ladder now holds a higher rung, which is more
+        // readable than a sharper-but-smaller one — and this is precisely the
+        // one-line choice to revisit if text comes out blocky on a fresh build.
+        .usage_type(usage)
+        .bitrate(BitRate::from_bps(bitrate))
+        .max_frame_rate(FrameRate::from_hz(fps))
+        .complexity(Complexity::Low)
+        .skip_frames(false)
+        .scene_change_detect(false)
+        .adaptive_quantization(false)
+        .num_threads(threads)
 }
 
 pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, planes: &mut Vec<u8>) {
@@ -568,6 +590,127 @@ mod tests {
                     "luma mismatch at {dst_x},{dst_y}: {actual} vs {expected}"
                 );
             }
+        }
+    }
+
+    /// Times the encoder across preset/thread combinations on a synthetic
+    /// screen-content frame, so the FPS work picks its knob on measured cost.
+    ///
+    /// Not a pass/fail test; prints a table. Run explicitly in release mode —
+    /// debug builds put the encoder itself in a wooden spoon:
+    ///
+    /// ```text
+    /// cargo test -p argos-media --release -- --ignored --nocapture encoder_preset_bench
+    /// ```
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --release"]
+    fn encoder_preset_bench() {
+        use super::{encoder_config, rgba_to_i420_scaled, H264Encoder};
+        use openh264::encoder::{Encoder, UsageType};
+        use openh264::formats::YUVSlices;
+        use openh264::OpenH264API;
+
+        // A deterministic stand-in for a real desktop: flat grey background,
+        // sharp horizontal bars and a fine checkerboard — text is roughly that.
+        let (src_w, src_h) = (1920usize, 1080usize);
+        let mut rgba = vec![85u8; src_w * src_h * 4];
+        for base in (0..rgba.len()).step_by(4) {
+            let i = base / 4;
+            let x = (i % src_w) as i32;
+            let y = (i / src_w) as i32;
+            let value = if x % 64 == 0 || y % 48 == 0 {
+                200
+            } else if (x / 8 + y / 8) % 2 == 0 {
+                60
+            } else {
+                140
+            };
+            for channel in &mut rgba[base..base + 4] {
+                *channel = value as u8;
+            }
+        }
+
+        fn encode_one(
+            encoder: &mut Encoder,
+            planes: &[u8],
+            width: usize,
+            height: usize,
+        ) -> std::time::Duration {
+            let y_len = width * height;
+            let uv_len = (width / 2) * (height / 2);
+            let yuv = YUVSlices::new(
+                (
+                    &planes[..y_len],
+                    &planes[y_len..y_len + uv_len],
+                    &planes[y_len + uv_len..],
+                ),
+                (width, height),
+                (width, width / 2, width / 2),
+            );
+            let started = std::time::Instant::now();
+            let _ = encoder.encode(&yuv).expect("encode failed");
+            started.elapsed()
+        }
+
+        fn planes_for(
+            rgba: &[u8],
+            src_w: usize,
+            src_h: usize,
+            target: Option<u32>,
+        ) -> (usize, usize, Vec<u8>) {
+            let (width, height) = H264Encoder::target_dims(src_w, src_h, target);
+            let mut planes = Vec::new();
+            if width == src_w && height == src_h {
+                rgba_to_i420(rgba, width, height, &mut planes);
+            } else {
+                rgba_to_i420_scaled(rgba, src_w, src_h, width, height, &mut planes);
+            }
+            (width, height, planes)
+        }
+
+        fn mean_ms(samples: &[std::time::Duration]) -> f32 {
+            samples.iter().map(|s| s.as_secs_f32() * 1e3).sum::<f32>() / samples.len() as f32
+        }
+
+        let labels = [
+            ("ScreenContent auto", UsageType::ScreenContentRealTime, 0),
+            ("ScreenContent t4  ", UsageType::ScreenContentRealTime, 4),
+            ("ScreenContent t8  ", UsageType::ScreenContentRealTime, 8),
+            ("Camera        auto", UsageType::CameraVideoRealTime, 0),
+            ("Camera        t4  ", UsageType::CameraVideoRealTime, 4),
+        ];
+        let targets = [(720u32, Some(720)), (360, Some(360)), (1080, None)];
+        println!("\npreset / threads      720p    360p  native   IDR@360p");
+        for (label, usage, threads) in labels {
+            let mut encoder = Encoder::with_api_config(
+                OpenH264API::from_source(),
+                encoder_config(usage, 60.0, threads),
+            )
+            .expect("encoder init failed");
+            // Warm up the rate-control and look-ahead state before measuring.
+            let warmup = planes_for(&rgba, src_w, src_h, Some(720));
+            for _ in 0..3 {
+                let _ = encode_one(&mut encoder, &warmup.2, warmup.0, warmup.1);
+            }
+            let mut row = [0.0f32; 4];
+            for (index, (_, target)) in targets.iter().enumerate() {
+                let (width, height, planes) = planes_for(&rgba, src_w, src_h, *target);
+                let samples = if target.is_some() { 30 } else { 10 };
+                let mut timed = Vec::with_capacity(samples);
+                for _ in 0..samples {
+                    timed.push(encode_one(&mut encoder, &planes, width, height));
+                }
+                row[index] = mean_ms(&timed);
+            }
+            // The one the Pipeline readout shows as a 390 ms peak: a forced
+            // intra frame at the ladder's resting resolution.
+            let (width, height, planes) = planes_for(&rgba, src_w, src_h, Some(360));
+            encoder.force_intra_frame();
+            row[3] = encode_one(&mut encoder, &planes, width, height).as_secs_f32() * 1e3;
+            println!(
+                "{label}  {:.1}  {:.1}  {:.1}  {:.1}",
+                row[0], row[1], row[2], row[3]
+            );
         }
     }
 }

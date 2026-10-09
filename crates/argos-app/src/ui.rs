@@ -70,8 +70,11 @@ mod theme {
     pub const SURFACE: Color32 = Color32::from_rgb(28, 31, 36);
     /// Hairlines between sections of a dark surface.
     pub const BORDER: Color32 = Color32::from_rgb(42, 46, 53);
+    /// Primary text. Contrast on `BG`: ~16:1.
+    pub const TEXT: Color32 = Color32::from_rgb(232, 234, 237);
     /// Secondary text: anything that must hold still while status changes.
-    pub const MUTED: Color32 = Color32::from_rgb(138, 145, 156);
+    /// Contrast on `BG`: ~5.6:1.
+    pub const MUTED: Color32 = Color32::from_rgb(150, 156, 166);
     /// The brand — a watch blue, this app's own identity.
     pub const ACCENT: Color32 = Color32::from_rgb(160, 190, 255);
     /// A peer is live and watching.
@@ -98,7 +101,12 @@ mod theme {
         // Any hairline egui draws — separators, widget outlines — is the palette's
         // BORDER, not the default dark-theme grey.
         visuals.widgets.noninteractive.bg_stroke.color = BORDER;
-        visuals.widgets.noninteractive.fg_stroke.color = BORDER;
+        // Text is the one thing that must not blend into the graphite. egui
+        // colours non-interactive labels from `fg_stroke`, and the dark-theme
+        // default is grey-on-black: brighten it explicitly, and give the weak()
+        // tier a real colour rather than a default that was too dim to read.
+        visuals.widgets.noninteractive.fg_stroke.color = TEXT;
+        visuals.weak_text_color = Some(MUTED);
         visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
         visuals.hyperlink_color = ACCENT;
         ctx.set_visuals(visuals);
@@ -977,6 +985,8 @@ pub struct ArgosApp {
     /// "Reset" button so a mean covers a known span rather than the whole
     /// session, which is what makes an intermittent stall visible.
     metrics_since: Instant,
+    /// Why the last "Save file" in the pipeline readout failed, if it did.
+    metrics_error: Option<String>,
     name_input: String,
     code_input: String,
     monitors: Vec<MonitorInfo>,
@@ -1056,6 +1066,7 @@ impl ArgosApp {
             settings_error: None,
             show_metrics: false,
             metrics_since: Instant::now(),
+            metrics_error: None,
         }
     }
 
@@ -3205,6 +3216,34 @@ impl ArgosApp {
         );
     }
 
+    /// Appends the pipeline readout to `argos-pipeline.txt` next to the running
+    /// program.
+    ///
+    /// Path is derived from the executable rather than the working directory so
+    /// the file lands wherever the program lives, whatever directory it was
+    /// launched from. Append mode, so a measurement session accumulates
+    /// captures (each headed by a `capture #<epoch-seconds>` marker) instead of
+    /// overwriting the previous one.
+    /// Tiny by construction — the readout is a few dozen lines — so a write on
+    /// the UI thread is not worth a worker of its own.
+    fn append_pipeline_log(report: &str) -> Result<(), String> {
+        let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+        else {
+            return Err("could not locate the program to save next to it".to_string());
+        };
+        let path = dir.join("argos-pipeline.txt");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("could not open argos-pipeline.txt: {error}"))?
+            .write_all(report.as_bytes())
+            .map_err(|error| format!("could not write argos-pipeline.txt: {error}"))
+    }
+
     /// The always-visible pipeline readout (Ctrl+D).
     ///
     /// Deliberately a floating window rather than a section in the sidebar: it
@@ -3213,6 +3252,7 @@ impl ArgosApp {
     fn metrics_window(&mut self, ctx: &egui::Context) {
         let mut reset = false;
         let mut copy = false;
+        let mut save = false;
         let mut close = false;
         let window = egui::Window::new("Pipeline")
             .collapsible(false)
@@ -3234,10 +3274,22 @@ impl ArgosApp {
                     {
                         copy = true;
                     }
+                    if ui
+                        .small_button("Save")
+                        .on_hover_text(
+                            "Append the readout to argos-pipeline.txt next to this program",
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
                     if ui.small_button("Close").clicked() {
                         close = true;
                     }
                 });
+                if let Some(error) = &self.metrics_error {
+                    ui.label(RichText::new(error).color(theme::ERR));
+                }
                 ui.separator();
 
                 let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
@@ -3257,6 +3309,21 @@ impl ArgosApp {
             );
             Self::metrics_body(&mut report, self.share.as_ref(), self.view.as_ref(), secs);
             ctx.copy_text(report);
+        }
+        if save {
+            let secs = self.metrics_since.elapsed().as_secs_f32().max(0.001);
+            let mark = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut report = format!(
+                "\n=== capture #{mark} — window {secs:.1} s ===\n\
+                 (rates are per second over that window)\n"
+            );
+            Self::metrics_body(&mut report, self.share.as_ref(), self.view.as_ref(), secs);
+            self.metrics_error = Self::append_pipeline_log(&report)
+                .err()
+                .map(|e| e.to_string());
         }
         if reset {
             self.metrics_since = Instant::now();

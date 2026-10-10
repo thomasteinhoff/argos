@@ -230,6 +230,30 @@ pub fn rgba_to_i420_scaled(
     let (u, v) = rest.split_at_mut(uv_len);
     let half = dst_width / 2;
 
+    // Every output pixel averages a source box of `count` pixels; the
+    // division `sum / count` needs a reciprocal that depends only on `count`,
+    // which takes at most (x_ext * y_ext) distinct values for any scale.
+    // Building the table once per frame (one `div_ceil` per box size) takes
+    // the division out of the hot loop — the Pipeline readout showed the
+    // `convert` stage was mostly that cost (~9 ms clean, ~85 ms on a
+    // contended box). With `recip_c = ceil(2^24 / c)`, the product
+    // `sum * recip_c` lies in `[sum/c, sum/c + 0.01)` scaled by `2^24`
+    // (recip is at most one over the real reciprocal, and `sum <= 255*c`),
+    // so the shift floors to exactly `sum / c`.
+    //
+    // Each per-axis extent is at most ceil(src/dst) + 1 (a range
+    // `floor((d+1)*r) - floor(d*r)` never exceeds `floor(r) + 1`), so the
+    // table size is an airtight upper bound on `count`.
+    let max_count = {
+        let x_ext = src_width.div_ceil(dst_width) + 1;
+        let y_ext = src_height.div_ceil(dst_height) + 1;
+        x_ext * y_ext
+    };
+    let mut recip = vec![0u64; max_count + 1];
+    for (i, slot) in recip.iter_mut().enumerate().skip(1) {
+        *slot = (1u64 << 24).div_ceil(i as u64);
+    }
+
     for block_y in 0..dst_height / 2 {
         for block_x in 0..half {
             let mut chroma = [0i32; 3];
@@ -259,10 +283,13 @@ pub fn rgba_to_i420_scaled(
                             count += 1;
                         }
                     }
-                    let count = count.max(1) as i32;
-                    let r = r_sum as i32 / count;
-                    let g = g_sum as i32 / count;
-                    let b = b_sum as i32 / count;
+                    // `count >= 1` (both source ranges clamp to at least one
+                    // pixel) and `count <= max_count`, so the lookup is always
+                    // in bounds.
+                    let recip = recip[count as usize];
+                    let r = ((r_sum as u64 * recip) >> 24) as i32;
+                    let g = ((g_sum as u64 * recip) >> 24) as i32;
+                    let b = ((b_sum as u64 * recip) >> 24) as i32;
                     y[dst_y * dst_width + dst_x] = luma(r, g, b);
                     chroma[0] += r;
                     chroma[1] += g;
@@ -712,5 +739,25 @@ mod tests {
                 row[0], row[1], row[2], row[3]
             );
         }
+        // The colour conversion is preset-independent and is the other half of
+        // the encode thread's per-frame budget, so it gets its own row.
+        let mut convert_row = [0.0f32; 3];
+        for (index, (_, target)) in targets.iter().enumerate() {
+            let samples = if target.is_some() { 10 } else { 5 };
+            for _ in 0..3 {
+                let _ = planes_for(&rgba, src_w, src_h, *target);
+            }
+            let mut timed = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let started = std::time::Instant::now();
+                let _ = planes_for(&rgba, src_w, src_h, *target);
+                timed.push(started.elapsed());
+            }
+            convert_row[index] = mean_ms(&timed);
+        }
+        println!(
+            "convert (preset-free)     {:.1}  {:.1}  {:.1}",
+            convert_row[0], convert_row[1], convert_row[2]
+        );
     }
 }

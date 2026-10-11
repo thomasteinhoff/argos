@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+// use argos_core::lan::CursorUpdate; // kept for type compatibility in Control
+
 use argos_core::metrics::SenderMetrics;
 use windows::core::{Interface, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
@@ -62,6 +64,8 @@ pub struct Control {
     pub active: Arc<AtomicBool>,
     pub interval: Arc<AtomicU64>,
     pub metrics: Arc<SenderMetrics>,
+    /// Cursor state published for forwarding to viewers (share side only).
+    pub cursor: Arc<std::sync::Mutex<Option<argos_core::lan::CursorUpdate>>>,
 }
 
 impl Recorder {
@@ -73,10 +77,12 @@ impl Recorder {
     pub fn start(name: &str, tx: SyncSender<Frame>, control: Control) -> Result<Self, String> {
         let monitor =
             monitor_handle_for(name).ok_or_else(|| format!("monitor '{name}' not found"))?;
+        let desktop =
+            monitor_rect_for(name).ok_or_else(|| format!("monitor '{name}' has no geometry"))?;
         let (device, context, duplication) = create_duplication(monitor)?;
         let join = thread::Builder::new()
             .name("argos-dxgi".to_string())
-            .spawn(move || run(device, context, duplication, tx, control))
+            .spawn(move || run(device, context, duplication, tx, control, desktop))
             .map_err(|error| error.to_string())?;
         Ok(Self { join: Some(join) })
     }
@@ -107,13 +113,16 @@ fn run(
     duplication: IDXGIOutputDuplication,
     tx: SyncSender<Frame>,
     control: Control,
+    desktop: RECT,
 ) -> bool {
     let Control {
         stop,
         active,
         interval,
         metrics,
+        cursor,
     } = control;
+    let mut shadow = crate::cursor::CursorShadow::new();
     let mut staging: Option<Staging> = None;
     // The very first acquire after a duplication is created reports
     // `LastPresentTime == 0` even though it carries the current desktop. Send it
@@ -128,6 +137,11 @@ fn run(
             thread::sleep(INACTIVE_SLEEP);
             last = Instant::now();
             continue;
+        }
+        if let Some(update) = shadow.poll(&desktop) {
+            if let Ok(mut slot) = cursor.lock() {
+                *slot = Some(update);
+            }
         }
         let target = Duration::from_micros(interval.load(Ordering::Relaxed).max(1));
         let timeout = (target.as_millis().max(1) as u32).min(ACQUIRE_TIMEOUT_MILLIS);
@@ -290,6 +304,21 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
 
 /// Resolves a picker name (e.g. `\\.\DISPLAY1`) to the `HMONITOR` DXGI compares
 /// its outputs against.
+fn monitor_rect_for(name: &str) -> Option<RECT> {
+    let handle = monitor_handle_for(name)?;
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(handle, &mut info).as_bool() {
+            return None;
+        }
+        Some(info.rcMonitor)
+    }
+}
+
 fn monitor_handle_for(name: &str) -> Option<HMONITOR> {
     enumerate()
         .into_iter()

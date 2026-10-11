@@ -7,7 +7,7 @@
 //! real [`dispatch`] over real serialised bytes rather than restating the
 //! mapping next to it.
 
-use super::{dispatch, Diagnostics, LanEvent, Message, RosterEntry};
+use super::{dispatch, CursorUpdate, Diagnostics, LanEvent, Message, RosterEntry};
 
 /// The id this process would answer to. Messages must be addressed to it.
 const US: &str = "0123456789abcdef";
@@ -28,6 +28,7 @@ fn message(kind: &str) -> Message {
         diag: Diagnostics::default(),
         roster: Vec::new(),
         source_fps: 0,
+        cursor: None,
     }
 }
 
@@ -63,6 +64,9 @@ fn every_kind_reaches_its_handler() {
     // Sent just before a viewer's hard exit, so the sharer frees its slot
     // instead of counting a ghost forever.
     assert!(matches!(over_the_wire("bye"), Some(LanEvent::Bye { .. })));
+    // Sent by the sharer when it ends its stream on purpose, so a viewer stops
+    // reconnecting into nothing.
+    assert!(matches!(over_the_wire("stop"), Some(LanEvent::Stop { .. })));
     // The two that carry recovery. Without these two the viewer is stuck
     // waiting for an intra frame that will only arrive on the 4 s backstop,
     // and the sharer never learns what its link looks like.
@@ -113,6 +117,75 @@ fn a_roster_carries_every_viewer_and_the_shape_of_the_stream() {
         }
         other => panic!("expected a Roster event, got {other:?}"),
     }
+}
+
+/// The cursor payload is a picture plus a position, and the viewer draws both:
+/// dropping the rgba or mangling the fractions would show a wrong pointer.
+#[test]
+fn a_cursor_carries_position_shape_and_desktop_anchor() {
+    let mut sent = message("cursor");
+    sent.cursor = Some(CursorUpdate {
+        x: 0.25,
+        y: 0.5,
+        desktop_w: 1920,
+        desktop_h: 1080,
+        width: 32,
+        height: 32,
+        hotspot_x: 2,
+        hotspot_y: 2,
+        generation: 3,
+        visible: true,
+        rgba: vec![0u8; 32 * 32 * 4],
+    });
+    let bytes = serde_json::to_vec(&sent).expect("serialise");
+    match dispatch(serde_json::from_slice(&bytes).expect("deserialise")) {
+        Some(LanEvent::Cursor { cursor, .. }) => {
+            assert_eq!(cursor.x, 0.25);
+            assert_eq!(cursor.y, 0.5);
+            assert_eq!(cursor.desktop_w, 1920);
+            assert_eq!(cursor.generation, 3);
+            assert!(cursor.visible);
+            assert_eq!(cursor.rgba.len(), 32 * 32 * 4);
+        }
+        other => panic!("expected a Cursor event, got {other:?}"),
+    }
+}
+
+/// A cursor whose position did not survive JSON (a non-finite float serialises
+/// as `null` and fails to parse) must be refused, not silently treated as the
+/// top-left corner.
+#[test]
+fn a_cursor_with_nowhere_to_be_is_refused() {
+    let mut sent = message("cursor");
+    sent.cursor = Some(CursorUpdate {
+        x: f32::NAN,
+        ..Default::default()
+    });
+    let bytes: Vec<u8> = serde_json::to_string(&sent) // to_string so NAN becomes null
+        .unwrap_or_default()
+        .into_bytes();
+    let parsed = serde_json::from_slice(&bytes);
+    // Serde serialises NAN as null, so the message must fail to parse at all.
+    assert!(parsed.is_err() || dispatch(parsed.ok().unwrap()).is_none());
+}
+
+/// An older build that knows nothing about the cursor field still exchanges
+/// every other message: a message without it deserialises to `cursor: None`.
+#[test]
+fn a_message_without_the_cursor_field_still_parses() {
+    let mut sent = message("request");
+    sent.cursor = None;
+    let bytes = serde_json::to_vec(&sent).expect("serialise");
+    // Strip the field, as a build predating it would send.
+    let text = String::from_utf8(bytes).expect("utf8");
+    let text = text.replacen(",\"cursor\":null", "", 1);
+    assert!(!text.contains("cursor"));
+    let parsed: Message = serde_json::from_str(&text).expect("parse without cursor field");
+    assert!(parsed.cursor.is_none());
+    assert!(matches!(
+        dispatch(serde_json::from_slice(text.as_bytes()).expect("deserialise")),
+        Some(LanEvent::Request { .. })
+    ));
 }
 
 /// The sender's id is what the sharer uses to decide whether the request came

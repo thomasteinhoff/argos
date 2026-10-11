@@ -739,6 +739,8 @@ struct ViewSession {
     self_id: Option<String>,
     /// This viewer's own name, for the fallback list a manual-code session has.
     self_name: String,
+    /// Last cursor update from sharer
+    cursor: Option<lan::CursorUpdate>,
     /// Whether the window is showing this stream alone.
     ///
     /// Kept on the session rather than the app so that it cannot outlive the
@@ -1596,6 +1598,7 @@ impl ArgosApp {
             source_fps: 0,
             self_id: self.lan.as_ref().map(|lan| lan.id().to_string()),
             self_name: self.config.name.clone(),
+            cursor: None,
             fullscreen: false,
             // Started idle rather than fresh, so the controls are not sitting on
             // top of the picture for the first three seconds of a session.
@@ -1714,16 +1717,8 @@ impl ArgosApp {
         }
     }
 
-    fn poll_lan_events(&mut self) {
-        // Before the events, so a request is answered against a slot list that
-        // has already had its dead connections cleared out, and so the roster
-        // that follows reflects those clearings.
+    fn poll_lan_events(&mut self, ctx: &egui::Context) {
         self.sweep_viewers();
-        // No early return when there is no LAN, so the connect deadline below
-        // still runs. A pending view with nowhere to send a request is the most
-        // hopeless state there is, and the deadline is the only thing that ends
-        // it — making it conditional on discovery being up would leave exactly
-        // the machines least able to connect also unable to be told so.
         let mut events = Vec::new();
         if let Some(lan) = self.lan.as_ref() {
             while let Some(event) = lan.try_event() {
@@ -1802,9 +1797,6 @@ impl ArgosApp {
                     viewers,
                     source_fps,
                 } => {
-                    // Only from the sharer being watched. Anyone else on the
-                    // network could send one of these, and acting on it would
-                    // display someone else's audience as ours.
                     let watching = self
                         .view
                         .as_ref()
@@ -1817,6 +1809,29 @@ impl ArgosApp {
                         view.roster = viewers;
                         view.roster_received = Some(Instant::now());
                         view.source_fps = source_fps;
+                    }
+                }
+                lan::LanEvent::Stop { id } => {
+                    let watching = self
+                        .view
+                        .as_ref()
+                        .and_then(|view| view.sharer_id.as_deref())
+                        == Some(id.as_str());
+                    if watching {
+                        self.view_error = Some("The sharer ended the stream".to_string());
+                        self.stop_view(ctx);
+                    }
+                }
+                lan::LanEvent::Cursor { id, cursor } => {
+                    let watching = self
+                        .view
+                        .as_ref()
+                        .and_then(|view| view.sharer_id.as_deref())
+                        == Some(id.as_str());
+                    if watching {
+                        if let Some(view) = self.view.as_mut() {
+                            view.cursor = Some(cursor);
+                        }
                     }
                 }
             }
@@ -3819,7 +3834,7 @@ impl eframe::App for ArgosApp {
             self.set_fullscreen(ctx, !fullscreen);
         }
         theme::apply(ctx);
-        self.poll_lan_events();
+        self.poll_lan_events(ctx);
         // Read after the events, because an event can finish the session the
         // fullscreen flag belonged to.
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);

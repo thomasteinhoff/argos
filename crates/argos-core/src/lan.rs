@@ -69,6 +69,28 @@ pub enum LanEvent {
         /// only — nothing in the quality controller reads it.
         diag: Diagnostics,
     },
+    /// The sharer ended its stream on purpose.
+    ///
+    /// The counter-message to `Bye`, which is a *viewer* leaving. A deliberate
+    /// end is indistinguishable from a dropped link at the transport, so the
+    /// viewer's recovery would otherwise reconnect five times into thin air;
+    /// this message lets it stop and say so. Best-effort like everything over
+    /// UDP — if it is lost, the reconnect loop still exhausts itself and
+    /// reports, which is the same story with a worse ending.
+    Stop {
+        id: String,
+    },
+    /// The sharer's mouse, so a viewer can draw it over the stream.
+    ///
+    /// The pointer never travels inside the video: DXGI delivers no frame when
+    /// only the cursor moves over a static desktop, so the cursor is captured
+    /// separately on the share machine (GDI) and shipped here. Shape changes
+    /// bump `generation` and ride the full `rgba`; position updates reuse the
+    /// shape the viewer already has.
+    Cursor {
+        id: String,
+        cursor: CursorUpdate,
+    },
     /// Who else is watching the same stream, and what shape the stream is.
     ///
     /// Sent by the sharer because it is the only party that knows: a viewer can
@@ -170,6 +192,57 @@ pub struct LinkReport {
     pub diag: Diagnostics,
 }
 
+/// One state of the sharer's pointer, as viewers need to draw it.
+///
+/// Coordinates are *normalized* fractions of the shared desktop
+/// (`x, y in 0..1`), not pixels, so the mapping survives the ladder changing
+/// the encoded resolution underneath. The bitmap is in *desktop* pixels; the
+/// viewer scales it with the picture using `desktop_w`/`desktop_h` as the
+/// anchor.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CursorUpdate {
+    /// Horizontal position as a fraction of the shared desktop's width.
+    #[serde(default)]
+    pub x: f32,
+    /// Vertical position as a fraction of the shared desktop's height.
+    #[serde(default)]
+    pub y: f32,
+    /// The shared desktop's pixel size — what the bitmap and the position
+    /// are measured against.
+    #[serde(default)]
+    pub desktop_w: u16,
+    #[serde(default)]
+    pub desktop_h: u16,
+    /// The cursor bitmap's size, in desktop pixels.
+    #[serde(default)]
+    pub width: u16,
+    #[serde(default)]
+    pub height: u16,
+    /// Where in the bitmap the click point is, in desktop pixels.
+    #[serde(default)]
+    pub hotspot_x: u16,
+    #[serde(default)]
+    pub hotspot_y: u16,
+    /// Bumped every time the shape changes; the receiver keeps its old shape
+    /// until a message carrying a newer `generation` and a non-empty `rgba`
+    /// replaces it.
+    #[serde(default)]
+    pub generation: u32,
+    /// False while the pointer is hidden or has left the shared desktop.
+    #[serde(default)]
+    pub visible: bool,
+    /// The cursor's RGBA pixels, top-down. Empty in a position-only update.
+    #[serde(default)]
+    pub rgba: Vec<u8>,
+}
+
+impl CursorUpdate {
+    /// Whether the fields a viewer trusts are real numbers.
+    pub fn is_finite(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.desktop_w > 0 && self.desktop_h > 0
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Message {
     kind: String,
@@ -199,6 +272,9 @@ struct Message {
     /// The stream's frame rate, in the `roster` message.
     #[serde(default)]
     source_fps: u32,
+    /// The sharer's pointer, in the `cursor` message.
+    #[serde(default)]
+    cursor: Option<CursorUpdate>,
 }
 
 pub struct Lan {
@@ -341,6 +417,7 @@ impl Lan {
             diag: Diagnostics::default(),
             roster: Vec::new(),
             source_fps: 0,
+            cursor: None,
         }
     }
 
@@ -408,6 +485,31 @@ impl Lan {
         let mut message = self.message("roster", id);
         message.roster = viewers.to_vec();
         message.source_fps = source_fps;
+        self.send_to_peer(id, message);
+    }
+
+    /// Tells a viewer this sharer is ending its stream on purpose, so it can
+    /// stop reconnecting instead of retrying five times into nothing.
+    ///
+    /// Best-effort and deliberately the last thing sent to that peer: the
+    /// share is being torn down either way. Sent once per viewer; a lost
+    /// datagram leaves the viewer to exhaust its reconnect attempts, which is
+    /// the behavior this exists to avoid but never a wrong one.
+    pub fn send_stop(&self, id: &str) {
+        let message = self.message("stop", id);
+        self.send_to_peer(id, message);
+    }
+
+    /// Ships one pointer state to one viewer.
+    ///
+    /// Best-effort and meant to be repeated, like the roster: position updates
+    /// ride this channel at the share machine's poll rate, and the shape
+    /// (`rgba` + `generation`) travels every time it changes. A lost shape
+    /// update leaves the viewer holding the older shape until the next change
+    /// or the sharer's periodic re-send, whichever comes first.
+    pub fn send_cursor(&self, id: &str, cursor: &CursorUpdate) {
+        let mut message = self.message("cursor", id);
+        message.cursor = Some(cursor.clone());
         self.send_to_peer(id, message);
     }
 }
@@ -525,6 +627,7 @@ fn discovery_loop(
                 diag: Diagnostics::default(),
                 roster: Vec::new(),
                 source_fps: 0,
+                cursor: None,
             };
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
@@ -596,6 +699,18 @@ fn dispatch(message: Message) -> Option<LanEvent> {
             sdp: message.sdp,
         }),
         "bye" => Some(LanEvent::Bye { id: message.id }),
+        "stop" => Some(LanEvent::Stop { id: message.id }),
+        "cursor" => {
+            // A position that deserialises as `null` (non-finite, dropped by
+            // JSON) would otherwise become exactly 0.0/0.0 — the top-left
+            // corner, a fabricated but superficially valid pointer. A missing
+            // or malformed payload is refused outright instead.
+            let cursor = message.cursor.filter(CursorUpdate::is_finite)?;
+            Some(LanEvent::Cursor {
+                id: message.id,
+                cursor,
+            })
+        }
         "keyframe" => Some(LanEvent::Keyframe { id: message.id }),
         "report" => {
             // A datagram whose measurements are absent rather than zero

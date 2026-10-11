@@ -69,6 +69,7 @@ pub struct CaptureSession {
     /// Shared with the capture thread so the UI can read stage timings and drop
     /// counts without touching the frame channel.
     metrics: Arc<SenderMetrics>,
+    cursor: Arc<Mutex<Option<argos_core::lan::CursorUpdate>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -82,6 +83,7 @@ impl CaptureSession {
             interval: Arc::new(AtomicU64::new(DEFAULT_CAPTURE_INTERVAL_MICROS)),
             error: Arc::new(Mutex::new(None)),
             metrics: Arc::new(SenderMetrics::default()),
+            cursor: Arc::new(Mutex::new(None)),
             join: None,
         }
     }
@@ -89,6 +91,13 @@ impl CaptureSession {
     /// Stage timings and drop counters for this session.
     pub fn metrics(&self) -> &Arc<SenderMetrics> {
         &self.metrics
+    }
+
+    /// The shared slot holding the last cursor state, for the app to forward to
+    /// viewers. Polling is driven by the capture thread; the app reads this at
+    /// its repaint cadence.
+    pub fn cursor(&self) -> Arc<Mutex<Option<argos_core::lan::CursorUpdate>>> {
+        Arc::clone(&self.cursor)
     }
 
     pub fn set_active(&self, active: bool) {
@@ -120,12 +129,13 @@ impl CaptureSession {
         let error_reporter = Arc::clone(&error);
         let stop_reporter = Arc::clone(&stop);
         let metrics = Arc::clone(&self.metrics);
+        let cursor = self.cursor();
         self.join = Some(
             thread::Builder::new()
                 .name("argos-capture".to_string())
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pump(wanted, tx, stop, active, interval, error, metrics)
+                        pump(wanted, tx, stop, active, interval, error, metrics, cursor)
                     }));
                     if let Err(payload) = outcome {
                         // A panicking capture thread used to die silently (the
@@ -172,6 +182,7 @@ impl Default for CaptureSession {
 /// or cannot be created, it retries with a bounded backoff and recreates the
 /// duplication, which is how the DXGI API itself prescribes handling access
 /// loss. Only a persistent failure streak is reported as fatal.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     wanted: String,
     tx: SyncSender<Frame>,
@@ -180,6 +191,7 @@ fn pump(
     interval: Arc<AtomicU64>,
     error: Arc<Mutex<Option<String>>>,
     metrics: Arc<SenderMetrics>,
+    cursor: Arc<Mutex<Option<argos_core::lan::CursorUpdate>>>,
 ) {
     let mut failed_since: Option<Instant> = None;
     let mut connected_at: Option<Instant> = None;
@@ -196,6 +208,7 @@ fn pump(
             active: Arc::clone(&active),
             interval: Arc::clone(&interval),
             metrics: Arc::clone(&metrics),
+            cursor: Arc::clone(&cursor),
         };
         let mut recorder = match Recorder::start(&wanted, tx.clone(), control) {
             Ok(recorder) => recorder,

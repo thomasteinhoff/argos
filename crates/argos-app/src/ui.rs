@@ -53,6 +53,16 @@ const VIEWER_REPORT_TTL: Duration = Duration::from_secs(3);
 /// anything.
 const VIEWER_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often the sharer re-sends the cursor's bitmap even when its shape has
+/// not changed.
+///
+/// Position-only updates ride the channel continuously, but each carries no
+/// pixels. A viewer that missed the datagram which introduced the current shape
+/// would otherwise hold the wrong picture until the shape changes again, which
+/// for the standard arrow is never — so the shape is repeated on this interval
+/// as a repair path.
+const CURSOR_SHAPE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The visible language of the app, in one place.
 ///
 /// Argos is a screen-watching tool for a trusted network: it runs dark, in a
@@ -687,6 +697,22 @@ struct Reconnect {
     last_request: Instant,
 }
 
+/// What the sharer last put on the wire for one cursor, so the next poll can
+/// send only what changed.
+///
+/// Position and visibility are compared field-by-field; the shape (bitmap) is
+/// keyed by `generation`, which the capture side bumps whenever the pointer's
+/// picture changes. `shape_at` is when the bitmap was last actually sent, which
+/// is what drives the periodic re-send in [`CURSOR_SHAPE_INTERVAL`].
+#[derive(Clone)]
+struct CursorSent {
+    generation: u32,
+    shape_at: Instant,
+    x: f32,
+    y: f32,
+    visible: bool,
+}
+
 struct ViewSession {
     viewer: Arc<session::Viewer>,
     answer_code: Option<String>,
@@ -741,6 +767,18 @@ struct ViewSession {
     self_name: String,
     /// Last cursor update from sharer
     cursor: Option<lan::CursorUpdate>,
+    /// The last decoded frame, before the pointer is drawn on it.
+    ///
+    /// The pointer must move while the picture underneath is still, and a
+    /// static desktop sends no new video frames at all. Keeping the clean frame
+    /// lets each cursor update be re-composited without waiting for one.
+    clean: Option<DecodedFrame>,
+    /// Scratch buffer reused for the composited frame, so re-drawing the pointer
+    /// does not allocate a whole frame every time it moves.
+    compose: Vec<u8>,
+    /// Set when a new frame or a new cursor update means the texture must be
+    /// rebuilt on the next draw.
+    cursor_dirty: bool,
     /// Whether the window is showing this stream alone.
     ///
     /// Kept on the session rather than the app so that it cannot outlive the
@@ -1005,6 +1043,12 @@ pub struct ArgosApp {
     share_height: Option<u32>,
     frame_rate: u32,
     live: bool,
+    /// Cursor forwarding state (sharer side): the last update put on the wire,
+    /// so the next poll can send only what changed.
+    cursor_sent: Option<CursorSent>,
+    /// Whether the "stream ended" notice has already gone out for this share, so
+    /// a window close racing several `update` calls does not repeat it.
+    stop_sent: bool,
     view: Option<ViewSession>,
     view_error: Option<String>,
     /// Why the last restart attempt did not happen. Its own slot because
@@ -1052,6 +1096,8 @@ impl ArgosApp {
             share_height: None,
             frame_rate: 60,
             live: false,
+            cursor_sent: None,
+            stop_sent: false,
             view: None,
             view_error: None,
             restart_error: None,
@@ -1313,6 +1359,8 @@ impl ArgosApp {
         if let Some(lan) = &self.lan {
             lan.set_sharing(true);
         }
+        self.cursor_sent = None;
+        self.stop_sent = false;
         self.share = Some(ShareSession {
             sharer,
             viewers: Vec::new(),
@@ -1438,7 +1486,29 @@ impl ArgosApp {
         }
     }
 
+    /// Tells every current viewer the stream is ending on purpose.
+    ///
+    /// Best-effort: each datagram is handed to the OS, and a lost one just leaves
+    /// that viewer to exhaust its reconnect attempts. Called before any teardown
+    /// that would close the LAN channel out from under it.
+    fn send_stop_to_viewers(&self) {
+        let Some(share) = self.share.as_ref() else {
+            return;
+        };
+        let Some(lan) = self.lan.as_ref() else {
+            return;
+        };
+        for viewer in &share.viewers {
+            lan.send_stop(&viewer.id);
+        }
+    }
+
     fn stop_live(&mut self) {
+        // Before the teardown below drops the share (and with it the LAN
+        // channel): a directed datagram sent now is already on the wire.
+        self.send_stop_to_viewers();
+        self.cursor_sent = None;
+        self.stop_sent = false;
         if let Some(mut share) = self.share.take() {
             let sharer = Arc::clone(&share.sharer);
             let encode = share.encode.take();
@@ -1599,6 +1669,9 @@ impl ArgosApp {
             self_id: self.lan.as_ref().map(|lan| lan.id().to_string()),
             self_name: self.config.name.clone(),
             cursor: None,
+            clean: None,
+            compose: Vec::new(),
+            cursor_dirty: false,
             fullscreen: false,
             // Started idle rather than fresh, so the controls are not sitting on
             // top of the picture for the first three seconds of a session.
@@ -1674,6 +1747,10 @@ impl ArgosApp {
                 lan.send_bye(sharer);
             }
         }
+        // Same reasoning for the viewers of a share this copy is running: the
+        // new copy takes over the network, and they must not treat the gap as a
+        // transient drop and retry into the replacement.
+        self.send_stop_to_viewers();
         std::process::exit(0);
     }
 
@@ -1830,7 +1907,28 @@ impl ArgosApp {
                         == Some(id.as_str());
                     if watching {
                         if let Some(view) = self.view.as_mut() {
-                            view.cursor = Some(cursor);
+                            // A position-only update carries no bitmap, and a
+                            // reordered one can arrive after a newer shape. In
+                            // both cases hold the last shape and take only the
+                            // position; otherwise adopt the whole update.
+                            let stale_shape = view.cursor.as_ref().is_some_and(|prev| {
+                                cursor.rgba.is_empty() || cursor.generation < prev.generation
+                            });
+                            if stale_shape {
+                                if let Some(prev) = view.cursor.as_mut() {
+                                    prev.x = cursor.x;
+                                    prev.y = cursor.y;
+                                    prev.visible = cursor.visible;
+                                    prev.desktop_w = cursor.desktop_w;
+                                    prev.desktop_h = cursor.desktop_h;
+                                }
+                            } else {
+                                view.cursor = Some(cursor);
+                            }
+                            // The pointer may have moved while the picture did
+                            // not; the next draw rebuilds the texture from the
+                            // clean frame plus this update.
+                            view.cursor_dirty = true;
                         }
                     }
                 }
@@ -1933,7 +2031,76 @@ impl ArgosApp {
             .store(encode_target(height), Ordering::Relaxed);
     }
 
+    /// Ships the capture thread's latest pointer state to every viewer.
+    ///
+    /// Called on every frame pump, before the "is a frame due" gate: a static
+    /// desktop produces no new video frames at all, and that is precisely when
+    /// the pointer is the only thing that moves. Position and visibility go out
+    /// continuously; the bitmap rides along only when the shape changed or the
+    /// re-send interval lapses, so a position-only update stays small.
+    fn forward_cursor(&mut self) {
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        let slot = capture.cursor();
+        let Some(mut update) = slot.lock().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        let now = Instant::now();
+        let prev = self.cursor_sent.clone();
+        let moved = match &prev {
+            Some(prev) => {
+                prev.generation != update.generation
+                    || prev.x != update.x
+                    || prev.y != update.y
+                    || prev.visible != update.visible
+            }
+            None => true,
+        };
+        let shape_due = match &prev {
+            Some(prev) => {
+                prev.generation != update.generation
+                    || now.duration_since(prev.shape_at) >= CURSOR_SHAPE_INTERVAL
+            }
+            None => true,
+        };
+        if !moved && !shape_due {
+            return;
+        }
+        // Only attach pixels when the shape is actually due; a position-only
+        // update ships with an empty bitmap, which is what keeps it small.
+        let sending_shape = shape_due && !update.rgba.is_empty();
+        if !sending_shape {
+            update.rgba.clear();
+        }
+        let Some(share) = self.share.as_ref() else {
+            return;
+        };
+        if !share.sharer.is_connected() {
+            return;
+        }
+        if let Some(lan) = self.lan.as_ref() {
+            for viewer in &share.viewers {
+                lan.send_cursor(&viewer.id, &update);
+            }
+        }
+        self.cursor_sent = Some(CursorSent {
+            generation: update.generation,
+            shape_at: if sending_shape {
+                now
+            } else {
+                prev.map(|prev| prev.shape_at).unwrap_or(now)
+            },
+            x: update.x,
+            y: update.y,
+            visible: update.visible,
+        });
+    }
+
     fn poll_capture(&mut self, ctx: &egui::Context) {
+        // Before the frame gate below: the pointer must reach viewers even when
+        // no new video frame is due, which is the whole point of the channel.
+        self.forward_cursor();
         let now = Instant::now();
         let interval = self.frame_interval();
         let encode_due = self.share.as_ref().is_some_and(|share| {
@@ -2151,35 +2318,54 @@ impl ArgosApp {
         let Some(view) = self.view.as_mut() else {
             return;
         };
-        let Some(frame) = view.latest.lock().ok().and_then(|mut slot| slot.take()) else {
+        // A new decoded frame replaces the clean one and forces a rebuild; a
+        // cursor update only forces a rebuild. Recomposing on a dirty flag means
+        // a pointer that moves over a still picture is redrawn at the UI's own
+        // rate without the video pipeline having to produce anything.
+        if let Some(frame) = view.latest.lock().ok().and_then(|mut slot| slot.take()) {
+            view.display_aspect.get_or_insert_with(|| {
+                if frame.height > 0 {
+                    frame.width as f32 / frame.height as f32
+                } else {
+                    16.0 / 9.0
+                }
+            });
+            view.clean = Some(frame);
+            view.cursor_dirty = true;
+        }
+        if !view.cursor_dirty {
+            return;
+        }
+        let Some(clean) = view.clean.as_ref() else {
             return;
         };
-        // Fix the display aspect on the first frame. The ladder preserves the
-        // source ratio, so every later resolution shares it and the box stays
-        // put when the resolution drops.
-        view.display_aspect.get_or_insert_with(|| {
-            if frame.height > 0 {
-                frame.width as f32 / frame.height as f32
-            } else {
-                16.0 / 9.0
-            }
-        });
+        let (width, height) = (clean.width, clean.height);
+        let len = width as usize * height as usize * 4;
+        view.compose.resize(len, 0);
+        view.compose.copy_from_slice(&clean.rgba);
+        // The pointer is composited here rather than captured into the video:
+        // drawing it onto the decoded frame keeps it sharp, and it can move
+        // while the picture underneath is still.
+        if let Some(cursor) = view.cursor.as_ref() {
+            bake_cursor(&mut view.compose, width, height, cursor);
+        }
         let image = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            &frame.rgba,
+            [width as usize, height as usize],
+            &view.compose,
         );
         match &mut view.texture {
-            Some(preview) if preview.width == frame.width && preview.height == frame.height => {
+            Some(preview) if preview.width == width && preview.height == height => {
                 preview.texture.set(image, egui::TextureOptions::LINEAR);
             }
             _ => {
                 view.texture = Some(Preview {
                     texture: ctx.load_texture("remote", image, egui::TextureOptions::LINEAR),
-                    width: frame.width,
-                    height: frame.height,
+                    width,
+                    height,
                 });
             }
         }
+        view.cursor_dirty = false;
     }
 
     /// Tells the sharer what this end is seeing, and asks for a keyframe when
@@ -3824,6 +4010,66 @@ impl ReportSink for String {
     fn separator(&mut self) {}
 }
 
+/// Draws the sharer's pointer into a decoded frame, in place.
+///
+/// The update's position is a fraction of the shared desktop and the bitmap is
+/// sized in desktop pixels, so both are scaled by the frame-to-desktop ratio.
+/// The hotspot — the click point inside the bitmap — is what keeps the bitmap's
+/// tip under the position. Everything is clipped to the frame; a hidden pointer
+/// or a non-finite update draws nothing.
+fn bake_cursor(rgba: &mut [u8], frame_w: u32, frame_h: u32, cursor: &lan::CursorUpdate) {
+    if !cursor.visible || !cursor.is_finite() || cursor.rgba.is_empty() {
+        return;
+    }
+    let cw = cursor.width as u32;
+    let ch = cursor.height as u32;
+    if cw == 0 || ch == 0 || cursor.rgba.len() < (cw * ch * 4) as usize {
+        return;
+    }
+    let scale_x = frame_w as f32 / cursor.desktop_w as f32;
+    let scale_y = frame_h as f32 / cursor.desktop_h as f32;
+    let origin_x = cursor.x * frame_w as f32 - cursor.hotspot_x as f32 * scale_x;
+    let origin_y = cursor.y * frame_h as f32 - cursor.hotspot_y as f32 * scale_y;
+    let dst_w = cw as f32 * scale_x;
+    let dst_h = ch as f32 * scale_y;
+    if dst_w < 1.0 || dst_h < 1.0 {
+        return;
+    }
+    let x0 = origin_x.floor().max(0.0) as i64;
+    let y0 = origin_y.floor().max(0.0) as i64;
+    let x1 = (origin_x + dst_w).ceil().min(frame_w as f32) as i64;
+    let y1 = (origin_y + dst_h).ceil().min(frame_h as f32) as i64;
+    for dy in y0..y1 {
+        for dx in x0..x1 {
+            // Nearest-neighbour into the source bitmap.
+            let sx = (((dx as f32 + 0.5 - origin_x) / dst_w) * cw as f32) as i64;
+            let sy = (((dy as f32 + 0.5 - origin_y) / dst_h) * ch as f32) as i64;
+            if sx < 0 || sy < 0 || sx >= cw as i64 || sy >= ch as i64 {
+                continue;
+            }
+            let src = ((sy as u32 * cw + sx as u32) * 4) as usize;
+            let alpha = cursor.rgba[src + 3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let dst = ((dy as u32 * frame_w + dx as u32) * 4) as usize;
+            if alpha == 255 {
+                rgba[dst..dst + 4].copy_from_slice(&cursor.rgba[src..src + 4]);
+            } else {
+                let inv = 255 - alpha;
+                for channel in 0..3 {
+                    let blended = (cursor.rgba[src + channel] as u32 * alpha
+                        + rgba[dst + channel] as u32 * inv
+                        + 127)
+                        / 255;
+                    rgba[dst + channel] = blended as u8;
+                }
+                rgba[dst + 3] = 255;
+            }
+        }
+    }
+}
+
 impl eframe::App for ArgosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input_mut(|input| input.key_pressed(egui::Key::D) && input.modifiers.ctrl) {
@@ -3835,6 +4081,15 @@ impl eframe::App for ArgosApp {
         }
         theme::apply(ctx);
         self.poll_lan_events(ctx);
+        // A window close tears the process down without any other teardown path,
+        // so the viewers are told here, once.
+        if self.share.is_some()
+            && !self.stop_sent
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            self.send_stop_to_viewers();
+            self.stop_sent = true;
+        }
         // Read after the events, because an event can finish the session the
         // fullscreen flag belonged to.
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
@@ -3889,9 +4144,9 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        audience_from, connect_step, encode_target, lan, roster_is_stale, worst_link, ConnectStep,
-        LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT, KEYFRAME_REQUEST_FLOOR,
-        REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
+        audience_from, bake_cursor, connect_step, encode_target, lan, roster_is_stale, worst_link,
+        ConnectStep, LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT,
+        KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use argos_media::encode::decode_target;
     use std::time::{Duration, Instant};
@@ -4244,5 +4499,52 @@ mod tests {
         assert_eq!(audience.len(), 1);
         assert_eq!(audience[0].id, "aabb");
         assert_eq!(audience[0].label(), "alice");
+    }
+
+    /// The pointer has to land where the sharer's is — scaled by the desktop-to-
+    /// frame ratio and anchored by the hotspot — and it must draw nothing when
+    /// hidden. This is the half that makes a cursor visible at all: the receive
+    /// side only stores the update, it is this bake that puts it on the picture.
+    #[test]
+    fn the_cursor_is_baked_at_the_scaled_hotspot_and_skipped_when_hidden() {
+        // A 2x2 pointer with one opaque red pixel under the hotspot, the rest
+        // transparent.
+        let mut cursor = lan::CursorUpdate {
+            x: 0.5,
+            y: 0.5,
+            desktop_w: 100,
+            desktop_h: 100,
+            width: 2,
+            height: 2,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            generation: 1,
+            visible: true,
+            rgba: vec![255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        // A 200x200 frame makes the desktop-to-frame scale 2x, so the 2px bitmap
+        // covers 4px, and 0.5 of the desktop is pixel 100.
+        let mut frame = vec![0u8; 200 * 200 * 4];
+        bake_cursor(&mut frame, 200, 200, &cursor);
+        let hit = (100 * 200 + 100) * 4;
+        assert_eq!(
+            &frame[hit..hit + 4],
+            &[255, 0, 0, 255],
+            "the cursor pixel lands at the hotspot"
+        );
+        let outside = (100 * 200 + 110) * 4;
+        assert_eq!(
+            &frame[outside..outside + 4],
+            &[0, 0, 0, 0],
+            "a pixel outside the bitmap is left alone"
+        );
+
+        cursor.visible = false;
+        let mut frame = vec![0u8; 200 * 200 * 4];
+        bake_cursor(&mut frame, 200, 200, &cursor);
+        assert!(
+            frame.iter().all(|&byte| byte == 0),
+            "a hidden cursor draws nothing"
+        );
     }
 }

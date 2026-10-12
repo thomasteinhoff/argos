@@ -23,10 +23,14 @@ fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("assets/icon.png must be a valid PNG");
     let options = eframe::NativeOptions {
+        // Undecorated: the OS caption bar is replaced by the one `ui` draws, so
+        // the app has a single bar instead of two stacked ones. The window's icon
+        // and title still matter — they are what the taskbar and Alt-Tab show.
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([820.0, 520.0])
             .with_min_inner_size([640.0, 420.0])
             .with_title("Argos")
+            .with_decorations(false)
             .with_icon(icon),
         ..Default::default()
     };

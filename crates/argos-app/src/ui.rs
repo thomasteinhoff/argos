@@ -93,6 +93,20 @@ mod theme {
     pub const WARN: Color32 = Color32::from_rgb(220, 200, 120);
     /// Something is wrong.
     pub const ERR: Color32 = Color32::from_rgb(220, 120, 120);
+    /// The fill a flat control wears while the pointer is over it. One shade
+    /// enough above both `SURFACE` and `BG` to read as a hover on either.
+    pub const HOVER: Color32 = Color32::from_rgb(52, 57, 66);
+
+    /// Spacing scale, in points. Reach for the nearest step rather than a bare
+    /// number so the rhythm survives an edit.
+    pub const SPACE_XS: f32 = 4.0;
+    pub const SPACE_S: f32 = 8.0;
+    pub const SPACE_M: f32 = 12.0;
+    /// Height of the custom title bar, close to a native Windows caption.
+    pub const TITLE_BAR_HEIGHT: f32 = 36.0;
+    /// Widest a column of text may get, so prose does not stretch across a
+    /// maximised window. Screens that show video ignore it on purpose.
+    pub const CONTENT_MAX_WIDTH: f32 = 720.0;
 
     /// Installs the palette into egui's global visuals.
     ///
@@ -106,7 +120,7 @@ mod theme {
         visuals.faint_bg_color = Color32::from_rgb(23, 26, 30);
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 38, 44);
         visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(35, 38, 44);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 52, 60);
+        visuals.widgets.hovered.bg_fill = HOVER;
         visuals.widgets.active.bg_fill = Color32::from_rgb(56, 61, 70);
         // Any hairline egui draws — separators, widget outlines — is the palette's
         // BORDER, not the default dark-theme grey.
@@ -311,6 +325,202 @@ fn fullscreen_key(input: &egui::InputState, fullscreen: bool) -> bool {
         && !input.modifiers.alt
         && !input.modifiers.command
         && !input.modifiers.shift
+}
+
+/// How close to a window edge the pointer has to be, in points, for a press to
+/// start an OS resize. An undecorated window gets no native resize border, so
+/// this is what stands in for one.
+const RESIZE_MARGIN: f32 = 6.0;
+
+/// Which edge or corner the pointer would resize, or `None` in the middle.
+///
+/// The corners are matched first: a pointer in the north-west margin is inside
+/// both the west and the north bands, and the diagonal is what a user expects
+/// there. Pure geometry, so it is the one piece of the chrome worth a test.
+fn resize_hit(pointer: egui::Pos2, rect: egui::Rect, margin: f32) -> Option<egui::ResizeDirection> {
+    use egui::ResizeDirection as Dir;
+    if !rect.contains(pointer) {
+        return None;
+    }
+    let west = pointer.x < rect.min.x + margin;
+    let east = pointer.x > rect.max.x - margin;
+    let north = pointer.y < rect.min.y + margin;
+    let south = pointer.y > rect.max.y - margin;
+    match (west, east, north, south) {
+        (true, _, true, _) => Some(Dir::NorthWest),
+        (_, true, true, _) => Some(Dir::NorthEast),
+        (true, _, _, true) => Some(Dir::SouthWest),
+        (_, true, _, true) => Some(Dir::SouthEast),
+        (true, _, _, _) => Some(Dir::West),
+        (_, true, _, _) => Some(Dir::East),
+        (_, _, true, _) => Some(Dir::North),
+        (_, _, _, true) => Some(Dir::South),
+        _ => None,
+    }
+}
+
+/// The pointer cursor that advertises a resize in `dir`.
+fn resize_cursor(dir: egui::ResizeDirection) -> egui::CursorIcon {
+    use egui::CursorIcon as Cursor;
+    use egui::ResizeDirection as Dir;
+    match dir {
+        Dir::North | Dir::South => Cursor::ResizeVertical,
+        Dir::East | Dir::West => Cursor::ResizeHorizontal,
+        Dir::NorthEast | Dir::SouthWest => Cursor::ResizeNeSw,
+        Dir::NorthWest | Dir::SouthEast => Cursor::ResizeNwSe,
+    }
+}
+
+/// Starts an OS-driven resize when the pointer presses a window edge.
+///
+/// The command hands the drag straight to the OS, which is why it is sent on
+/// the press and the drag is not tracked here. `controls` is the title bar's
+/// button cluster: it reaches the window's top and right edges, and the OS
+/// border has to yield to it or the close button would resize the window.
+fn window_resize(ctx: &egui::Context, controls: Option<egui::Rect>) {
+    let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
+        return;
+    };
+    if controls.is_some_and(|rect| rect.contains(pointer)) {
+        return;
+    }
+    let Some(dir) = resize_hit(pointer, ctx.screen_rect(), RESIZE_MARGIN) else {
+        return;
+    };
+    ctx.set_cursor_icon(resize_cursor(dir));
+    if ctx.input(|input| input.pointer.primary_pressed()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+    }
+}
+
+/// The window controls the custom title bar draws.
+#[derive(Clone, Copy)]
+enum Caption {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+/// A Windows-style caption button: a flat square that only paints a background
+/// on hover. The glyph is drawn rather than typed, so it does not depend on
+/// whichever ones the bundled font happens to carry.
+fn caption_button(
+    ui: &mut egui::Ui,
+    caption: Caption,
+    hover_fill: Color32,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(44.0, theme::TITLE_BAR_HEIGHT),
+        egui::Sense::click(),
+    );
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, hover_fill);
+    }
+    let color = if hovered { Color32::WHITE } else { theme::TEXT };
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    let center = rect.center();
+    let half = 5.0;
+    match caption {
+        Caption::Minimize => {
+            painter.hline(
+                egui::Rangef::new(center.x - half, center.x + half),
+                center.y,
+                stroke,
+            );
+        }
+        Caption::Maximize => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::Vec2::splat(half * 2.0)),
+                egui::CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Caption::Restore => {
+            let back = egui::Rect::from_center_size(
+                center + egui::vec2(-2.0, -2.0),
+                egui::Vec2::splat(half * 1.7),
+            );
+            painter.rect_stroke(
+                back,
+                egui::CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            let front = egui::Rect::from_center_size(
+                center + egui::vec2(2.0, 2.0),
+                egui::Vec2::splat(half * 1.7),
+            );
+            // Punch the front pane out of the back one so the overlap reads as
+            // two windows rather than a smudge.
+            painter.rect_filled(front, egui::CornerRadius::ZERO, theme::SURFACE);
+            painter.rect_stroke(
+                front,
+                egui::CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Caption::Close => {
+            painter.line_segment(
+                [
+                    center - egui::vec2(half, half),
+                    center + egui::vec2(half, half),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(half, -half),
+                    center - egui::vec2(half, -half),
+                ],
+                stroke,
+            );
+        }
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// A frameless text control for the title bar: it shows `hover_fill` behind the
+/// text only while hovered. A plain `Label` gives no feedback and `ui.button`
+/// would wear its frame all the time, which the title bar does not want.
+fn title_text_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: Color32,
+    hover_fill: Color32,
+) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(15.0), color);
+    let padding = egui::vec2(theme::SPACE_S, 0.0);
+    let (rect, response) =
+        ui.allocate_exact_size(galley.size() + padding * 2.0, egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, hover_fill);
+    }
+    ui.painter().galley(rect.min + padding, galley, color);
+    response
+}
+
+/// Runs `add` in a column centred at a readable width.
+///
+/// Only for screens that are mostly text; capping a screen that shows video
+/// would shrink the stream for no gain.
+fn text_column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let width = ui.available_width().min(theme::CONTENT_MAX_WIDTH);
+    let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.add_space(margin);
+        ui.vertical(|ui| {
+            ui.set_max_width(width);
+            add(ui);
+        });
+    });
 }
 
 /// The measurement the adaptive controller should act on, as `(loss, fps)`.
@@ -1126,30 +1336,129 @@ impl ArgosApp {
         }
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button(RichText::new("ARGOS").strong().size(18.0))
-                    .on_hover_text("Home")
-                    .clicked()
-                {
-                    self.screen = Screen::Home;
+    /// The single bar at the top: the app name, the status, and the window
+    /// controls. It replaces the OS caption bar (the window is undecorated), so
+    /// it also owns dragging the window and the double-click to maximise.
+    fn title_bar(&mut self, ctx: &egui::Context) {
+        let maximized = ctx
+            .input(|input| input.viewport().maximized)
+            .unwrap_or(false);
+        let mut go_home = false;
+        let mut open_profile = false;
+        let mut restart = false;
+        // The button cluster, unioned as it is built so `window_resize` can keep
+        // the OS resize border off it.
+        let mut controls: Option<egui::Rect> = None;
+
+        egui::TopBottomPanel::top("title_bar")
+            .exact_height(theme::TITLE_BAR_HEIGHT)
+            .frame(egui::Frame::NONE.fill(theme::SURFACE))
+            .show(ctx, |ui| {
+                let mut note = |rect: egui::Rect| {
+                    controls = Some(controls.map_or(rect, |prev| prev.union(rect)));
+                };
+                // The bar is the drag handle. It is interacted before the buttons
+                // are added so that they, drawn on top, keep their own clicks.
+                let bar = ui.max_rect();
+                let drag = ui.interact(
+                    bar,
+                    ui.id().with("title_bar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
-                ui.separator();
-                if ui
-                    .button(RichText::new(self.profile_label()).color(theme::ACCENT))
-                    .on_hover_text("Your name, as friends will see it")
-                    .clicked()
+                // A press in the top resize strip belongs to the edge, not the
+                // drag, or the two would fight over the first few pixels.
+                if drag.drag_started_by(egui::PointerButton::Primary)
+                    && drag
+                        .interact_pointer_pos()
+                        .is_some_and(|pos| pos.y > bar.min.y + RESIZE_MARGIN)
                 {
-                    self.name_input.clone_from(&self.config.name);
-                    self.show_settings = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(self.status_text()).color(theme::MUTED));
+
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(theme::SPACE_M);
+                    if title_text_button(ui, "Argos", theme::TEXT, theme::HOVER)
+                        .on_hover_text("Home")
+                        .clicked()
+                    {
+                        go_home = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close = caption_button(ui, Caption::Close, theme::ERR, "Close");
+                        note(close.rect);
+                        if close.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        let (caption, tooltip) = if maximized {
+                            (Caption::Restore, "Restore")
+                        } else {
+                            (Caption::Maximize, "Maximize")
+                        };
+                        let maximize = caption_button(ui, caption, theme::HOVER, tooltip);
+                        note(maximize.rect);
+                        if maximize.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        let minimize =
+                            caption_button(ui, Caption::Minimize, theme::HOVER, "Minimize");
+                        note(minimize.rect);
+                        if minimize.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+
+                        // Profile and Restart share the overflow rather than
+                        // spending a permanent place in the bar on either.
+                        let menu = ui.menu_button("…", |ui| {
+                            ui.set_min_width(180.0);
+                            if ui
+                                .button(format!("Profile: {}", self.profile_label()))
+                                .clicked()
+                            {
+                                open_profile = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Restart Argos").clicked() {
+                                restart = true;
+                                ui.close();
+                            }
+                        });
+                        note(menu.response.rect);
+
+                        // Added label-first so the dot lands to its left: this
+                        // branch lays widgets out right to left.
+                        ui.add_space(theme::SPACE_S);
+                        let (label, color) = self.status();
+                        ui.label(RichText::new(label).color(color));
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.5, color);
+                    });
                 });
             });
-        });
+
+        // Run with the cluster just measured, so a press on a caption button is
+        // never mistaken for a press on the window edge.
+        window_resize(ctx, controls);
+
+        if go_home {
+            self.screen = Screen::Home;
+        }
+        if open_profile {
+            self.name_input.clone_from(&self.config.name);
+            self.show_settings = true;
+        }
+        if restart {
+            // Same as the Advanced button did: on success this process is gone
+            // before the frame ends, so the error can only be set on failure.
+            if let Err(error) = self.restart() {
+                self.restart_error = Some(error);
+            }
+        }
     }
 
     fn side_bar(&mut self, ctx: &egui::Context) {
@@ -2820,6 +3129,13 @@ impl ArgosApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let people = match peers.len() {
+                    0 => "People".to_string(),
+                    n => format!("People ({n})"),
+                };
+                ui.add_space(theme::SPACE_XS);
+                ui.label(RichText::new(people).weak());
+
                 if self.lan.is_none() {
                     ui.label(RichText::new("Peer discovery is unavailable").weak());
                 } else if peers.is_empty() {
@@ -2828,28 +3144,31 @@ impl ArgosApp {
 
                 for peer in &peers {
                     ui.horizontal(|ui| {
+                        ui.set_min_height(24.0);
                         // The app's one loud element: a filled dot for a live
                         // peer, an open ring for someone present but not
                         // sharing. Everything after it stays quiet.
                         let (dot, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+                            ui.allocate_exact_size(egui::vec2(14.0, 24.0), egui::Sense::hover());
                         if peer.sharing {
-                            ui.painter().circle_filled(dot.center(), 3.0_f32, theme::OK);
+                            ui.painter().circle_filled(dot.center(), 4.0_f32, theme::OK);
                         } else {
                             ui.painter().circle_stroke(
                                 dot.center(),
-                                3.0_f32,
+                                4.0_f32,
                                 egui::Stroke::new(1.0_f32, theme::MUTED),
                             );
                         }
                         if peer.sharing {
                             let selected =
                                 matches!(&self.screen, Screen::Peer(id) if id == &peer.id);
+                            // Full width so the selection reads as a row, not a
+                            // word-sized button.
                             if ui
-                                .add(egui::Button::selectable(
-                                    selected,
-                                    RichText::new(&peer.name),
-                                ))
+                                .add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::Button::selectable(selected, RichText::new(&peer.name)),
+                                )
                                 .clicked()
                             {
                                 self.screen = Screen::Peer(peer.id.clone());
@@ -2877,8 +3196,13 @@ impl ArgosApp {
                     }
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_S);
                 self.network_status(ui);
+                // Restart lives in the title bar's overflow now; its failure
+                // stays here, where it is visible after the menu has closed.
+                if let Some(error) = &self.restart_error {
+                    ui.label(RichText::new(error).color(theme::ERR));
+                }
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("Advanced")
                     .default_open(false)
@@ -2941,26 +3265,6 @@ impl ArgosApp {
                         {
                             ui.label(RichText::new("Your reply code").strong());
                             Self::code_widget(ui, code, 2);
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(
-                                "Starts a new copy of Argos and closes this one. Use it when \
-                                 something is wedged and nothing else helps; it drops any \
-                                 stream in progress.",
-                            )
-                            .weak(),
-                        );
-                        if ui.button("Restart Argos").clicked() {
-                            // Inside the click, not after the loop: on success
-                            // this process is gone before the frame finishes,
-                            // so nothing below it will run either way.
-                            if let Err(error) = self.restart() {
-                                self.restart_error = Some(error);
-                            }
-                        }
-                        if let Some(error) = &self.restart_error {
-                            ui.label(RichText::new(error).color(theme::ERR));
                         }
                     });
             });
@@ -3927,30 +4231,33 @@ impl ArgosApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.screen.clone() {
-                    Screen::Home => self.welcome(ui),
-                    Screen::Share => self.share_view(ui),
+                    // Text screens sit in a centred column; the video screens
+                    // keep the full width so the stream is not shrunk.
+                    Screen::Home => text_column(ui, |ui| self.welcome(ui)),
+                    Screen::Share => text_column(ui, |ui| self.share_view(ui)),
                     Screen::Peer(id) => self.peer_view(ui, ctx, &id),
                     Screen::View => self.watch_view(ui, ctx),
                 });
         });
     }
 
-    fn status_text(&self) -> &str {
+    /// The status word and the colour that carries the same meaning at a glance.
+    fn status(&self) -> (&'static str, Color32) {
         if self
             .share
             .as_ref()
             .map(|share| share.sharer.is_connected())
             .unwrap_or(false)
         {
-            "sharing"
+            ("sharing", theme::OK)
         } else if self.view.is_some() {
-            "watching"
+            ("watching", theme::ACCENT)
         } else if self.live {
-            "live"
+            ("live", theme::OK)
         } else if self.capture.is_some() {
-            "previewing"
+            ("previewing", theme::WARN)
         } else {
-            "offline"
+            ("offline", theme::MUTED)
         }
     }
 }
@@ -4094,7 +4401,7 @@ impl eframe::App for ArgosApp {
         // fullscreen flag belonged to.
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
         if !fullscreen {
-            self.top_bar(ctx);
+            self.title_bar(ctx);
             self.side_bar(ctx);
         }
         if self.capture.is_some() {
@@ -4144,15 +4451,60 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        audience_from, bake_cursor, connect_step, encode_target, lan, roster_is_stale, worst_link,
-        ConnectStep, LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT,
-        KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, ROSTER_STALE, VIEWER_REPORT_TTL,
+        audience_from, bake_cursor, connect_step, encode_target, lan, resize_hit, roster_is_stale,
+        worst_link, ConnectStep, LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT,
+        KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, RESIZE_MARGIN, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use argos_media::encode::decode_target;
+    use eframe::egui;
     use std::time::{Duration, Instant};
 
     fn slot(name: &str) -> ViewerSlot {
         ViewerSlot::new(name, name, Instant::now())
+    }
+
+    /// The resize bands: corners win over edges, and the middle is not a resize
+    /// at all. This is the whole reason an undecorated window is still usable.
+    #[test]
+    fn resize_hit_maps_edges_and_corners() {
+        use egui::ResizeDirection as Dir;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let m = RESIZE_MARGIN;
+
+        assert_eq!(resize_hit(egui::pos2(3.0, 300.0), rect, m), Some(Dir::West));
+        assert_eq!(
+            resize_hit(egui::pos2(797.0, 300.0), rect, m),
+            Some(Dir::East)
+        );
+        assert_eq!(
+            resize_hit(egui::pos2(400.0, 3.0), rect, m),
+            Some(Dir::North)
+        );
+        assert_eq!(
+            resize_hit(egui::pos2(400.0, 597.0), rect, m),
+            Some(Dir::South)
+        );
+
+        assert_eq!(
+            resize_hit(egui::pos2(3.0, 3.0), rect, m),
+            Some(Dir::NorthWest)
+        );
+        assert_eq!(
+            resize_hit(egui::pos2(797.0, 3.0), rect, m),
+            Some(Dir::NorthEast)
+        );
+        assert_eq!(
+            resize_hit(egui::pos2(3.0, 597.0), rect, m),
+            Some(Dir::SouthWest)
+        );
+        assert_eq!(
+            resize_hit(egui::pos2(797.0, 597.0), rect, m),
+            Some(Dir::SouthEast)
+        );
+
+        assert_eq!(resize_hit(egui::pos2(400.0, 300.0), rect, m), None);
+        // Outside the window is not an edge either.
+        assert_eq!(resize_hit(egui::pos2(-5.0, 300.0), rect, m), None);
     }
 
     /// A waiting request repeats on schedule and then gives up, once.

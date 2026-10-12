@@ -1,12 +1,14 @@
 # Building Argos (Windows)
 
-Argos is Windows-only. Two dependencies compile native code at build time, so a C
-compiler and a linker are needed — but nothing else:
+Argos is Windows-only. A few dependencies need native tools at build time, so a
+C compiler, a linker, and the Windows SDK's `rc.exe` are needed — but nothing
+else:
 
 | Crate | What it needs |
 | --- | --- |
 | `openh264` / `openh264-sys2` | Compiles the openh264 C encoder from source (`cc`) |
 | `webrtc` / `rtc-*` → `ring` | On MSVC, links pregenerated assembly — no assembler |
+| `winresource` | Runs the SDK's `rc.exe` to embed the exe's icon (crate `argos-app` only) |
 
 **NASM is not required on MSVC.** `ring` 0.17.14 ships pregenerated x86-64 assembly
 for MSVC and only shells out to `nasm` on other toolchains. Verified by deleting

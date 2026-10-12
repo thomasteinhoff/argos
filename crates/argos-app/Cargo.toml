@@ -9,3 +9,8 @@ confy.workspace = true
 serde.workspace = true
 argos-core = { path = "../argos-core" }
 argos-media = { path = "../argos-media" }
+
+# Embeds assets/icon.ico into the executable. Windows-only because it drives the
+# SDK's `rc.exe`; the icon it produces is meaningless on any other platform.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }

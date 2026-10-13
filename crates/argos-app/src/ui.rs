@@ -4024,6 +4024,7 @@ impl ArgosApp {
             }
             sink.heading("Sending");
             Self::stage_row(sink, "acquire", &m.acquire);
+            Self::stage_row(sink, "readback", &m.readback);
             Self::stage_row(sink, "convert", &m.convert);
             Self::stage_row(sink, "encode", &m.encode);
             Self::stage_row(sink, "packetize", &m.packetize);
@@ -4037,6 +4038,21 @@ impl ArgosApp {
                     m.captured.frames(),
                     m.captured.frames() as f32 / secs,
                     m.captured.dropped()
+                ),
+            );
+            // The desktop's own rate, and how much of it the target cadence
+            // refused. `fresh` is what separates a stream held back by the gate
+            // from content that simply does not change that often: the two are
+            // indistinguishable in every other number on this panel.
+            Self::counter_row(
+                sink,
+                "cadence",
+                format!(
+                    "{} presented by the desktop, {} refused early ({:.1}/s), target {:.1} ms",
+                    m.fresh.get(),
+                    m.paced.get(),
+                    m.paced.get() as f32 / secs,
+                    m.cadence_target.get() as f64 / 1000.0
                 ),
             );
             Self::counter_row(
@@ -4300,6 +4316,9 @@ impl ArgosApp {
             frames.reset();
         }
         for counter in [
+            &metrics.fresh,
+            &metrics.paced,
+            &metrics.cadence_target,
             &metrics.encoded_bytes,
             &metrics.last_keyframe_bytes,
             &metrics.keyframes,

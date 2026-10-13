@@ -128,14 +128,25 @@ fn run(
     // `LastPresentTime == 0` even though it carries the current desktop. Send it
     // so a newly-connected viewer gets a picture without waiting for a change.
     let mut first = true;
-    let mut last = Instant::now() - Duration::from_secs(1);
+    // The cadence is a fixed grid of absolute deadlines, not "an interval since
+    // the last frame left". Two measured failures came from the latter:
+    //
+    // * Charging the clock after the readback added the readback's own time to
+    //   every interval, so a target equal to the display's interval refused every
+    //   second present and pinned the stream to 30 fps on a 60 Hz display.
+    // * The desktop's present grid rarely divides the target. At a 30 fps target
+    //   on a ~110 Hz display the gate can only send 3 or 4 presents apart, and
+    //   scheduling from the last send gives 27 fps; carrying the remainder on an
+    //   accumulating deadline averages the target exactly.
+    //
+    // A grid left far behind by a stall resyncs itself in `due_at`.
+    let mut next_due = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
         if !active.load(Ordering::Relaxed) {
             thread::sleep(INACTIVE_SLEEP);
-            last = Instant::now();
             // Coming back from idle, treat the next acquire as the first one: a
             // desktop sitting still produces no new frame, and the pointer moving
             // is reported with `LastPresentTime == 0`, so nothing would be sent
@@ -150,7 +161,9 @@ fn run(
                 *slot = Some(update);
             }
         }
-        let target = Duration::from_micros(interval.load(Ordering::Relaxed).max(1));
+        let interval_micros = interval.load(Ordering::Relaxed).max(1);
+        metrics.cadence_target.set(interval_micros);
+        let target = Duration::from_micros(interval_micros);
         let timeout = (target.as_millis().max(1) as u32).min(ACQUIRE_TIMEOUT_MILLIS);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
@@ -163,9 +176,16 @@ fn run(
                 // neither the GPU's latency nor ours, and left `readback` — which
                 // the pipeline readout displays — permanently zero.
                 metrics.acquire.record(waiting.elapsed());
+                // The picture became available as the acquire returned, so that is
+                // the instant the deadline is judged against. Judging it after the
+                // readback instead folded our own work into every interval.
+                let presented = Instant::now();
                 let fresh = info.LastPresentTime != 0 || first;
-                let due = last.elapsed() >= target;
-                if fresh && due {
+                if fresh {
+                    metrics.fresh.incr();
+                }
+                let due = fresh && due_at(&mut next_due, presented, target);
+                if due {
                     if let Some(resource) = resource.as_ref() {
                         let copying = Instant::now();
                         match readback(&device, &context, resource, &mut staging) {
@@ -184,11 +204,16 @@ fn run(
                                         return false;
                                     }
                                 }
-                                last = Instant::now();
                             }
                             Err(_) => metrics.readback.record(copying.elapsed()),
                         }
                     }
+                } else if fresh {
+                    // A new picture that arrived before its slot was due. Nothing
+                    // else can see this one: it never reaches the handoff queue,
+                    // so `captured.dropped()` does not move and the stream looks
+                    // healthy at whatever rate the gate allowed it.
+                    metrics.paced.incr();
                 }
                 // Always release: a held frame blocks the next acquire and is
                 // the path to DXGI_ERROR_ACCESS_LOST.
@@ -206,6 +231,35 @@ fn run(
             }
         }
     }
+}
+
+/// Reports whether a frame is due on a fixed cadence grid, advancing the grid.
+///
+/// `next_due` moves by exactly one interval per frame sent, never by the moment
+/// the frame actually went out, and the deadline is judged against the instant
+/// the picture became available. That makes the grid immune to the two things
+/// measured pinning a stream below its configured rate:
+///
+/// * Its own work. Charging the clock after the readback added the readback to
+///   every interval, so a target equal to the display's interval refused every
+///   second present and streamed a 60 Hz desktop at a flat 30 fps.
+/// * The desktop's present grid, which rarely divides the target. At 30 fps on a
+///   ~110 Hz display the gate can only send 3 or 4 presents apart: measured from
+///   the last send that is 27 fps, while carrying the remainder on an
+///   accumulating deadline averages the target exactly.
+///
+/// A grid left more than one interval behind — a stall, a display mode switch, a
+/// session that just resumed — resyncs to `now` rather than replaying its
+/// backlog, so a catch-up burst cannot happen.
+fn due_at(next_due: &mut Instant, now: Instant, target: Duration) -> bool {
+    if now < *next_due {
+        return false;
+    }
+    *next_due += target;
+    if now.saturating_duration_since(*next_due) > target {
+        *next_due = now + target;
+    }
+    true
 }
 
 fn readback(
@@ -442,5 +496,65 @@ fn create_duplication(monitor: HMONITOR) -> Result<Duplication, String> {
                 .map_err(|error| format!("DuplicateOutput: {error}"))?;
             return Ok((device, context, duplication));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::due_at;
+    use std::time::{Duration, Instant};
+
+    /// 110 Hz presents against a 30 fps target: the grid can only land on
+    /// presents, so frames must go out 3 or 4 of them apart and still average 30.
+    #[test]
+    fn a_fixed_grid_averages_the_target_on_a_display_that_does_not_divide_it() {
+        let start = Instant::now();
+        let target = Duration::from_micros(1_000_000 / 30);
+        let present = Duration::from_micros(1_000_000 / 110);
+        let mut next_due = start;
+        let mut sent = 0u32;
+        for step in 0..=2200 {
+            if due_at(&mut next_due, start + present * step, target) {
+                sent += 1;
+            }
+        }
+        // 20 s of presents. Measuring each interval from the last send gave 27 fps.
+        assert!((598..=602).contains(&sent), "sent {sent} in 20 s");
+    }
+
+    /// An early present is refused, and the refusal does not drag the grid
+    /// forward: a frame arriving late is charged to its own slot instead of
+    /// adding its lateness to every interval that follows.
+    #[test]
+    fn an_early_present_does_not_drift_the_grid() {
+        let start = Instant::now();
+        let target = Duration::from_micros(16_666);
+        let mut next_due = start;
+        assert!(due_at(&mut next_due, start, target));
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert!(!due_at(&mut next_due, at(9), target));
+        assert!(due_at(&mut next_due, at(19), target));
+        assert!(!due_at(&mut next_due, at(28), target));
+        assert!(due_at(&mut next_due, at(38), target));
+        assert!(!due_at(&mut next_due, at(45), target));
+        assert!(due_at(&mut next_due, at(55), target));
+    }
+
+    /// After a stall the grid is a whole interval or more behind. It resyncs
+    /// instead of replaying, so recovery sends one frame rather than sixty.
+    #[test]
+    fn a_stalled_grid_resyncs_instead_of_bursting() {
+        let start = Instant::now();
+        let target = Duration::from_micros(16_666);
+        let mut next_due = start;
+        assert!(due_at(&mut next_due, start, target));
+        let resumed = start + Duration::from_secs(1);
+        assert!(due_at(&mut next_due, resumed, target));
+        assert!(!due_at(
+            &mut next_due,
+            resumed + Duration::from_millis(1),
+            target
+        ));
+        assert!(due_at(&mut next_due, resumed + target, target));
     }
 }

@@ -298,6 +298,31 @@ pub struct SenderMetrics {
     pub queued: DropCounter,
     /// Frames the encoder turned into a bitstream.
     pub encoded: DropCounter,
+    /// New pictures the desktop presented, before the target cadence is applied.
+    ///
+    /// This is the desktop's own rate, and it is the only counter that can tell a
+    /// stream that is being held back from one whose content simply does not
+    /// change that often: with [`SenderMetrics::paced`] it accounts for
+    /// `captured`, because every fresh frame is either sent or refused early.
+    /// Half the desktop's rate looks identical to a desktop changing half as
+    /// often without it.
+    pub fresh: Counter,
+    /// Fresh frames refused because the next frame was not due yet.
+    ///
+    /// The refusal is invisible everywhere else. The frame never reaches the
+    /// handoff queue, so it is not a `captured` drop; no stage timer changes; and
+    /// the readout shows a healthy stream at whatever rate the gate allowed. On a
+    /// 60 Hz display a target equal to the refresh interval refused every second
+    /// present and pinned the whole pipeline to 30 fps with every other counter
+    /// sitting at zero.
+    pub paced: Counter,
+    /// The frame interval the capture gate is honouring, in microseconds.
+    ///
+    /// A gauge rather than a total, like `captured_width`. It is here because a
+    /// report cannot otherwise tell a slow stream that is at its configured
+    /// cadence from one being held below it: `captured` alone looks the same in
+    /// both cases.
+    pub cadence_target: Counter,
     /// Total bitstream bytes.
     pub encoded_bytes: Counter,
     /// Bytes in the most recently encoded keyframe.

@@ -120,7 +120,7 @@ impl CaptureSession {
             return Err("capture already running".to_string());
         }
         let wanted = source.name.clone();
-        let (tx, rx) = sync_channel::<Frame>(1);
+        let (tx, rx) = sync_channel::<Frame>(2);
         let stop = self.stop.clone();
         let active = self.active.clone();
         let interval = self.interval.clone();

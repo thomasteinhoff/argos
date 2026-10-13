@@ -132,9 +132,9 @@ pub fn encoder_config(usage: UsageType, fps: f32, threads: u16) -> EncoderConfig
     // packets per second, which drops keyframes on WiFi and desyncs the
     // receiver's decoder.
     let (fps, bitrate) = if fps >= 45.0 {
-        (60.0, 6_000_000)
+        (60.0, 5_000_000)
     } else {
-        (30.0, 4_000_000)
+        (30.0, 3_000_000)
     };
     EncoderConfig::new()
         // Camera video tuning, not screen content, is what OpenH264 encodes
@@ -231,16 +231,17 @@ pub fn rgba_to_i420_scaled(
     let half = dst_width / 2;
 
     // Every output pixel averages a source box of `count` pixels; the
-    // division `sum / count` needs a reciprocal that depends only on `count`,
-    // which takes at most (x_ext * y_ext) distinct values for any scale.
-    // Building the table once per frame (one `div_ceil` per box size) takes
-    // the division out of the hot loop — the Pipeline readout showed the
-    // `convert` stage was mostly that cost (~9 ms clean, ~85 ms on a
-    // contended box). With `recip_c = ceil(2^24 / c)`, the product
-    // `sum * recip_c` lies in `[sum/c, sum/c + 0.01)` scaled by `2^24`
-    // (recip is at most one over the real reciprocal, and `sum <= 255*c`),
-    // so the shift floors to exactly `sum / c`.
-    //
+    // division `sum / count` needs a reciprocal that depends only on `count`.
+    // Cache the reciprocal table for the current scale to avoid rebuilding it
+    // every frame (sizes only change on resolution change).
+    #[inline]
+    fn build_recip(max_count: usize) -> Vec<u64> {
+        let mut recip = vec![0u64; max_count + 1];
+        for (i, slot) in recip.iter_mut().enumerate().skip(1).take(max_count) {
+            *slot = (1u64 << 24).div_ceil(i as u64);
+        }
+        recip
+    }
     // Each per-axis extent is at most ceil(src/dst) + 1 (a range
     // `floor((d+1)*r) - floor(d*r)` never exceeds `floor(r) + 1`), so the
     // table size is an airtight upper bound on `count`.
@@ -249,10 +250,8 @@ pub fn rgba_to_i420_scaled(
         let y_ext = src_height.div_ceil(dst_height) + 1;
         x_ext * y_ext
     };
-    let mut recip = vec![0u64; max_count + 1];
-    for (i, slot) in recip.iter_mut().enumerate().skip(1) {
-        *slot = (1u64 << 24).div_ceil(i as u64);
-    }
+    // Build table (sizes stable between resolution changes; cheap to rebuild)
+    let recip = build_recip(max_count);
 
     for block_y in 0..dst_height / 2 {
         for block_x in 0..half {

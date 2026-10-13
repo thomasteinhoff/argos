@@ -1754,7 +1754,7 @@ impl ArgosApp {
                 return Err(error);
             }
         };
-        let (tx, rx) = sync_channel::<EncodeMsg>(4);
+        let (tx, rx) = sync_channel::<EncodeMsg>(12);
         let force_keyframe = Arc::new(AtomicBool::new(false));
         let worker_force_keyframe = Arc::clone(&force_keyframe);
         let target_height = Arc::new(AtomicI32::new(encode_target(self.share_height)));

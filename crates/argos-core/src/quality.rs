@@ -35,7 +35,7 @@ const UP_LOSS: f32 = 0.5;
 /// remedy, a resolution drop, costs a forced intra frame.
 const DOWN_DROPS: f32 = 10.0;
 /// Encoder drops below this count as headroom.
-const UP_DROPS: f32 = 1.0;
+const UP_DROPS: f32 = 3.0;
 
 /// How long loss must stay bad before a step down. Short enough to react to a
 /// genuinely bad link, long enough that one burst is not treated as a trend.
@@ -46,7 +46,7 @@ const LOAD_HOLD: Duration = Duration::from_secs(3);
 /// Recovery takes much longer than the way down. Stepping up into a link that
 /// is still congested reintroduces the loss that caused the step down, and
 /// the oscillation is more visible than either end state.
-const UP_HOLD: Duration = Duration::from_secs(8);
+const UP_HOLD: Duration = Duration::from_secs(4);
 /// Floor between any two changes.
 const MIN_HOLD: Duration = Duration::from_secs(5);
 

@@ -80,10 +80,10 @@ mod theme {
     pub const SURFACE: Color32 = Color32::from_rgb(28, 31, 36);
     /// Hairlines between sections of a dark surface.
     pub const BORDER: Color32 = Color32::from_rgb(42, 46, 53);
-    /// Primary text. Contrast on `BG`: ~16:1.
+    /// Primary text. Contrast on `BG`: ~15:1.
     pub const TEXT: Color32 = Color32::from_rgb(232, 234, 237);
     /// Secondary text: anything that must hold still while status changes.
-    /// Contrast on `BG`: ~5.6:1.
+    /// Contrast on `BG`: ~6.5:1.
     pub const MUTED: Color32 = Color32::from_rgb(150, 156, 166);
     /// The brand — a watch blue, this app's own identity.
     pub const ACCENT: Color32 = Color32::from_rgb(160, 190, 255);
@@ -91,37 +91,76 @@ mod theme {
     pub const OK: Color32 = Color32::from_rgb(150, 220, 150);
     /// Something is being waited on.
     pub const WARN: Color32 = Color32::from_rgb(220, 200, 120);
-    /// Something is wrong.
-    pub const ERR: Color32 = Color32::from_rgb(220, 120, 120);
-    /// The fill a flat control wears while the pointer is over it. One shade
-    /// enough above both `SURFACE` and `BG` to read as a hover on either.
-    pub const HOVER: Color32 = Color32::from_rgb(52, 57, 66);
+    /// Something is wrong. Held to roughly the weight of the other two, because
+    /// a failure being the quietest thing on a dark screen is its own bug.
+    /// Contrast on `BG`: ~7.2:1.
+    pub const ERR: Color32 = Color32::from_rgb(235, 135, 135);
+
+    /// The fill of a resting control: buttons, selectable rows.
+    pub const RAISED: Color32 = Color32::from_rgb(35, 38, 44);
+    /// The fill a control wears while the pointer is over it. Deliberately one
+    /// visible step above both `SURFACE` and `RAISED`: a hover nobody notices is
+    /// a hover that does not exist, and the pointer has no other way to say "this
+    /// responds".
+    pub const HOVER: Color32 = Color32::from_rgb(66, 73, 84);
+    /// The fill a control wears while held. Above `HOVER`, so a press reads as
+    /// going further in rather than bouncing back out.
+    pub const PRESSED: Color32 = Color32::from_rgb(84, 92, 105);
+    /// Sunken fields egui draws itself, chiefly text edits.
+    pub const INSET: Color32 = Color32::from_rgb(13, 14, 16);
+    /// The faintest surface egui draws, for alternating rows.
+    pub const FAINT: Color32 = Color32::from_rgb(23, 26, 30);
 
     /// Spacing scale, in points. Reach for the nearest step rather than a bare
     /// number so the rhythm survives an edit.
     pub const SPACE_XS: f32 = 4.0;
     pub const SPACE_S: f32 = 8.0;
     pub const SPACE_M: f32 = 12.0;
+
+    /// Corner radius for a small control — a hover fill, a chip. egui's own unit
+    /// is whole pixels, so these are `u8` rather than the `f32` of the scale.
+    pub const RADIUS_S: u8 = 4;
+    /// Corner radius for a floating panel or a framed picture.
+    pub const RADIUS: u8 = 6;
+
+    /// Type scale, in points: caption, body, and the one loud line. Installed
+    /// into egui as its text styles, so a screen asks for "heading" or "body"
+    /// rather than passing a bare size to a call site.
+    ///
+    /// These are the knob to turn if the UI reads too big or too small: Plex Sans
+    /// carries a taller x-height than the face egui ships, so it looks larger at
+    /// the same size — `TEXT_M` alone shifts every ordinary label.
+    pub const TEXT_S: f32 = 12.0;
+    pub const TEXT_M: f32 = 13.0;
+    pub const TEXT_L: f32 = 17.0;
+
     /// Height of the custom title bar, close to a native Windows caption.
     pub const TITLE_BAR_HEIGHT: f32 = 36.0;
     /// Widest a column of text may get, so prose does not stretch across a
     /// maximised window. Screens that show video ignore it on purpose.
     pub const CONTENT_MAX_WIDTH: f32 = 720.0;
 
-    /// Installs the palette into egui's global visuals.
+    /// The sidebar's width, and the range a drag may take it to. The People list
+    /// grows with the names in it, so the panel is resizable — but not unbounded:
+    /// a sidebar that can swallow the window is worse than one that cannot move.
+    pub const SIDEBAR_WIDTH: f32 = 240.0;
+    pub const SIDEBAR_MIN_WIDTH: f32 = 170.0;
+    pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+
+    /// Installs the palette and the type scale into egui's global style.
     ///
-    /// Text follows egui's dark defaults — the palette only moves surfaces and
-    /// status — so `.weak()` and friends keep their meaning.
+    /// Text colours still follow egui's dark defaults — this moves surfaces,
+    /// status, and sizes — so `.weak()` and friends keep their meaning.
     pub fn apply(ctx: &egui::Context) {
         let mut visuals = Visuals::dark();
         visuals.panel_fill = BG;
         visuals.window_fill = SURFACE;
-        visuals.extreme_bg_color = Color32::from_rgb(13, 14, 16);
-        visuals.faint_bg_color = Color32::from_rgb(23, 26, 30);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 38, 44);
-        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(35, 38, 44);
+        visuals.extreme_bg_color = INSET;
+        visuals.faint_bg_color = FAINT;
+        visuals.widgets.inactive.bg_fill = RAISED;
+        visuals.widgets.inactive.weak_bg_fill = RAISED;
         visuals.widgets.hovered.bg_fill = HOVER;
-        visuals.widgets.active.bg_fill = Color32::from_rgb(56, 61, 70);
+        visuals.widgets.active.bg_fill = PRESSED;
         // Any hairline egui draws — separators, widget outlines — is the palette's
         // BORDER, not the default dark-theme grey.
         visuals.widgets.noninteractive.bg_stroke.color = BORDER;
@@ -133,7 +172,51 @@ mod theme {
         visuals.weak_text_color = Some(MUTED);
         visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
         visuals.hyperlink_color = ACCENT;
-        ctx.set_visuals(visuals);
+
+        // The sizes, installed the same way as the colours so that "body" and
+        // "heading" are names rather than numbers scattered through the file. The
+        // monospace face is reserved for readouts: fixed digit widths stop the
+        // live numbers from reflowing every time they tick.
+        let mut style = (*ctx.style()).clone();
+        style.text_styles = [
+            (egui::TextStyle::Heading, egui::FontId::proportional(TEXT_L)),
+            (egui::TextStyle::Body, egui::FontId::proportional(TEXT_M)),
+            (egui::TextStyle::Button, egui::FontId::proportional(TEXT_M)),
+            (egui::TextStyle::Small, egui::FontId::proportional(TEXT_S)),
+            (egui::TextStyle::Monospace, egui::FontId::monospace(TEXT_M)),
+        ]
+        .into();
+        style.visuals = visuals;
+        ctx.set_style(style);
+    }
+
+    /// The app's proportional face: IBM Plex Sans, embedded so the type is
+    /// Argos's own rather than whatever egui ships. This is the variable font,
+    /// resolved at its default instance (Regular); its licence sits beside it as
+    /// `assets/IBMPlexSans-OFL.txt`.
+    const PROPORTIONAL: &[u8] = include_bytes!("../assets/IBMPlexSans.ttf");
+
+    /// Installs the font families.
+    ///
+    /// Separate from `apply` because it must run *once*: `set_fonts` rebuilds the
+    /// glyph atlas, and rebuilding it every frame would cost more than the type
+    /// is worth. So this is called from `ArgosApp::new`, and `apply` stays the
+    /// per-frame part.
+    pub fn install_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "plex-sans".to_owned(),
+            egui::FontData::from_static(PROPORTIONAL).into(),
+        );
+        // Front of the proportional family, so every non-monospace label is Plex.
+        // The bundled faces stay behind it as fallbacks for the glyphs it does
+        // not carry — emoji, arrows and the like.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "plex-sans".to_owned());
+        ctx.set_fonts(fonts);
     }
 }
 
@@ -279,6 +362,16 @@ const DIAG_DECODE_SAMPLES: usize = 60;
 /// keep a large stream from becoming a postage stamp in a sidebar, and a
 /// fullscreen window is not a sidebar.
 const VIEWER_IMAGE_CAP: egui::Vec2 = egui::vec2(1024.0, 576.0);
+
+/// Shortest a picture is ever drawn.
+///
+/// The share screen keeps its preview under all of its controls, inside a scroll
+/// area, so the room left below them shrinks as the window does — and on a short
+/// window there is none left at all. Sizing to that drew a one-pixel sliver that
+/// reads as a broken preview rather than as a tight window. A floor plus a
+/// scrollbar is the honest answer: the picture stays a picture and the window
+/// scrolls to it.
+const MIN_IMAGE_HEIGHT: f32 = 180.0;
 
 /// How long the fullscreen controls stay on screen after the mouse last moved.
 ///
@@ -494,14 +587,16 @@ fn title_text_button(
     color: Color32,
     hover_fill: Color32,
 ) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(15.0), color);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(theme::TEXT_M),
+        color,
+    );
     let padding = egui::vec2(theme::SPACE_S, 0.0);
     let (rect, response) =
         ui.allocate_exact_size(galley.size() + padding * 2.0, egui::Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 4.0, hover_fill);
+        ui.painter().rect_filled(rect, theme::RADIUS_S, hover_fill);
     }
     ui.painter().galley(rect.min + padding, galley, color);
     response
@@ -521,6 +616,19 @@ fn text_column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             add(ui);
         });
     });
+}
+
+/// The size a picture is drawn at: as much of `available` as it can use, never
+/// past `max`, and never shorter than `MIN_IMAGE_HEIGHT`.
+///
+/// Split out from the drawing so the sizing — the part with the floor in it, and
+/// the part that quietly decides whether a stream is visible at all — can be
+/// tested without a window.
+fn picture_size(available: egui::Vec2, max: egui::Vec2, aspect: f32) -> egui::Vec2 {
+    let box_width = max.x.min(available.x.max(1.0));
+    let box_height = max.y.min(available.y.max(MIN_IMAGE_HEIGHT));
+    let width = box_width.min(box_height * aspect);
+    egui::vec2(width, width / aspect)
 }
 
 /// The measurement the adaptive controller should act on, as `(loss, fps)`.
@@ -1222,6 +1330,10 @@ fn viewer_audience(ui: &mut egui::Ui, view: &ViewSession, alpha: f32) {
 pub struct ArgosApp {
     config: AppConfig,
     screen: Screen,
+    /// The app icon as a texture, for the welcome screen's lockup. Built once at
+    /// startup from the same PNG the window icon uses, so the two can never
+    /// disagree about the artwork.
+    icon: Option<egui::TextureHandle>,
     show_settings: bool,
     /// Why the last attempt to write the profile failed, shown in the Profile
     /// window. Kept separate from the in-memory `config` so the window can stay
@@ -1280,13 +1392,30 @@ pub struct ArgosApp {
 }
 
 impl ArgosApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Once, not per frame: setting fonts rebuilds the glyph atlas.
+        theme::install_fonts(&cc.egui_ctx);
+        // The same artwork the window icon is built from, turned into a texture
+        // the welcome screen can draw. `ok()` rather than `expect` because a bad
+        // PNG already fails loudly in `main` and in the icon test; a missing
+        // welcome picture is not worth taking the app down for.
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+            .ok()
+            .map(|data| {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [data.width as usize, data.height as usize],
+                    &data.rgba,
+                );
+                cc.egui_ctx
+                    .load_texture("argos-icon", image, egui::TextureOptions::LINEAR)
+            });
         let config = config::load();
         let (lan, lan_error) = match lan::Lan::start(config.name.clone()) {
             Ok(lan) => (Some(lan), None),
             Err(error) => (None, Some(error)),
         };
         Self {
+            icon,
             name_input: config.name.clone(),
             code_input: String::new(),
             monitors: Vec::new(),
@@ -1463,10 +1592,11 @@ impl ArgosApp {
 
     fn side_bar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("side_panel")
-            .resizable(false)
-            .default_width(240.0)
+            .resizable(true)
+            .default_width(theme::SIDEBAR_WIDTH)
+            .width_range(theme::SIDEBAR_MIN_WIDTH..=theme::SIDEBAR_MAX_WIDTH)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_XS);
                 let selected = self.screen == Screen::Share;
                 if ui
                     .add_sized(
@@ -1497,7 +1627,7 @@ impl ArgosApp {
                         .hint_text("Your name")
                         .desired_width(260.0),
                 );
-                ui.add_space(8.0);
+                ui.add_space(theme::SPACE_S);
                 if let Some(error) = &self.settings_error {
                     ui.label(RichText::new(error).color(theme::ERR));
                 }
@@ -2776,12 +2906,8 @@ impl ArgosApp {
         if !aspect.is_finite() || aspect <= 0.0 {
             return;
         }
-        let available = ui.available_size();
-        let box_width = max.x.min(available.x.max(1.0));
-        let box_height = max.y.min(available.y.max(1.0));
-        let width = box_width.min(box_height * aspect);
-        let height = width / aspect;
-        ui.image((preview.texture.id(), egui::vec2(width, height)));
+        let size = picture_size(ui.available_size(), max, aspect);
+        ui.image((preview.texture.id(), size));
     }
 
     fn network_status(&mut self, ui: &mut egui::Ui) {
@@ -2842,7 +2968,7 @@ impl ArgosApp {
                 quality.fps, quality.mbps, quality.loss
             ))
             .color(color)
-            .size(16.0),
+            .monospace(),
         );
         // Recovery state, because "the fps is bad" and "the app is asking the
         // sharer to fix it" are different situations and only one of them is
@@ -2886,7 +3012,7 @@ impl ArgosApp {
         } else {
             "Share your screen"
         });
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
         if self.live || self.share.is_some() {
             if ui.button("Stop streaming").clicked() {
                 do_stop_live = true;
@@ -3016,7 +3142,7 @@ impl ArgosApp {
                 }
             });
 
-        ui.add_space(6.0);
+        ui.add_space(theme::SPACE_S);
         let preview_label = if self.preview_active {
             "Stop preview"
         } else {
@@ -3029,7 +3155,7 @@ impl ArgosApp {
             ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
 
-        ui.add_space(6.0);
+        ui.add_space(theme::SPACE_S);
         if let Some(share) = self.share.as_mut() {
             // Presence of the objects only proves the thread started. The state
             // handle is what says whether a device is actually being serviced
@@ -3081,14 +3207,17 @@ impl ArgosApp {
             ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
 
-        ui.add_space(8.0);
+        ui.add_space(theme::SPACE_S);
         if self.preview_active {
             if let Some(preview) = &self.preview {
-                ui.label(format!(
-                    "{}x{} @ {:.0} fps",
-                    preview.width, preview.height, self.fps
-                ));
-                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{}x{} @ {:.0} fps",
+                        preview.width, preview.height, self.fps
+                    ))
+                    .monospace(),
+                );
+                ui.add_space(theme::SPACE_S);
                 let aspect = preview.width as f32 / preview.height.max(1) as f32;
                 Self::render_image(ui, preview, aspect, VIEWER_IMAGE_CAP);
             }
@@ -3203,7 +3332,7 @@ impl ArgosApp {
                 if let Some(error) = &self.restart_error {
                     ui.label(RichText::new(error).color(theme::ERR));
                 }
-                ui.add_space(6.0);
+                ui.add_space(theme::SPACE_S);
                 egui::CollapsingHeader::new("Advanced")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -3316,19 +3445,22 @@ impl ArgosApp {
         if let Some(error) = &self.view_error {
             ui.label(RichText::new(error.to_string()).color(theme::ERR));
         }
-        ui.add_space(8.0);
+        ui.add_space(theme::SPACE_S);
 
         let available = ui.available_size();
         let width = available.x.clamp(320.0, 1024.0);
         let height = (width * 9.0 / 16.0).min(available.y.max(200.0));
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(6), Color32::from_gray(28));
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(theme::RADIUS),
+            theme::SURFACE,
+        );
         ui.painter().rect_stroke(
             rect,
-            egui::CornerRadius::same(6),
-            egui::Stroke::new(1.0_f32, Color32::from_gray(80)),
+            egui::CornerRadius::same(theme::RADIUS),
+            egui::Stroke::new(1.0_f32, theme::BORDER),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(
@@ -3339,8 +3471,8 @@ impl ArgosApp {
             } else {
                 "Click to watch"
             },
-            egui::FontId::proportional(20.0),
-            Color32::from_gray(200),
+            egui::FontId::proportional(theme::TEXT_L),
+            theme::TEXT,
         );
         if response.clicked() && !pending {
             self.request_view(id);
@@ -3459,7 +3591,7 @@ impl ArgosApp {
             if let Some(error) = &view.error {
                 ui.label(RichText::new(error).color(theme::ERR));
             }
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_S);
             if let Some(preview) = &view.texture {
                 ui.label(format!("Stream {}x{}", preview.width, preview.height));
                 let aspect = view
@@ -3481,7 +3613,7 @@ impl ArgosApp {
             // The verdict is computed from the very report that is on its way to
             // the sharer, so the two sides can never disagree about what this
             // machine measured — only about what to do about it.
-            ui.add_space(6.0);
+            ui.add_space(theme::SPACE_S);
             viewer_audience(ui, view, 1.0);
             let mine = view.quality.link_report(&view.metrics);
             let verdict = diagnose(&mine.diag, mine.loss, view.source_fps);
@@ -3491,11 +3623,11 @@ impl ArgosApp {
             } else {
                 ui.label(RichText::new(verdict_text).color(theme::WARN));
             }
-            ui.add_space(8.0);
+            ui.add_space(theme::SPACE_S);
             if ui.button("Stop watching").clicked() {
                 request_stop = true;
             }
-            ui.add_space(6.0);
+            ui.add_space(theme::SPACE_S);
             if ui
                 .button(if view.fullscreen {
                     "Leave fullscreen (Esc)"
@@ -3644,16 +3776,26 @@ impl ArgosApp {
     }
 
     fn welcome(&self, ui: &mut egui::Ui) {
-        ui.heading("Argos");
-        ui.add_space(6.0);
-        ui.label("Pick someone to watch, or press Share to stream your screen.");
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "Everyone on your Radmin network sees each other. No accounts, no servers.",
-            )
-            .weak(),
-        );
+        ui.horizontal_top(|ui| {
+            if let Some(icon) = &self.icon {
+                // The lockup: the app's own mark beside its words, so the first
+                // screen reads as Argos rather than as a form.
+                ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(56.0, 56.0)));
+                ui.add_space(theme::SPACE_M);
+            }
+            ui.vertical(|ui| {
+                ui.heading("Argos");
+                ui.add_space(theme::SPACE_S);
+                ui.label("Pick someone to watch, or press Share to stream your screen.");
+                ui.add_space(theme::SPACE_S);
+                ui.label(
+                    RichText::new(
+                        "Everyone on your Radmin network sees each other. No accounts, no servers.",
+                    )
+                    .weak(),
+                );
+            });
+        });
     }
 
     /// One line of the stage-timing table. The peak column is the important
@@ -4242,23 +4384,39 @@ impl ArgosApp {
     }
 
     /// The status word and the colour that carries the same meaning at a glance.
+    ///
+    /// "live" and "sharing" used to be two words for one state — whether anyone
+    /// had connected yet — which is a distinction the person sharing did not need
+    /// to hold in their head. Sending is sending.
     fn status(&self) -> (&'static str, Color32) {
-        if self
-            .share
-            .as_ref()
-            .map(|share| share.sharer.is_connected())
-            .unwrap_or(false)
-        {
-            ("sharing", theme::OK)
-        } else if self.view.is_some() {
-            ("watching", theme::ACCENT)
-        } else if self.live {
-            ("live", theme::OK)
-        } else if self.capture.is_some() {
-            ("previewing", theme::WARN)
-        } else {
-            ("offline", theme::MUTED)
-        }
+        status_word(
+            self.live
+                || self
+                    .share
+                    .as_ref()
+                    .is_some_and(|share| share.sharer.is_connected()),
+            self.view.is_some(),
+            self.preview_active,
+        )
+    }
+}
+
+/// The status word, as a pure function of the three things that can be true at
+/// once, so the precedence can be tested without standing up the app around it.
+///
+/// `previewing` follows the preview being switched on, not a capture session
+/// existing. The session is deliberately left alive and idle after a stream
+/// stops so that going live again is instant — reading that as a state is what
+/// left the app claiming to preview a screen it was not showing.
+fn status_word(sharing: bool, watching: bool, previewing: bool) -> (&'static str, Color32) {
+    if sharing {
+        ("sharing", theme::OK)
+    } else if watching {
+        ("watching", theme::ACCENT)
+    } else if previewing {
+        ("previewing", theme::WARN)
+    } else {
+        ("offline", theme::MUTED)
     }
 }
 
@@ -4451,9 +4609,10 @@ impl eframe::App for ArgosApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        audience_from, bake_cursor, connect_step, encode_target, lan, resize_hit, roster_is_stale,
-        worst_link, ConnectStep, LoadSampler, ViewerSlot, CONNECT_RETRY, CONNECT_TIMEOUT,
-        KEYFRAME_REQUEST_FLOOR, REPORT_INTERVAL, RESIZE_MARGIN, ROSTER_STALE, VIEWER_REPORT_TTL,
+        audience_from, bake_cursor, connect_step, encode_target, lan, picture_size, resize_hit,
+        roster_is_stale, status_word, worst_link, ConnectStep, LoadSampler, ViewerSlot,
+        CONNECT_RETRY, CONNECT_TIMEOUT, KEYFRAME_REQUEST_FLOOR, MIN_IMAGE_HEIGHT, REPORT_INTERVAL,
+        RESIZE_MARGIN, ROSTER_STALE, VIEWER_REPORT_TTL,
     };
     use argos_media::encode::decode_target;
     use eframe::egui;
@@ -4461,6 +4620,47 @@ mod tests {
 
     fn slot(name: &str) -> ViewerSlot {
         ViewerSlot::new(name, name, Instant::now())
+    }
+
+    /// Where the floor lives: on a window too short for the preview's share of
+    /// it, the picture used to be sized to the leftover — which was nothing — and
+    /// drawn one pixel tall. An invisible preview is indistinguishable from a
+    /// broken one, so the floor wins and the scroll area carries the overflow.
+    #[test]
+    fn a_picture_never_collapses_to_nothing() {
+        let capped = egui::vec2(1024.0, 576.0);
+        let no_room = egui::vec2(560.0, 0.0);
+        let size = picture_size(no_room, capped, 16.0 / 9.0);
+        assert!(
+            size.y >= MIN_IMAGE_HEIGHT,
+            "the preview collapsed to {} tall",
+            size.y
+        );
+        assert!(size.x <= no_room.x, "drawn wider than the room it had");
+        assert!(
+            (size.x / size.y - 16.0 / 9.0).abs() < 0.01,
+            "the picture came out at the wrong shape"
+        );
+
+        // A roomy window still gets the cap, a narrow one still gets its width.
+        let roomy = picture_size(egui::vec2(4000.0, 4000.0), capped, 16.0 / 9.0);
+        assert!(roomy.x <= capped.x + 0.01 && roomy.y <= capped.y + 0.01);
+        let narrow = picture_size(egui::vec2(300.0, 4000.0), capped, 16.0 / 9.0);
+        assert!((narrow.x - 300.0).abs() < 0.01, "ignored the room it had");
+    }
+
+    /// The status is a state, not a leftover. Stopping a stream leaves the capture
+    /// session alive and idle on purpose, so that going live again is instant, and
+    /// that idle session used to be reported as "previewing" long after the
+    /// preview had been switched off.
+    #[test]
+    fn the_status_word_reports_the_state_not_a_leftover() {
+        assert_eq!(status_word(false, false, false).0, "offline");
+        assert_eq!(status_word(false, false, true).0, "previewing");
+        assert_eq!(status_word(false, true, false).0, "watching");
+        assert_eq!(status_word(true, false, false).0, "sharing");
+        // Sending outranks the two things a person can do with their own screen.
+        assert_eq!(status_word(true, true, true).0, "sharing");
     }
 
     /// The resize bands: corners win over edges, and the middle is not a resize
@@ -4897,6 +5097,85 @@ mod tests {
         assert!(
             frame.iter().all(|&byte| byte == 0),
             "a hidden cursor draws nothing"
+        );
+    }
+
+    /// The palette is calibration, not decoration: status colours have to stay
+    /// readable, the interactive fills have to climb in the order they are used,
+    /// and the type scale has to be a scale. Pinned here so a later tweak that
+    /// dims a warning or flattens a hover fails a test rather than being
+    /// discovered on a machine.
+    #[test]
+    fn palette_and_type_scale_stay_ordered() {
+        fn luminance(colour: egui::Color32) -> f32 {
+            fn channel(value: u8) -> f32 {
+                let value = value as f32 / 255.0;
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * channel(colour.r())
+                + 0.7152 * channel(colour.g())
+                + 0.0722 * channel(colour.b())
+        }
+        fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+            let (la, lb) = (luminance(a), luminance(b));
+            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        fn ascending(name: &str, values: &[f32]) {
+            for pair in values.windows(2) {
+                assert!(pair[1] > pair[0], "{name} does not ascend");
+            }
+        }
+        use super::theme;
+
+        // Anything carrying meaning clears AA on the panel background.
+        for (name, colour) in [
+            ("OK", theme::OK),
+            ("WARN", theme::WARN),
+            ("ERR", theme::ERR),
+            ("ACCENT", theme::ACCENT),
+        ] {
+            let ratio = contrast(colour, theme::BG);
+            assert!(ratio >= 4.5, "{name} on BG is {ratio:.2}:1, below AA");
+        }
+
+        // The surfaces climb in the order the states are used: background, panel,
+        // resting control, hover, pressed. Reversed, a press looks like a
+        // release, which is the whole point of having three fills.
+        ascending(
+            "the surface stack",
+            &[
+                luminance(theme::BG),
+                luminance(theme::SURFACE),
+                luminance(theme::RAISED),
+                luminance(theme::HOVER),
+                luminance(theme::PRESSED),
+            ],
+        );
+
+        // A hover nobody notices is a hover that does not exist.
+        let hover_step = contrast(theme::HOVER, theme::RAISED);
+        assert!(
+            hover_step >= 1.5,
+            "hover is only {hover_step:.2}:1 over a resting control"
+        );
+
+        // Every scale ascends.
+        ascending(
+            "the type scale",
+            &[theme::TEXT_S, theme::TEXT_M, theme::TEXT_L],
+        );
+        ascending(
+            "the spacing scale",
+            &[theme::SPACE_XS, theme::SPACE_S, theme::SPACE_M],
+        );
+        ascending(
+            "the radius scale",
+            &[theme::RADIUS_S as f32, theme::RADIUS as f32],
         );
     }
 }

@@ -51,4 +51,18 @@ mod tests {
         eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
             .expect("assets/icon.png must be a valid PNG");
     }
+
+    /// The type is embedded, so a missing or truncated file would not fail the
+    /// build — only render an empty UI at launch, which is worse than a panic.
+    /// Assert the bytes are a font here instead.
+    #[test]
+    fn the_embedded_font_is_a_truetype_file() {
+        let bytes: &[u8] = include_bytes!("../assets/IBMPlexSans.ttf");
+        assert!(bytes.len() > 4096, "the font file is suspiciously small");
+        let magic = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+        assert_eq!(
+            magic, 0x0001_0000,
+            "the font does not begin with an sfnt header"
+        );
+    }
 }

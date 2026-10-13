@@ -136,6 +136,13 @@ fn run(
         if !active.load(Ordering::Relaxed) {
             thread::sleep(INACTIVE_SLEEP);
             last = Instant::now();
+            // Coming back from idle, treat the next acquire as the first one: a
+            // desktop sitting still produces no new frame, and the pointer moving
+            // is reported with `LastPresentTime == 0`, so nothing would be sent
+            // until something on screen actually changed. The preview would come
+            // back blank and a viewer would come back to a frozen picture, both
+            // of which look like the capture failed.
+            first = true;
             continue;
         }
         if let Some(update) = shadow.poll(&desktop) {

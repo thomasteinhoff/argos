@@ -1771,6 +1771,7 @@ impl ArgosApp {
             Arc::clone(&metrics),
             worker_force_keyframe,
             worker_target_height,
+            self.config.hardware_encoder,
         ) {
             Ok(worker) => worker,
             Err(error) => {
@@ -3379,6 +3380,15 @@ impl ArgosApp {
                                 share.metrics.audio_frames.get()
                             ));
                         }
+                        let mut hardware = self.config.hardware_encoder;
+                        if ui
+                            .checkbox(&mut hardware, "Use hardware H.264 encoder (restart share)")
+                            .changed()
+                        {
+                            self.config.hardware_encoder = hardware;
+                            let _ = config::save(&self.config);
+                            let _ = self.restart();
+                        }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.code_input)
                                 .hint_text("Connection code")
@@ -4023,6 +4033,10 @@ impl ArgosApp {
                 Self::audio_rows(sink, "Capture", capture.state().metrics(), secs);
             }
             sink.heading("Sending");
+            // Standing state rather than a timing, which is why it comes before
+            // the stage rows: on a machine that fell back, every number below it
+            // is the software encoder's.
+            Self::counter_row(sink, "encoder", m.encoder_name());
             Self::stage_row(sink, "acquire", &m.acquire);
             Self::stage_row(sink, "readback", &m.readback);
             Self::stage_row(sink, "convert", &m.convert);

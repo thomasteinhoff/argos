@@ -4,7 +4,8 @@
 //! Everything here is designed to be written from a worker thread and read from
 //! the UI thread without contention: durations accumulate into an [`Ema`] via
 //! fixed-point atomics, and event counts are plain [`AtomicU64`]s. No mutex is
-//! taken on the hot path.
+//! taken on the hot path — the one string in [`SenderMetrics`] is written when
+//! the encoder changes, which is a couple of times per share.
 //!
 //! The point is to make the pipeline's cost observable. Every stage that can
 //! fall behind (capture readback, colour conversion, H.264 encode, RTP write,
@@ -13,6 +14,7 @@
 //! duration climbs points straight at the culprit.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How many recent observations an [`Ema`] keeps individually.
@@ -347,6 +349,35 @@ pub struct SenderMetrics {
     pub audio_bytes: Counter,
     /// Audio writes that failed.
     pub audio_errors: Counter,
+
+    /// Which encoder is producing the bitstream — "hardware (...)" or
+    /// "software (openh264), <reason>".
+    ///
+    /// A string rather than an atomic because it changes at most twice per
+    /// share (once when the encoder is built, once if the hardware path gives
+    /// up), and the readout is the only reader.
+    pub encoder: Mutex<String>,
+}
+
+impl SenderMetrics {
+    /// Records which encoder is running. The name is written only when it
+    /// changes, so the lock is taken a couple of times per share rather than
+    /// once per frame.
+    pub fn set_encoder(&self, name: &str) {
+        if let Ok(mut slot) = self.encoder.lock() {
+            if *slot != name {
+                *slot = name.to_string();
+            }
+        }
+    }
+
+    /// Which encoder is running, for the pipeline readout.
+    pub fn encoder_name(&self) -> String {
+        self.encoder
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Per-stage timings and counters for the receive/decode/present direction.

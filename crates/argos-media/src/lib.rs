@@ -4,3 +4,4 @@ pub mod cursor;
 pub mod decode;
 mod dxgi;
 pub mod encode;
+pub mod hwenc;

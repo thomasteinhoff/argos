@@ -13,11 +13,28 @@ use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
 
 use crate::audio::FirstError;
+use crate::hwenc;
+
+/// What the pipeline readout calls the encoder while it is running in software.
+const SOFTWARE: &str = "software (openh264)";
 
 pub struct H264Encoder {
     encoder: Encoder,
+    /// The hardware encoder, when this machine has one.
+    ///
+    /// Everything downstream of [`Self::encode_planes`] is identical either
+    /// way: the packetizer, the transport and the far side's decoder never
+    /// learn which encoder produced the bytes.
+    hw: Option<crate::hwenc::HwEncoder>,
+    /// Which encoder is running, and why. Read by the pipeline readout.
+    name: String,
     planes: Vec<u8>,
     target_height: Option<u32>,
+    /// The rate the encoder was built with, shared with the hardware path so
+    /// both run the same bitrate budget.
+    fps: f32,
+    /// A key frame has been asked of the hardware encoder and not yet encoded.
+    hw_keyframe: bool,
 }
 
 impl H264Encoder {
@@ -33,9 +50,42 @@ impl H264Encoder {
         .map_err(|error| error.to_string())?;
         Ok(Self {
             encoder,
+            hw: None,
+            name: SOFTWARE.to_string(),
             planes: Vec::new(),
             target_height: None,
+            fps,
+            hw_keyframe: false,
         })
+    }
+
+    /// Switches to a hardware encoder, if this machine has one.
+    ///
+    /// Called from the encode worker rather than on the UI thread, because COM
+    /// and Media Foundation are initialized per thread and that is the thread
+    /// the encoder will live on. Not finding one is not a failure — it is the
+    /// common case on the machines this has to keep working on — so the reason
+    /// ends up in [`Self::name`] and the software path carries on.
+    pub fn attach_hardware(&mut self, enabled: bool) {
+        if !enabled {
+            self.name = format!("{SOFTWARE}, hardware acceleration disabled");
+            self.hw = None;
+            return;
+        }
+        match hwenc::HwEncoder::new(self.fps, bitrate_for(self.fps).1) {
+            Ok(hw) => {
+                self.name = format!("hardware ({})", hw.name());
+                self.hw = Some(hw);
+            }
+            Err(reason) => {
+                self.name = format!("{SOFTWARE}, {reason}");
+            }
+        }
+    }
+
+    /// Which encoder is running, and why it is that one.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn set_target_height(&mut self, height: Option<u32>) {
@@ -94,7 +144,31 @@ impl H264Encoder {
     }
 
     /// Encodes the I420 planes produced by the last [`Self::convert`] call.
+    ///
+    /// `Ok(vec![])` means the hardware encoder has taken the frame but has not
+    /// produced output for it yet: nothing is packetized, and the next frame
+    /// carries the newer timestamp.
     pub fn encode_planes(&mut self, width: usize, height: usize) -> Result<Vec<u8>, String> {
+        let keyframe = std::mem::take(&mut self.hw_keyframe);
+        let hardware = self
+            .hw
+            .as_mut()
+            .map(|hw| hw.encode(&self.planes, width as u32, height as u32, keyframe));
+        match hardware {
+            Some(Ok(Some(bitstream))) => return Ok(bitstream),
+            Some(Ok(None)) => return Ok(Vec::new()),
+            Some(Err(reason)) => {
+                // The software encoder was configured in the same call as this
+                // one and does not fail, so this costs a frame rather than the
+                // share. It also asks for an intra frame: the far side has been
+                // decoding hardware output until now, and the switch is only
+                // visible from there at a key frame.
+                self.hw = None;
+                self.name = format!("{SOFTWARE}, {reason}");
+                self.encoder.force_intra_frame();
+            }
+            None => {}
+        }
         let y_len = width * height;
         let uv_len = (width / 2) * (height / 2);
         let yuv = YUVSlices::new(
@@ -115,6 +189,29 @@ impl H264Encoder {
 
     pub fn force_keyframe(&mut self) {
         self.encoder.force_intra_frame();
+        // The call above only reaches the software encoder, which may not be
+        // the one encoding: the hardware path keeps its own flag.
+        self.hw_keyframe = true;
+    }
+}
+
+/// The bitrate and frame rate an encoder runs at, from the rate it was asked
+/// for.
+///
+/// One source of truth for both encoders: the hardware path is given the same
+/// budget the software one gets, so a machine that falls back mid-share does
+/// not quietly change how much it asks of the link.
+pub fn bitrate_for(fps: f32) -> (f32, u32) {
+    // Sane bitrate targets for desktop screen content at the stream
+    // quality (720p by default). 30-60 Mbps is far beyond useful for
+    // screen sharing: it makes the software encoder frame-bound (the fps
+    // collapses) and floods the network with tens of thousands of RTP
+    // packets per second, which drops keyframes on WiFi and desyncs the
+    // receiver's decoder.
+    if fps >= 45.0 {
+        (60.0, 5_000_000)
+    } else {
+        (30.0, 3_000_000)
     }
 }
 
@@ -125,17 +222,7 @@ impl H264Encoder {
 /// fixed count. The preset is the only argument that changes behaviour; the
 /// bitrate/fps budget is repicked internally from `fps` exactly as before.
 pub fn encoder_config(usage: UsageType, fps: f32, threads: u16) -> EncoderConfig {
-    // Sane bitrate targets for desktop screen content at the stream
-    // quality (720p by default). 30-60 Mbps is far beyond useful for
-    // screen sharing: it makes the software encoder frame-bound (the fps
-    // collapses) and floods the network with tens of thousands of RTP
-    // packets per second, which drops keyframes on WiFi and desyncs the
-    // receiver's decoder.
-    let (fps, bitrate) = if fps >= 45.0 {
-        (60.0, 5_000_000)
-    } else {
-        (30.0, 3_000_000)
-    };
+    let (fps, bitrate) = bitrate_for(fps);
     EncoderConfig::new()
         // Camera video tuning, not screen content, is what OpenH264 encodes
         // fastest on this shape of input. Chosen on a measured comparison
@@ -378,6 +465,7 @@ impl EncodeWorker {
         metrics: Arc<SenderMetrics>,
         force_keyframe: Arc<AtomicBool>,
         target_height: Arc<AtomicI32>,
+        hardware_enabled: bool,
     ) -> Result<Self, String> {
         let error = Arc::new(FirstError::default());
         let thread_error = Arc::clone(&error);
@@ -392,6 +480,13 @@ impl EncodeWorker {
                 // sync. The frame rate now lives only in the encoder's own
                 // configuration, set before this thread starts.
                 let clock = h264::Clock::new();
+                // The hardware encoder is built here rather than on the UI
+                // thread: COM and Media Foundation are initialized per thread,
+                // and this is the thread that will use them. A machine without
+                // one stays on the software encoder it was already built with.
+                encoder.attach_hardware(hardware_enabled);
+                let mut reported = encoder.name().to_string();
+                metrics.set_encoder(&reported);
                 let mut last_keyframe = Instant::now();
                 // The target the encoder is currently configured for. Compared
                 // against the shared atomic on every frame, so a resolution
@@ -457,6 +552,14 @@ impl EncodeWorker {
                     };
                     match bitstream {
                         Ok(bitstream) => {
+                            if bitstream.is_empty() {
+                                continue;
+                            }
+                            let current = encoder.name();
+                            if current != reported {
+                                reported = current.to_string();
+                                metrics.set_encoder(&reported);
+                            }
                             // Sampled at send time, not at receipt: the clock is
                             // measuring how long this frame waited, which is
                             // exactly the latency a receiver has to absorb.

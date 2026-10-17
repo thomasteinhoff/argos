@@ -4,11 +4,17 @@ fn default_volume_percent() -> u32 {
     100
 }
 
+fn default_hardware_encoder() -> bool {
+    true
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub name: String,
     #[serde(default = "default_volume_percent")]
     pub volume_percent: u32,
+    #[serde(default = "default_hardware_encoder")]
+    pub hardware_encoder: bool,
 }
 
 pub fn load() -> AppConfig {

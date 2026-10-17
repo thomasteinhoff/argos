@@ -3,5 +3,9 @@
 # A release build copied out here. 12.9 MB of executable does not belong in the
 # history, and it was tracked here before this line existed.
 /argos-app-release.exe
-# The hand-off doc for the next session. Deliberately not part of the repo.
-/context.md
+# The hand-off doc and the working TODO list for the next session. Deliberately
+# not part of the repo. The pattern is a family, not a name: a copy dragged in
+# from another machine is usually called `context <something>.md`, and that
+# slipped past the old `/context.md` and sat untracked.
+/context*.md
+/todo.md

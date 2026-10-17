@@ -1543,6 +1543,14 @@ impl ArgosApp {
                         // spending a permanent place in the bar on either.
                         let menu = ui.menu_button("…", |ui| {
                             ui.set_min_width(180.0);
+                            let mut hardware = self.config.hardware_encoder;
+                            if ui.checkbox(&mut hardware, "Hardware encoder").changed() {
+                                self.config.hardware_encoder = hardware;
+                                let _ = config::save(&self.config);
+                                let _ = self.restart();
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui
                                 .button(format!("Profile: {}", self.profile_label()))
                                 .clicked()
@@ -1555,6 +1563,8 @@ impl ArgosApp {
                                 restart = true;
                                 ui.close();
                             }
+                            ui.separator();
+                            ui.label(RichText::new("Argos 0.1.0").weak());
                         });
                         note(menu.response.rect);
 

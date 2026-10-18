@@ -1564,7 +1564,7 @@ impl ArgosApp {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.label(RichText::new("Argos 0.1.0").weak());
+                            ui.label(RichText::new("Argos 1.4.2").weak());
                         });
                         note(menu.response.rect);
 
@@ -1601,7 +1601,8 @@ impl ArgosApp {
     }
 
     fn side_bar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("side_panel")
+        let panel_id = egui::Id::new("side_panel");
+        egui::SidePanel::left(panel_id)
             .resizable(true)
             .default_width(theme::SIDEBAR_WIDTH)
             .width_range(theme::SIDEBAR_MIN_WIDTH..=theme::SIDEBAR_MAX_WIDTH)
@@ -1620,6 +1621,27 @@ impl ArgosApp {
                 ui.separator();
                 self.sidebar(ui);
             });
+
+        // Double-clicking the divider snaps back to the default width. The
+        // resize handle is drag-only, so a double-click never reaches it as a
+        // click; instead read the stored rect and check the pointer here.
+        if let Some(state) = egui::containers::panel::PanelState::load(ctx, panel_id) {
+            let divider_x = state.rect.right();
+            let double = ctx.input(|i| {
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|pos| (pos.x - divider_x).abs() <= 6.0)
+            });
+            if double {
+                let mut rect = state.rect;
+                rect.max.x = rect.min.x + theme::SIDEBAR_WIDTH;
+                ctx.data_mut(|d| {
+                    d.insert_persisted(panel_id, egui::containers::panel::PanelState { rect })
+                });
+            }
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -2918,7 +2940,19 @@ impl ArgosApp {
             return;
         }
         let size = picture_size(ui.available_size(), max, aspect);
-        ui.image((preview.texture.id(), size));
+        // Center the picture in whatever space is left. Fullscreen on an
+        // ultrawide (or any ratio that does not match the source) leaves bars
+        // on two sides; drawing top-left would push the picture into a corner.
+        let avail = ui.available_size();
+        let offset = (avail - size) * 0.5;
+        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let pos = rect.min + offset;
+        ui.painter().image(
+            preview.texture.id(),
+            egui::Rect::from_min_size(pos, size),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     }
 
     fn network_status(&mut self, ui: &mut egui::Ui) {
@@ -3389,15 +3423,6 @@ impl ArgosApp {
                                 share.metrics.encode_errors.get(),
                                 share.metrics.audio_frames.get()
                             ));
-                        }
-                        let mut hardware = self.config.hardware_encoder;
-                        if ui
-                            .checkbox(&mut hardware, "Use hardware H.264 encoder (restart share)")
-                            .changed()
-                        {
-                            self.config.hardware_encoder = hardware;
-                            let _ = config::save(&self.config);
-                            let _ = self.restart();
                         }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.code_input)

@@ -93,13 +93,20 @@ impl H264Encoder {
     }
 
     pub fn target_dims(width: usize, height: usize, target_height: Option<u32>) -> (usize, usize) {
+        // H.264 is encoded in 16x16 macroblocks: a frame whose sides are not a
+        // multiple of 16 is padded by the codec, and those padding rows/columns
+        // decode as a garbage strip along the bottom (and right) edge. Cropping
+        // to the macroblock grid loses at most 15 px of the very edge and makes
+        // the decoded frame exactly the size that was encoded.
+        const MB: usize = 16;
+        let snap = |value: usize| (value / MB * MB).max(MB);
         match target_height {
             Some(target) if (target as usize) >= 2 && (target as usize) < height => {
-                let out_height = (target as usize) & !1;
-                let out_width = ((width * out_height / height) & !1).max(2);
+                let out_height = snap((target as usize) & !1);
+                let out_width = snap((width * out_height / height) & !1);
                 (out_width, out_height)
             }
-            _ => (width, height),
+            _ => (snap(width), snap(height)),
         }
     }
 
@@ -656,6 +663,20 @@ mod tests {
             }
         }
         planes
+    }
+
+    #[test]
+    fn target_dims_crops_to_macroblock() {
+        use super::H264Encoder;
+        // A 1080p frame is not a whole number of 16px macroblocks; the codec
+        // would pad the remainder and the viewer would see a garbage strip.
+        // The dimensions must snap down to the macroblock grid instead.
+        assert_eq!(H264Encoder::target_dims(1920, 1080, None), (1920, 1072));
+        // A target height is snapped the same way, and the width keeps aspect.
+        assert_eq!(H264Encoder::target_dims(1920, 1080, Some(720)), (1280, 720));
+        assert_eq!(H264Encoder::target_dims(1920, 1080, Some(360)), (624, 352));
+        // Already-aligned sizes are left alone.
+        assert_eq!(H264Encoder::target_dims(1280, 720, None), (1280, 720));
     }
 
     #[test]

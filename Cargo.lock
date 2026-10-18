@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "argos-app"
-version = "0.1.0"
+version = "1.4.2"
 dependencies = [
  "argos-core",
  "argos-media",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "argos-core"
-version = "0.1.0"
+version = "1.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "argos-media"
-version = "0.1.0"
+version = "1.4.2"
 dependencies = [
  "argos-core",
  "openh264",

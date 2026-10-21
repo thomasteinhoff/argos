@@ -364,7 +364,8 @@ const DIAG_DECODE_SAMPLES: usize = 60;
 const VIEWER_IMAGE_CAP: egui::Vec2 = egui::vec2(1024.0, 576.0);
 
 /// Height of the draggable strip between the viewer's controls and its picture.
-const VIEWER_SPLITTER_HEIGHT: f32 = 8.0;
+/// Tall enough to hit with a pointer without hunting for a one-pixel line.
+const VIEWER_SPLITTER_HEIGHT: f32 = 14.0;
 
 /// Shortest the windowed viewer's picture is ever dragged to.
 const MIN_VIEWER_HEIGHT: f32 = 180.0;
@@ -3714,9 +3715,11 @@ impl ArgosApp {
                 }
             }
 
-            // A thin draggable strip is the handle between the controls and the
-            // picture: drag it to give the stream more or less height.
-            ui.add_space(theme::SPACE_S);
+            // A draggable strip between the controls and the picture: drag it up to
+            // give the stream more height, down to give it less. It lights up on
+            // hover and shows a resize cursor so it reads as a handle rather than
+            // as leftover empty space.
+            ui.add_space(theme::SPACE_XS);
             let width = ui.available_width();
             let (strip, response) = ui.allocate_exact_size(
                 egui::vec2(width, VIEWER_SPLITTER_HEIGHT),
@@ -3725,11 +3728,30 @@ impl ArgosApp {
             if response.dragged() {
                 splitter_delta = Some(-response.drag_delta().y);
             }
-            let grip_y = strip.center().y;
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+            let active = response.dragged();
+            let line_color = if active {
+                theme::ACCENT
+            } else if response.hovered() {
+                theme::MUTED
+            } else {
+                theme::BORDER
+            };
+            // A short centred pill is the grip: brighter than a hairline, and it
+            // scales down to a line at the strip's rest height.
+            let pill_w = 48.0;
+            let pill_h = if active { 3.0 } else { 2.0 };
+            let pill = egui::Rect::from_center_size(strip.center(), egui::vec2(pill_w, pill_h));
+            ui.painter()
+                .rect_filled(pill, pill.height() * 0.5, line_color);
+            // The full-width underline keeps the strip's bounds legible when the
+            // pill alone is not enough to find the edge.
             ui.painter().line_segment(
                 [
-                    egui::pos2(strip.left() + theme::SPACE_M, grip_y),
-                    egui::pos2(strip.right() - theme::SPACE_M, grip_y),
+                    egui::pos2(strip.left(), strip.bottom() - 0.5),
+                    egui::pos2(strip.right(), strip.bottom() - 0.5),
                 ],
                 egui::Stroke::new(1.0_f32, theme::BORDER),
             );

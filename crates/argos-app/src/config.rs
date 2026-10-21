@@ -8,6 +8,10 @@ fn default_hardware_encoder() -> bool {
     true
 }
 
+fn default_stats_for_nerds() -> bool {
+    false
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub name: String,
@@ -15,6 +19,8 @@ pub struct AppConfig {
     pub volume_percent: u32,
     #[serde(default = "default_hardware_encoder")]
     pub hardware_encoder: bool,
+    #[serde(default = "default_stats_for_nerds")]
+    pub stats_for_nerds: bool,
 }
 
 pub fn load() -> AppConfig {

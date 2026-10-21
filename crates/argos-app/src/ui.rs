@@ -363,6 +363,12 @@ const DIAG_DECODE_SAMPLES: usize = 60;
 /// fullscreen window is not a sidebar.
 const VIEWER_IMAGE_CAP: egui::Vec2 = egui::vec2(1024.0, 576.0);
 
+/// Height of the draggable strip between the viewer's controls and its picture.
+const VIEWER_SPLITTER_HEIGHT: f32 = 8.0;
+
+/// Shortest the windowed viewer's picture is ever dragged to.
+const MIN_VIEWER_HEIGHT: f32 = 180.0;
+
 /// Shortest a picture is ever drawn.
 ///
 /// The share screen keeps its preview under all of its controls, inside a scroll
@@ -1373,6 +1379,10 @@ pub struct ArgosApp {
     stop_sent: bool,
     view: Option<ViewSession>,
     view_error: Option<String>,
+    /// Drag-splitter height for the windowed viewer, in points. `None` means the
+    /// picture fills whatever height is left below the controls. Session-only: a
+    /// stream's right size depends on this window, not on every launch.
+    viewer_height: Option<f32>,
     /// Why the last restart attempt did not happen. Its own slot because
     /// restarting is not the same act as connecting, and someone who pressed it
     /// must not have the failure reported as a connection problem they never
@@ -1439,6 +1449,7 @@ impl ArgosApp {
             stop_sent: false,
             view: None,
             view_error: None,
+            viewer_height: None,
             restart_error: None,
             auto_quality: true,
             lan,
@@ -1549,6 +1560,11 @@ impl ArgosApp {
                                 let _ = config::save(&self.config);
                                 let _ = self.restart();
                                 ui.close();
+                            }
+                            let mut stats = self.config.stats_for_nerds;
+                            if ui.checkbox(&mut stats, "Stats for Nerds (F3)").changed() {
+                                self.config.stats_for_nerds = stats;
+                                let _ = config::save(&self.config);
                             }
                             ui.separator();
                             if ui
@@ -2955,6 +2971,31 @@ impl ArgosApp {
         );
     }
 
+    /// Draws the decoded frame centered inside an already-allocated `rect`, fitted
+    /// at the source aspect.
+    ///
+    /// The windowed viewer owns its own layout (a top block, a splitter, then a
+    /// picture that fills the rest), so it reserves the picture's box itself
+    /// rather than letting [`Self::render_image`] allocate the whole remaining
+    /// space.
+    fn paint_picture(ui: &egui::Ui, preview: &Preview, aspect: f32, rect: egui::Rect) {
+        if !aspect.is_finite() || aspect <= 0.0 {
+            return;
+        }
+        let size = picture_size(
+            rect.size(),
+            egui::vec2(f32::INFINITY, f32::INFINITY),
+            aspect,
+        );
+        let pos = rect.center() - size * 0.5;
+        ui.painter().image(
+            preview.texture.id(),
+            egui::Rect::from_min_size(pos, size),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
     fn network_status(&mut self, ui: &mut egui::Ui) {
         match self.lan.as_ref().and_then(|lan| lan.local_address()) {
             Some(ip) => {
@@ -3211,17 +3252,19 @@ impl ArgosApp {
                 _ => "Audio: not available",
             };
             ui.label(format!("Status: {}", share.sharer.status()));
-            if share
-                .audio_capture
-                .as_ref()
-                .is_some_and(AudioCapture::is_alive)
-            {
-                ui.label(RichText::new(audio_label).weak());
-            } else {
-                ui.label(RichText::new(audio_label).color(theme::WARN));
-            }
-            if let Some(notice) = &share.audio_notice {
-                ui.label(RichText::new(notice).weak());
+            if self.config.stats_for_nerds {
+                if share
+                    .audio_capture
+                    .as_ref()
+                    .is_some_and(AudioCapture::is_alive)
+                {
+                    ui.label(RichText::new(audio_label).weak());
+                } else {
+                    ui.label(RichText::new(audio_label).color(theme::WARN));
+                }
+                if let Some(notice) = &share.audio_notice {
+                    ui.label(RichText::new(notice).weak());
+                }
             }
             if let Some(error) = &share.audio_error {
                 ui.label(RichText::new(error).color(theme::ERR));
@@ -3239,11 +3282,13 @@ impl ArgosApp {
             // be read as a bug in one of them.
             let audience = share.audience();
             viewer_list(ui, &audience, "", false, 1.0);
-            let now = Instant::now();
-            let source_fps = share.frame_rate;
-            for slot in &share.viewers {
-                let line = slot.summary(now, source_fps);
-                ui.label(line);
+            if self.config.stats_for_nerds {
+                let now = Instant::now();
+                let source_fps = share.frame_rate;
+                for slot in &share.viewers {
+                    let line = slot.summary(now, source_fps);
+                    ui.label(line);
+                }
             }
         } else if self.live {
             ui.label(RichText::new("Waiting for someone to join…").color(theme::OK));
@@ -3415,14 +3460,16 @@ impl ArgosApp {
                             if ui.button("New code for another viewer").clicked() {
                                 do_manual = true;
                             }
-                            let encode_metrics = &share.metrics.encode;
-                            ui.label(format!(
-                                "{} frames sent, {:.1} ms/frame, {} encode errors, {} audio frames",
-                                share.metrics.encoded.frames(),
-                                encode_metrics.mean_ms(),
-                                share.metrics.encode_errors.get(),
-                                share.metrics.audio_frames.get()
-                            ));
+                            if self.config.stats_for_nerds {
+                                let encode_metrics = &share.metrics.encode;
+                                ui.label(format!(
+                                    "{} frames sent, {:.1} ms/frame, {} encode errors, {} audio frames",
+                                    share.metrics.encoded.frames(),
+                                    encode_metrics.mean_ms(),
+                                    share.metrics.encode_errors.get(),
+                                    share.metrics.audio_frames.get()
+                                ));
+                            }
                         }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.code_input)
@@ -3527,43 +3574,57 @@ impl ArgosApp {
     fn watch_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut request_stop = false;
         let mut toggle_fullscreen = false;
+        let mut splitter_delta: Option<f32> = None;
+        let stats = self.config.stats_for_nerds;
         if let Some(view) = self.view.as_mut() {
-            ui.heading("Watching");
-            ui.label(format!("Status: {}", view.viewer.status()));
-            Self::quality_line(ui, view);
+            // Everything that is not the picture sits in one compact block at the
+            // top, so the stream below can claim whatever height is left.
+            ui.horizontal(|ui| {
+                ui.heading("Watching");
+                if ui.button("Stop watching").clicked() {
+                    request_stop = true;
+                }
+                let label = if view.fullscreen {
+                    "Leave fullscreen (Esc)"
+                } else {
+                    "Fullscreen (F11)"
+                };
+                if ui.button(label).clicked() {
+                    toggle_fullscreen = true;
+                }
+            });
+            if stats {
+                ui.label(format!("Status: {}", view.viewer.status()));
+                Self::quality_line(ui, view);
+            }
             let muted = view
                 .audio_playback
                 .as_ref()
                 .map(|playback| playback.is_muted())
                 .unwrap_or(false);
             if let Some(playback) = &view.audio_playback {
-                let label = if muted { "Unmute" } else { "Mute" };
-                if ui.button(label).clicked() {
-                    playback.set_muted(!muted);
-                }
-                let mut vol = playback.volume_percent();
-                let mut vol_changed = false;
                 ui.horizontal(|ui| {
+                    let label = if muted { "Unmute" } else { "Mute" };
+                    if ui.button(label).clicked() {
+                        playback.set_muted(!muted);
+                    }
+                    let mut vol = playback.volume_percent();
                     ui.label("Volume");
                     if ui
                         .add(egui::Slider::new(&mut vol, 0..=200).suffix("%"))
                         .changed()
                     {
-                        vol_changed = true;
+                        playback.set_volume_percent(vol);
+                        self.config.volume_percent = vol;
+                        // Ignored deliberately: the new value is already live in the
+                        // player, and the next drag or the Profile window's Save
+                        // retries the write. Only the explicit Save needs to report.
+                        let _ = config::save(&self.config);
+                        if playback.is_muted() && vol > 0 {
+                            playback.set_muted(false);
+                        }
                     }
                 });
-                if vol_changed {
-                    playback.set_volume_percent(vol);
-                    self.config.volume_percent = vol;
-                    // Ignored deliberately: the new value is already live in the
-                    // player, and the next drag or the Profile window's Save
-                    // retries the write. Only the explicit Save needs to report.
-                    let _ = config::save(&self.config);
-                    if playback.is_muted() && vol > 0 {
-                        playback.set_muted(false);
-                    }
-                }
-                // unmute on change to non-zero? if muted and vol>0, unmute? but button controls mute
                 // `Some(playback)` says the thread was started, not that the
                 // speaker is still being driven. A worker stuck in its retry
                 // backoff leaves the session silent with nothing else to show
@@ -3636,53 +3697,84 @@ impl ArgosApp {
             if let Some(error) = &view.error {
                 ui.label(RichText::new(error).color(theme::ERR));
             }
-            ui.add_space(theme::SPACE_S);
-            if let Some(preview) = &view.texture {
-                ui.label(format!("Stream {}x{}", preview.width, preview.height));
-                let aspect = view
-                    .display_aspect
-                    .unwrap_or(preview.width as f32 / preview.height as f32);
-                Self::render_image(ui, preview, aspect, VIEWER_IMAGE_CAP);
-            } else if view.metrics.packets.get() > 0 {
-                ui.label(
-                    RichText::new("Receiving stream data but no decoded picture yet…")
-                        .color(theme::WARN),
-                );
-            } else {
-                ui.label(RichText::new("Waiting for stream data…").color(theme::MUTED));
-            }
-            // Who else is watching, and what this end measured. Under the picture
-            // rather than above it, because the picture is the point and both of
-            // these are context for it.
-            //
+            // Who else is watching. Above the picture now rather than under it,
+            // so the picture can take the whole of the remaining height.
+            viewer_audience(ui, view, 1.0);
             // The verdict is computed from the very report that is on its way to
             // the sharer, so the two sides can never disagree about what this
             // machine measured — only about what to do about it.
-            ui.add_space(theme::SPACE_S);
-            viewer_audience(ui, view, 1.0);
-            let mine = view.quality.link_report(&view.metrics);
-            let verdict = diagnose(&mine.diag, mine.loss, view.source_fps);
-            let verdict_text = format!("Your end: {}", verdict.describe(view.source_fps));
-            if verdict == Bottleneck::Ok {
-                ui.label(RichText::new(verdict_text).weak());
-            } else {
-                ui.label(RichText::new(verdict_text).color(theme::WARN));
-            }
-            ui.add_space(theme::SPACE_S);
-            if ui.button("Stop watching").clicked() {
-                request_stop = true;
-            }
-            ui.add_space(theme::SPACE_S);
-            if ui
-                .button(if view.fullscreen {
-                    "Leave fullscreen (Esc)"
+            if stats {
+                let mine = view.quality.link_report(&view.metrics);
+                let verdict = diagnose(&mine.diag, mine.loss, view.source_fps);
+                let verdict_text = format!("Your end: {}", verdict.describe(view.source_fps));
+                if verdict == Bottleneck::Ok {
+                    ui.label(RichText::new(verdict_text).weak());
                 } else {
-                    "Fullscreen (F11)"
-                })
-                .clicked()
-            {
-                toggle_fullscreen = true;
+                    ui.label(RichText::new(verdict_text).color(theme::WARN));
+                }
             }
+
+            // A thin draggable strip is the handle between the controls and the
+            // picture: drag it to give the stream more or less height.
+            ui.add_space(theme::SPACE_S);
+            let width = ui.available_width();
+            let (strip, response) = ui.allocate_exact_size(
+                egui::vec2(width, VIEWER_SPLITTER_HEIGHT),
+                egui::Sense::click_and_drag(),
+            );
+            if response.dragged() {
+                splitter_delta = Some(-response.drag_delta().y);
+            }
+            let grip_y = strip.center().y;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(strip.left() + theme::SPACE_M, grip_y),
+                    egui::pos2(strip.right() - theme::SPACE_M, grip_y),
+                ],
+                egui::Stroke::new(1.0_f32, theme::BORDER),
+            );
+
+            // The picture fills whatever is left, or the height the handle was
+            // dragged to, always fitted inside that box at the source aspect.
+            let remaining = ui.available_height();
+            let target = self
+                .viewer_height
+                .unwrap_or(remaining)
+                .clamp(MIN_VIEWER_HEIGHT, remaining.max(MIN_VIEWER_HEIGHT));
+            let (video_rect, _) =
+                ui.allocate_exact_size(egui::vec2(width, target), egui::Sense::hover());
+            if let Some(preview) = &view.texture {
+                let aspect = view
+                    .display_aspect
+                    .unwrap_or(preview.width as f32 / preview.height.max(1) as f32);
+                Self::paint_picture(ui, preview, aspect, video_rect);
+            } else {
+                let text = if view.metrics.packets.get() > 0 {
+                    "Receiving stream data but no decoded picture yet…"
+                } else {
+                    "Waiting for stream data…"
+                };
+                let color = if view.metrics.packets.get() > 0 {
+                    theme::WARN
+                } else {
+                    theme::MUTED
+                };
+                ui.painter().text(
+                    video_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::proportional(theme::TEXT_M),
+                    color,
+                );
+            }
+        }
+        if let Some(delta) = splitter_delta {
+            let now = self.viewer_height.unwrap_or_else(|| {
+                // Seed from the current remaining height on the first drag, so the
+                // handle starts where the fill layout already put the picture.
+                ui.available_height()
+            });
+            self.viewer_height = Some((now + delta).max(MIN_VIEWER_HEIGHT));
         }
         if request_stop {
             self.stop_view(ctx);
@@ -4438,6 +4530,13 @@ impl ArgosApp {
 
     fn content(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The watching screen owns the full window height: a compact top block,
+            // a splitter, then a picture that fills what is left. It must not scroll,
+            // or the splitter would have no fixed frame to size against.
+            if self.view_visible() {
+                self.watch_view(ui, ctx);
+                return;
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.screen.clone() {
@@ -4446,6 +4545,8 @@ impl ArgosApp {
                     Screen::Home => text_column(ui, |ui| self.welcome(ui)),
                     Screen::Share => text_column(ui, |ui| self.share_view(ui)),
                     Screen::Peer(id) => self.peer_view(ui, ctx, &id),
+                    // Not reached while a stream is live (handled above), but a
+                    // screen can outlive its session for a frame.
                     Screen::View => self.watch_view(ui, ctx),
                 });
         });
@@ -4607,6 +4708,10 @@ impl eframe::App for ArgosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input_mut(|input| input.key_pressed(egui::Key::D) && input.modifiers.ctrl) {
             self.show_metrics = !self.show_metrics;
+        }
+        if ctx.input_mut(|input| input.key_pressed(egui::Key::F3)) {
+            self.config.stats_for_nerds = !self.config.stats_for_nerds;
+            let _ = config::save(&self.config);
         }
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
         if ctx.input(|input| fullscreen_key(input, fullscreen)) {

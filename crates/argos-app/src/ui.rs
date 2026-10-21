@@ -3726,7 +3726,17 @@ impl ArgosApp {
                 egui::Sense::click_and_drag(),
             );
             if response.dragged() {
-                splitter_delta = Some(-response.drag_delta().y);
+                // The strip sits right under the info block, so an upward drag runs
+                // out of window almost immediately. Let the same handle resize
+                // sideways as well: whichever axis the pointer travels furthest this
+                // frame drives the change — up/right grows the picture, down/left
+                // shrinks it.
+                let delta = response.drag_delta();
+                splitter_delta = Some(if delta.x.abs() >= delta.y.abs() {
+                    delta.x
+                } else {
+                    -delta.y
+                });
             }
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);

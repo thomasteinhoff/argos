@@ -12,14 +12,13 @@ API, which is Windows-specific and has no equivalent elsewhere.
 
 - Windows, practically 10 or later. Capture uses the Desktop Duplication API,
   which has existed since Windows 8, but nothing older has been tried.
-- A network both machines already share. The intended one is
-  [Radmin VPN](https://www.radmin.com/radmin-vpn/), which gives each machine a
-  stable private IP and hides the peers from everyone else — see
-  [Security](#security) for why that matters.
+- A network both machines already share. The intended one is a private VPN
+  overlay, which gives each machine a stable private IP and hides the peers from
+  everyone else — see [Security](#security) for why that matters.
 - A build toolchain, if you're building from source rather than taking a
   prebuilt binary. See [BUILDING.md](BUILDING.md).
 
-Argos can launch Radmin VPN for you from the sidebar if it is installed.
+Argos can launch your VPN tool for you from the sidebar if it is installed.
 
 ## Using it
 
@@ -118,9 +117,9 @@ That protects the video, not the decision to send it.
 
 So the security model is exactly this: *the network is the trust boundary.* Use
 it on a network you control, where everyone on it is someone you would hand a
-remote-desktop session to. Radmin VPN fits well because it is a private
-overlay: machines on it can find each other, and machines off it cannot see
-any of them. A shared office WiFi does not.
+remote-desktop session to. A private VPN overlay fits well because machines on
+it can find each other, and machines off it cannot see any of them. A shared
+office WiFi does not.
 
 Argos is built for a small group of people sharing over a VPN they already
 trust. It is not hardened against an adversary on the same network, and it has

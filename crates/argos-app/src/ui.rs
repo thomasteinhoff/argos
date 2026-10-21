@@ -1398,8 +1398,8 @@ pub struct ArgosApp {
     pending_view: Option<PendingView>,
     /// When the sharer last swept its viewer slots for finished connections.
     last_viewer_sweep: Instant,
-    radmin_exe: Option<std::path::PathBuf>,
-    radmin_error: Option<String>,
+    vpn_exe: Option<std::path::PathBuf>,
+    vpn_error: Option<String>,
 }
 
 impl ArgosApp {
@@ -1457,8 +1457,8 @@ impl ArgosApp {
             lan_error,
             pending_view: None,
             last_viewer_sweep: Instant::now(),
-            radmin_exe: crate::radmin::find_exe(),
-            radmin_error: None,
+            vpn_exe: crate::vpn::find_exe(),
+            vpn_error: None,
             config,
             screen: Screen::Home,
             show_settings: false,
@@ -3004,19 +3004,17 @@ impl ArgosApp {
             }
             None => {
                 ui.label(
-                    RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
+                    RichText::new("No VPN detected — friends can't find this PC yet.")
                         .color(theme::WARN),
                 );
-                if self.radmin_exe.is_some() {
-                    if ui.button("Launch Radmin VPN").clicked() {
-                        self.launch_radmin();
+                if self.vpn_exe.is_some() {
+                    if ui.button("Launch VPN").clicked() {
+                        self.launch_vpn();
                     }
                 } else {
-                    ui.label(
-                        RichText::new("Install Radmin VPN to share with friends online.").weak(),
-                    );
+                    ui.label(RichText::new("Install a VPN to share with friends online.").weak());
                 }
-                if let Some(error) = &self.radmin_error {
+                if let Some(error) = &self.vpn_error {
                     ui.label(RichText::new(error).color(theme::ERR));
                 }
             }
@@ -3026,10 +3024,10 @@ impl ArgosApp {
         }
     }
 
-    fn launch_radmin(&mut self) {
-        match crate::radmin::launch() {
-            Ok(()) => self.radmin_error = None,
-            Err(error) => self.radmin_error = Some(error),
+    fn launch_vpn(&mut self) {
+        match crate::vpn::launch() {
+            Ok(()) => self.vpn_error = None,
+            Err(error) => self.vpn_error = Some(error),
         }
     }
 
@@ -3959,7 +3957,7 @@ impl ArgosApp {
                 ui.add_space(theme::SPACE_S);
                 ui.label(
                     RichText::new(
-                        "Everyone on your Radmin network sees each other. No accounts, no servers.",
+                        "Everyone on your VPN network sees each other. No accounts, no servers.",
                     )
                     .weak(),
                 );

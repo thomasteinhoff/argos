@@ -8,8 +8,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod config;
-mod radmin;
 mod ui;
+mod vpn;
 
 use eframe::egui;
 

@@ -560,7 +560,7 @@ fn find_vpn_address() -> Option<Ipv4Addr> {
     let interfaces = if_addrs::get_if_addrs().ok()?;
     for interface in &interfaces {
         if let if_addrs::IfAddr::V4(v4) = &interface.addr {
-            if interface.name.to_lowercase().contains("radmin") {
+            if interface.name.to_lowercase().contains("vpn") {
                 return Some(v4.ip);
             }
         }

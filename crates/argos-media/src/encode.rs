@@ -416,7 +416,7 @@ fn chroma_v(r: i32, g: i32, b: i32) -> u8 {
 /// This used to be 2 s and was the sharer's *only* recovery mechanism, because
 /// the rtc transport offers no RTCP feedback path (see `session.rs`). It is
 /// now a backstop behind on-demand requests over the LAN channel: every
-/// keyframe is a burst on a Radmin tunnel, and a burst is what causes loss in
+/// keyframe is a burst on a VPN tunnel, and a burst is what causes loss in
 /// the first place.
 pub const KEYFRAME_INTERVAL: Duration = Duration::from_secs(4);
 

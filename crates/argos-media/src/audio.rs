@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 use argos_core::metrics::{AudioMetrics, SenderMetrics};
 use argos_core::session;
 use opus_rs::{Application, OpusDecoder, OpusEncoder};
+#[cfg(windows)]
 use wasapi::{
     initialize_mta, AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
 };
+#[cfg(windows)]
 use windows::Win32::Foundation::CloseHandle;
+#[cfg(windows)]
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -25,6 +28,7 @@ const BLOCK_ALIGN: usize = CHANNELS * BYTES_PER_SAMPLE;
 const EXCLUSION_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Buffer duration for the process-loopback client (20 ms). The device period cannot
 /// be queried in process-loopback mode and the passed value is ignored by the engine anyway.
+#[cfg(windows)]
 const PROCESS_LOOPBACK_PERIOD_HNS: i64 = 200_000;
 
 /// How long to wait on the WASAPI event before re-checking the stop flag and
@@ -36,6 +40,7 @@ const PROCESS_LOOPBACK_PERIOD_HNS: i64 = 200_000;
 /// unplugged, default device changed, stream invalidated) the thread hangs for
 /// that entire window and never notices its own stop flag. A short timeout
 /// makes that failure mode bounded.
+#[cfg(windows)]
 const EVENT_WAIT_MS: u32 = 20;
 
 /// First backoff between attempts to open an audio device.
@@ -591,6 +596,7 @@ impl Drop for AudioSender {
     }
 }
 
+#[cfg(windows)]
 fn capture_loop(
     tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
@@ -630,6 +636,7 @@ fn capture_loop(
     }
 }
 
+#[cfg(windows)]
 fn run_capture(
     tx: &SyncSender<Vec<f32>>,
     stop: &AtomicBool,
@@ -757,6 +764,7 @@ fn run_capture(
     }
 }
 
+#[cfg(windows)]
 fn build_capture_client(
     target: Option<u32>,
     state: &AudioState,
@@ -788,6 +796,7 @@ fn build_capture_client(
 /// Find the root process of the Discord process tree, if Discord is running.
 /// Returns `None` when no Discord process is active. The root is the process whose
 /// parent is not itself a Discord process, excluding that root excludes the whole tree.
+#[cfg(windows)]
 fn find_discord_root_pid() -> Result<Option<u32>, String> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|error| error.to_string())?;
@@ -857,6 +866,7 @@ fn count_descendants(root: u32, processes: &[(u32, u32)]) -> usize {
 }
 
 /// Read an executable image name from a null-terminated Win32 wide string, lowercased.
+#[cfg(windows)]
 fn image_name(name: &[u16]) -> String {
     let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     name[..end]
@@ -865,6 +875,7 @@ fn image_name(name: &[u16]) -> String {
         .collect()
 }
 
+#[cfg(windows)]
 fn is_discord_image(name: &str) -> bool {
     matches!(name, "discord.exe" | "discordptb.exe" | "discordcanary.exe")
 }
@@ -1014,6 +1025,7 @@ impl Drop for AudioPlayback {
     }
 }
 
+#[cfg(windows)]
 fn playback_loop(
     rx: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
@@ -1057,6 +1069,7 @@ fn playback_loop(
     }
 }
 
+#[cfg(windows)]
 fn run_playback(
     rx: &Receiver<Vec<f32>>,
     stop: &AtomicBool,
@@ -1180,6 +1193,618 @@ fn run_playback(
     }
 
     let _ = audio_client.stop_stream();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PaSampleSpec {
+    format: i32,
+    rate: u32,
+    channels: u8,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PaBufferAttr {
+    maxlength: u32,
+    tlength: u32,
+    prebuf: u32,
+    minreq: u32,
+    fragsize: u32,
+}
+
+#[cfg(target_os = "linux")]
+const PA_STREAM_PLAYBACK: i32 = 1;
+#[cfg(target_os = "linux")]
+const PA_STREAM_RECORD: i32 = 2;
+#[cfg(target_os = "linux")]
+const PA_SAMPLE_FLOAT32LE: i32 = 5;
+
+#[cfg(target_os = "linux")]
+type PaSimpleNewFn = unsafe extern "C" fn(
+    *const libc::c_char,
+    *const libc::c_char,
+    i32,
+    *const libc::c_char,
+    *const libc::c_char,
+    *const PaSampleSpec,
+    *const libc::c_void,
+    *const PaBufferAttr,
+    *mut libc::c_int,
+) -> *mut libc::c_void;
+
+#[cfg(target_os = "linux")]
+type PaSimpleReadFn =
+    unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_void, usize, *mut libc::c_int) -> i32;
+
+#[cfg(target_os = "linux")]
+type PaSimpleWriteFn =
+    unsafe extern "C" fn(*mut libc::c_void, *const libc::c_void, usize, *mut libc::c_int) -> i32;
+
+#[cfg(target_os = "linux")]
+type PaSimpleFreeFn = unsafe extern "C" fn(*mut libc::c_void);
+
+#[cfg(target_os = "linux")]
+struct PulseSimple {
+    _lib: libloading::Library,
+    handle: *mut libc::c_void,
+    read_fn: PaSimpleReadFn,
+    write_fn: PaSimpleWriteFn,
+    free_fn: PaSimpleFreeFn,
+}
+
+#[cfg(target_os = "linux")]
+impl PulseSimple {
+    fn open(direction: i32, dev: Option<&str>, stream_name: &str) -> Result<Self, String> {
+        let lib = unsafe {
+            libloading::Library::new("libpulse-simple.so.0")
+                .or_else(|_| libloading::Library::new("libpulse-simple.so"))
+        }
+        .map_err(|e| format!("could not load libpulse-simple.so.0: {e}"))?;
+
+        let new_fn: PaSimpleNewFn = unsafe { *lib.get(b"pa_simple_new\0").map_err(|e| e.to_string())? };
+        let read_fn: PaSimpleReadFn =
+            unsafe { *lib.get(b"pa_simple_read\0").map_err(|e| e.to_string())? };
+        let write_fn: PaSimpleWriteFn =
+            unsafe { *lib.get(b"pa_simple_write\0").map_err(|e| e.to_string())? };
+        let free_fn: PaSimpleFreeFn =
+            unsafe { *lib.get(b"pa_simple_free\0").map_err(|e| e.to_string())? };
+
+        let app_c = std::ffi::CString::new("Argos").unwrap();
+        let stream_c = std::ffi::CString::new(stream_name).unwrap();
+        let dev_c = dev.and_then(|d| std::ffi::CString::new(d).ok());
+        let dev_ptr = dev_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+
+        let ss = PaSampleSpec {
+            format: PA_SAMPLE_FLOAT32LE,
+            rate: SAMPLE_RATE,
+            channels: CHANNELS as u8,
+        };
+        let period_bytes = (FRAME_SAMPLES * BLOCK_ALIGN) as u32;
+        let attr = PaBufferAttr {
+            maxlength: period_bytes * 4,
+            tlength: period_bytes * 2,
+            prebuf: u32::MAX,
+            minreq: period_bytes,
+            fragsize: period_bytes,
+        };
+        let mut err: libc::c_int = 0;
+        let handle = unsafe {
+            new_fn(
+                std::ptr::null(),
+                app_c.as_ptr(),
+                direction,
+                dev_ptr,
+                stream_c.as_ptr(),
+                &ss,
+                std::ptr::null(),
+                &attr,
+                &mut err,
+            )
+        };
+        if handle.is_null() {
+            return Err(format!("pa_simple_new failed (code {err})"));
+        }
+        Ok(Self {
+            _lib: lib,
+            handle,
+            read_fn,
+            write_fn,
+            free_fn,
+        })
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        let mut err: libc::c_int = 0;
+        let rc = unsafe {
+            (self.read_fn)(
+                self.handle,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut err,
+            )
+        };
+        if rc < 0 {
+            Err(format!("pa_simple_read failed (code {err})"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> Result<(), String> {
+        let mut err: libc::c_int = 0;
+        let rc = unsafe {
+            (self.write_fn)(
+                self.handle,
+                buf.as_ptr().cast(),
+                buf.len(),
+                &mut err,
+            )
+        };
+        if rc < 0 {
+            Err(format!("pa_simple_write failed (code {err})"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PulseSimple {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { (self.free_fn)(self.handle) };
+        }
+    }
+}
+
+/// Parses `(pid, comm, ppid)` from a `/proc/<pid>/stat` line.
+///
+/// The process name `comm` is enclosed in parentheses and may itself contain
+/// spaces or parentheses, so the end of `comm` is always the *last* `')'` on
+/// the line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_stat(content: &str) -> Option<(u32, String, u32)> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let pid: u32 = content[..open].trim().parse().ok()?;
+    let comm = content[open + 1..close].to_ascii_lowercase();
+    let rest = content[close + 1..].trim_start();
+    // Fields after ')': state (char), ppid (u32), ...
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    Some((pid, comm, ppid))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_discord_linux_name(name: &str) -> bool {
+    matches!(
+        name,
+        "discord" | "discordptb" | "discordcanary" | "vesktop"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn scan_linux_discord_processes() -> Result<(Option<u32>, std::collections::HashSet<u32>), String> {
+    let entries = std::fs::read_dir("/proc").map_err(|e| e.to_string())?;
+    let mut all_procs: Vec<(u32, String, u32)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) {
+            if let Some(parsed) = parse_proc_stat(&stat) {
+                all_procs.push(parsed);
+            }
+        }
+    }
+
+    let direct_discord: Vec<(u32, u32)> = all_procs
+        .iter()
+        .filter(|(_, comm, _)| is_discord_linux_name(comm))
+        .map(|&(pid, _, ppid)| (pid, ppid))
+        .collect();
+
+    let root = select_discord_root(&direct_discord);
+    let mut tree_pids: std::collections::HashSet<u32> =
+        direct_discord.iter().map(|&(pid, _)| pid).collect();
+    if let Some(root_pid) = root {
+        tree_pids.insert(root_pid);
+        // Include all descendants (e.g. Chromium utility/audio subprocesses)
+        let parent_map: std::collections::HashMap<u32, u32> =
+            all_procs.iter().map(|&(pid, _, ppid)| (pid, ppid)).collect();
+        for &(pid, _, _) in &all_procs {
+            let mut cur = pid;
+            let mut depth = 0;
+            while let Some(&parent) = parent_map.get(&cur) {
+                if tree_pids.contains(&parent) {
+                    tree_pids.insert(pid);
+                    break;
+                }
+                if parent == 0 || parent == cur || depth > 32 {
+                    break;
+                }
+                cur = parent;
+                depth += 1;
+            }
+        }
+    }
+    Ok((root, tree_pids))
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxCaptureBackend {
+    Pulse(PulseSimple),
+    PipeWireFiltered(std::process::Child),
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCaptureBackend {
+    fn open(
+        target_root: Option<u32>,
+        discord_tree: &std::collections::HashSet<u32>,
+        state: &AudioState,
+    ) -> Result<Self, String> {
+        if target_root.is_some() {
+            if let Ok(mut child) = std::process::Command::new("pw-cat")
+                .args([
+                    "--record",
+                    "--target",
+                    "0",
+                    "--raw",
+                    "--format",
+                    "f32",
+                    "--rate",
+                    "48000",
+                    "--channels",
+                    "2",
+                    "--latency",
+                    "20ms",
+                    "--properties",
+                    "node.name=argos-capture-exclude",
+                    "-",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                // Give PipeWire a moment to register the node, then link non-Discord streams
+                thread::sleep(Duration::from_millis(60));
+                if sync_pipewire_links(discord_tree).is_ok() {
+                    return Ok(Self::PipeWireFiltered(child));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                state.notice(
+                    "Discord exclusion unavailable on this audio server; sharing full system audio"
+                        .to_string(),
+                );
+            } else {
+                state.notice(
+                    "Discord exclusion unavailable (pw-cat missing); sharing full system audio"
+                        .to_string(),
+                );
+            }
+        }
+
+        let client = PulseSimple::open(PA_STREAM_RECORD, Some("@DEFAULT_MONITOR@"), "system-capture")
+            .or_else(|_| {
+                default_monitor_source_name()
+                    .and_then(|mon| PulseSimple::open(PA_STREAM_RECORD, Some(&mon), "system-capture"))
+            })
+            .or_else(|_| PulseSimple::open(PA_STREAM_RECORD, None, "system-capture"))?;
+        Ok(Self::Pulse(client))
+    }
+
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        match self {
+            Self::Pulse(pulse) => pulse.read(buf),
+            Self::PipeWireFiltered(child) => {
+                use std::io::Read;
+                let stdout = child
+                    .stdout
+                    .as_mut()
+                    .ok_or_else(|| "pw-cat stdout closed".to_string())?;
+                stdout.read_exact(buf).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxCaptureBackend {
+    fn drop(&mut self) {
+        if let Self::PipeWireFiltered(child) = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn default_monitor_source_name() -> Result<String, String> {
+    let output = std::process::Command::new("pactl")
+        .arg("get-default-sink")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sink.is_empty() {
+        Err("empty default sink".to_string())
+    } else {
+        Ok(format!("{sink}.monitor"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sync_pipewire_links(discord_pids: &std::collections::HashSet<u32>) -> Result<(), String> {
+    let output = std::process::Command::new("pw-dump")
+        .arg("Node")
+        .output()
+        .map_err(|e| format!("pw-dump failed: {e}"))?;
+    if !output.status.success() {
+        return Err("pw-dump exited with error".to_string());
+    }
+    let nodes: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("pw-dump json: {e}"))?;
+    let Some(array) = nodes.as_array() else {
+        return Err("pw-dump output is not an array".to_string());
+    };
+
+    for node in array {
+        let Some(props) = node.pointer("/info/props") else {
+            continue;
+        };
+        let media_class = props
+            .get("media.class")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if media_class != "Stream/Output/Audio" {
+            continue;
+        }
+        let Some(node_id) = node.get("id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let pid = props
+            .get("application.process.id")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+            .map(|v| v as u32);
+        let app_name = props
+            .get("application.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bin_name = props
+            .get("application.process.binary")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let is_discord = pid.is_some_and(|p| discord_pids.contains(&p))
+            || app_name.contains("discord")
+            || is_discord_linux_name(&bin_name);
+
+        for (src_ch, dst_ch) in [("output_FL", "input_FL"), ("output_FR", "input_FR")] {
+            let src_port = format!("{node_id}:{src_ch}");
+            let dst_port = format!("argos-capture-exclude:{dst_ch}");
+            if is_discord {
+                let _ = std::process::Command::new("pw-link")
+                    .args(["-d", &src_port, &dst_port])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            } else {
+                let _ = std::process::Command::new("pw-link")
+                    .args([&src_port, &dst_port])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_loop(
+    tx: SyncSender<Vec<f32>>,
+    stop: Arc<AtomicBool>,
+    state: Arc<AudioState>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    let _ = ready.send(Ok(()));
+
+    let mut backoff = RETRY_BACKOFF;
+    let mut generation = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match run_capture(&tx, &stop, &state, generation) {
+            Ok(()) => return,
+            Err(error) => {
+                state.fail(generation, error);
+                generation += 1;
+                state.metrics().restarts.incr();
+            }
+        }
+        if sleep_interrupted(backoff, &stop) {
+            return;
+        }
+        backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_capture(
+    tx: &SyncSender<Vec<f32>>,
+    stop: &AtomicBool,
+    state: &AudioState,
+    generation: u64,
+) -> Result<(), String> {
+    let frame_bytes = FRAME_SAMPLES * BLOCK_ALIGN;
+    let mut exclusion_target: Option<u32> = None;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let (target, mut discord_tree) = match scan_linux_discord_processes() {
+            Ok(pair) => pair,
+            Err(error) => {
+                state.notice(format!("Discord detection failed: {error}"));
+                (None, std::collections::HashSet::new())
+            }
+        };
+        if target != exclusion_target {
+            if let Some(pid) = target {
+                state.notice(format!(
+                    "Discord audio excluded from the stream (pid {pid})"
+                ));
+            } else {
+                state.notice("Discord not running: sharing full system audio".to_string());
+            }
+        }
+        exclusion_target = target;
+
+        let mut backend = LinuxCaptureBackend::open(target, &discord_tree, state)?;
+        state.alive.store(true, Ordering::Relaxed);
+        state.clear_error();
+
+        let mut raw_chunk = vec![0u8; frame_bytes];
+        let mut bytes: VecDeque<u8> = VecDeque::with_capacity(frame_bytes * 4);
+        let mut samples: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * CHANNELS);
+        let mut next_rescan = Instant::now() + EXCLUSION_RESCAN_INTERVAL;
+        let mut rebuild = false;
+
+        while !stop.load(Ordering::Relaxed) {
+            if Instant::now() >= next_rescan {
+                next_rescan = Instant::now() + EXCLUSION_RESCAN_INTERVAL;
+                match scan_linux_discord_processes() {
+                    Ok((current, tree)) if current != exclusion_target => {
+                        let _ = tree;
+                        rebuild = true;
+                        break;
+                    }
+                    Ok((_, tree)) => {
+                        discord_tree = tree;
+                        if matches!(backend, LinuxCaptureBackend::PipeWireFiltered(_)) {
+                            let _ = sync_pipewire_links(&discord_tree);
+                        }
+                    }
+                    Err(error) => {
+                        state.notice(format!("Discord detection failed: {error}"));
+                    }
+                }
+            }
+
+            let reading = Instant::now();
+            let read_res = backend.read_chunk(&mut raw_chunk);
+            state.metrics().device_io.record(reading.elapsed());
+            if let Err(error) = read_res {
+                state.fail(generation, format!("audio capture read failed: {error}"));
+                rebuild = true;
+                break;
+            }
+            bytes.extend(&raw_chunk);
+            loop {
+                let converting = Instant::now();
+                if !pop_frame(&mut bytes, &mut samples) {
+                    break;
+                }
+                state.metrics().convert.record(converting.elapsed());
+                let _ = tx.try_send(samples.clone());
+            }
+            state.metrics().periods.incr();
+        }
+
+        if !rebuild || stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn playback_loop(
+    rx: Receiver<Vec<f32>>,
+    stop: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    volume: Arc<std::sync::atomic::AtomicU32>,
+    state: Arc<AudioState>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    let _ = ready.send(Ok(()));
+
+    let mut backoff = RETRY_BACKOFF;
+    let mut generation = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match run_playback(&rx, &stop, &muted, &volume, &state, generation) {
+            Ok(()) => return,
+            Err(error) => {
+                state.fail(generation, error);
+                generation += 1;
+                state.metrics().restarts.incr();
+            }
+        }
+        if sleep_interrupted(backoff, &stop) {
+            return;
+        }
+        backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_playback(
+    rx: &Receiver<Vec<f32>>,
+    stop: &AtomicBool,
+    muted: &AtomicBool,
+    volume: &Arc<std::sync::atomic::AtomicU32>,
+    state: &AudioState,
+    generation: u64,
+) -> Result<(), String> {
+    let mut client = PulseSimple::open(PA_STREAM_PLAYBACK, None, "playback")?;
+    state.alive.store(true, Ordering::Relaxed);
+    state.clear_error();
+
+    let mut jitter = JitterBuffer::new(state.metrics_handle());
+    let mut out: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * CHANNELS);
+    let mut raw: Vec<u8> = Vec::with_capacity(FRAME_SAMPLES * BLOCK_ALIGN);
+
+    while !stop.load(Ordering::Relaxed) {
+        while let Ok(frame) = rx.try_recv() {
+            jitter.push(&frame);
+        }
+
+        let filling = Instant::now();
+        let _real = jitter.fill(&mut out, FRAME_SAMPLES * CHANNELS);
+        let gain = if muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            let v = volume.load(Ordering::Relaxed).clamp(0, 200) as f32;
+            v / 100.0
+        };
+        raw.clear();
+        for sample in &out {
+            raw.extend_from_slice(&(sample * gain).to_le_bytes());
+        }
+        state.metrics().convert.record(filling.elapsed());
+
+        let writing = Instant::now();
+        client.write(&raw).map_err(|error| {
+            state.fail(generation, format!("audio playback failed: {error}"));
+            error
+        })?;
+        state.metrics().device_io.record(writing.elapsed());
+        state.metrics().periods.incr();
+    }
+
     Ok(())
 }
 
@@ -1553,5 +2178,23 @@ mod tests {
         buffer.push(&constant(1.0));
         buffer.fill(&mut out, FRAME);
         assert_eq!(metrics.underruns.dropped(), 0);
+    }
+
+    #[test]
+    fn proc_stat_parser_extracts_pid_comm_with_spaces_or_parens_and_ppid() {
+        use super::{is_discord_linux_name, parse_proc_stat};
+        let normal = "4123 (Discord) S 1890 4123 4123 0 -1 4194560";
+        assert_eq!(
+            parse_proc_stat(normal),
+            Some((4123, "discord".to_string(), 1890))
+        );
+        assert!(is_discord_linux_name("discord"));
+        assert!(is_discord_linux_name("vesktop"));
+
+        let tricky = "9876 (Web Content (1)) R 4123 9876 9876 0 -1 0";
+        assert_eq!(
+            parse_proc_stat(tricky),
+            Some((9876, "web content (1)".to_string(), 4123))
+        );
     }
 }

@@ -558,19 +558,71 @@ fn random_id() -> String {
 
 fn find_vpn_address() -> Option<Ipv4Addr> {
     let interfaces = if_addrs::get_if_addrs().ok()?;
-    for interface in &interfaces {
-        if let if_addrs::IfAddr::V4(v4) = &interface.addr {
-            if interface.name.to_lowercase().contains("radmin") {
-                return Some(v4.ip);
-            }
+    let candidates: Vec<(String, Ipv4Addr)> = interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some((interface.name, v4.ip)),
+            _ => None,
+        })
+        .collect();
+    select_vpn_or_lan_address(&candidates)
+}
+
+fn select_vpn_or_lan_address(candidates: &[(String, Ipv4Addr)]) -> Option<Ipv4Addr> {
+    // 1. Radmin VPN (Windows default overlay)
+    for (name, ip) in candidates {
+        if name.to_ascii_lowercase().contains("radmin") || ip.octets()[0] == 26 {
+            return Some(*ip);
         }
     }
-    for interface in &interfaces {
-        if let if_addrs::IfAddr::V4(v4) = &interface.addr {
-            if v4.ip.octets()[0] == 26 {
-                return Some(v4.ip);
-            }
+    // 2. ZeroTier (zt* interfaces on Linux, or ZeroTier adapter on Windows)
+    for (name, ip) in candidates {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("zt") || lower.contains("zerotier") {
+            return Some(*ip);
         }
+    }
+    // 3. Tailscale / WireGuard / TUN / TAP overlays
+    for (name, ip) in candidates {
+        let lower = name.to_ascii_lowercase();
+        let is_cgnat = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
+        if lower.starts_with("tailscale")
+            || lower.starts_with("wg")
+            || lower.starts_with("tun")
+            || lower.starts_with("tap")
+            || is_cgnat
+        {
+            return Some(*ip);
+        }
+    }
+    // 4. Standard private LAN interface (excluding local container/VM bridges)
+    for (name, ip) in candidates {
+        let lower = name.to_ascii_lowercase();
+        let is_virtual_bridge = lower.starts_with("docker")
+            || lower.starts_with("br-")
+            || lower.starts_with("veth")
+            || lower.starts_with("virbr")
+            || lower.starts_with("wsl");
+        if !is_virtual_bridge && ip.is_private() {
+            return Some(*ip);
+        }
+    }
+    None
+}
+
+fn interface_broadcast(
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
+    broadcast: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    if ip.is_loopback() {
+        return None;
+    }
+    if let Some(bcast) = broadcast {
+        return Some(bcast);
+    }
+    if netmask != Ipv4Addr::BROADCAST && netmask != Ipv4Addr::UNSPECIFIED {
+        return Some(Ipv4Addr::from(u32::from(ip) | !u32::from(netmask)));
     }
     None
 }
@@ -580,7 +632,7 @@ fn broadcast_targets() -> Vec<SocketAddr> {
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for interface in interfaces {
             if let if_addrs::IfAddr::V4(v4) = interface.addr {
-                if let Some(broadcast) = v4.broadcast {
+                if let Some(broadcast) = interface_broadcast(v4.ip, v4.netmask, v4.broadcast) {
                     let addr = SocketAddr::from((broadcast, DISCOVERY_PORT));
                     if !targets.contains(&addr) {
                         targets.push(addr);
@@ -603,12 +655,12 @@ fn discovery_loop(
     id: String,
     signal_port: u16,
 ) {
-    let targets = broadcast_targets();
     let mut buffer = [0u8; 8192];
     let mut last_beacon = Instant::now() - BEACON_INTERVAL;
 
     while !stop.load(Ordering::Relaxed) {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
+            let targets = broadcast_targets();
             let detected = find_vpn_address();
             if let Ok(mut current) = local.lock() {
                 *current = detected;

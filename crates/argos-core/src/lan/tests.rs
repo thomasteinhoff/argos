@@ -7,7 +7,11 @@
 //! real [`dispatch`] over real serialised bytes rather than restating the
 //! mapping next to it.
 
-use super::{dispatch, CursorUpdate, Diagnostics, LanEvent, Message, RosterEntry};
+use super::{
+    dispatch, interface_broadcast, select_vpn_or_lan_address, CursorUpdate, Diagnostics, LanEvent,
+    Message, RosterEntry,
+};
+use std::net::Ipv4Addr;
 
 /// The id this process would answer to. Messages must be addressed to it.
 const US: &str = "0123456789abcdef";
@@ -361,4 +365,44 @@ fn a_non_finite_diagnostic_is_rejected_at_parse_time() {
 #[test]
 fn an_unknown_kind_is_ignored_rather_than_misread() {
     assert!(over_the_wire("something-newer").is_none());
+}
+
+#[test]
+fn zerotier_interface_takes_priority_over_local_ethernet_and_virtual_bridges() {
+    let candidates = vec![
+        ("docker0".to_string(), Ipv4Addr::new(172, 17, 0, 1)),
+        ("enp3s0".to_string(), Ipv4Addr::new(192, 168, 1, 20)),
+        ("ztcf123456".to_string(), Ipv4Addr::new(10, 147, 17, 5)),
+    ];
+    assert_eq!(
+        select_vpn_or_lan_address(&candidates),
+        Some(Ipv4Addr::new(10, 147, 17, 5))
+    );
+}
+
+#[test]
+fn private_lan_skips_container_bridges_when_no_vpn_is_active() {
+    let candidates = vec![
+        ("docker0".to_string(), Ipv4Addr::new(172, 17, 0, 1)),
+        ("virbr0".to_string(), Ipv4Addr::new(192, 168, 122, 1)),
+        ("wlan0".to_string(), Ipv4Addr::new(192, 168, 0, 42)),
+    ];
+    assert_eq!(
+        select_vpn_or_lan_address(&candidates),
+        Some(Ipv4Addr::new(192, 168, 0, 42))
+    );
+}
+
+#[test]
+fn directed_broadcast_is_computed_from_netmask_when_os_omits_it() {
+    let ip = Ipv4Addr::new(10, 147, 17, 5);
+    let mask = Ipv4Addr::new(255, 255, 255, 0);
+    assert_eq!(
+        interface_broadcast(ip, mask, None),
+        Some(Ipv4Addr::new(10, 147, 17, 255))
+    );
+    assert_eq!(
+        interface_broadcast(Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 0, 0, 0), None),
+        None
+    );
 }

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Argos
+Comment=Peer-to-peer screen and audio sharing over VPN or LAN
+Exec=argos-app
+Icon=argos
+Terminal=false
+Categories=Network;AudioVideo;
+StartupWMClass=Argos

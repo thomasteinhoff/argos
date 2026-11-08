@@ -25,19 +25,29 @@
 //! The input is the I420 planes the shared conversion already produced, so the
 //! RGBA->YUV work is not done twice — the hardware path only adds a repack.
 
+#[cfg(windows)]
 use std::collections::VecDeque;
+#[cfg(windows)]
 use std::ptr;
+#[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use windows::core::{IUnknown, Interface};
+#[cfg(windows)]
 use windows::Win32::Foundation::TRUE;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
+#[cfg(windows)]
 use windows::Win32::Media::MediaFoundation::*;
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
 };
@@ -47,17 +57,20 @@ use windows::Win32::System::Com::{
 /// One millisecond is a tenth of a frame at 60 fps, and the alternative — a
 /// blocking `GetEvent` — has no upper bound, which would turn a wedged driver
 /// into a share that has silently stopped sending.
+#[cfg(windows)]
 const POLL: Duration = Duration::from_millis(1);
 
 /// How long one frame may wait before the encoder is counted as stalled.
 ///
 /// A healthy hardware encoder takes 3-6 ms. 200 ms is already six frames late;
 /// anything past it is a broken encoder, not a slow one.
+#[cfg(windows)]
 const STALL: Duration = Duration::from_millis(200);
 
 /// Stalls tolerated before the hardware path gives up for good. A single late
 /// frame is a driver hiccup; three in a row is a pattern, and the software
 /// encoder is a known quantity.
+#[cfg(windows)]
 const MAX_STALLS: u32 = 3;
 
 /// The pixel formats an encoder MFT will accept, best first.
@@ -65,6 +78,7 @@ const MAX_STALLS: u32 = 3;
 /// NV12 is what every vendor implements. The planar ones are worth taking when
 /// they are offered, because the repack the hardware path needs is real work at
 /// 1080p (~0.5 ms) and skipping it is free.
+#[cfg(windows)]
 const INPUT_FORMATS: [(windows::core::GUID, &str); 4] = [
     (MFVideoFormat_NV12, "NV12"),
     (MFVideoFormat_I420, "I420"),
@@ -73,6 +87,7 @@ const INPUT_FORMATS: [(windows::core::GUID, &str); 4] = [
 ];
 
 /// A hardware H.264 encoder, ready to take I420 frames.
+#[cfg(windows)]
 pub struct HwEncoder {
     /// The vendor's own name, e.g. "Intel® Quick Sync Video H.264 Encoder".
     /// Goes on the pipeline readout so a report says which machine got what.
@@ -112,8 +127,10 @@ pub struct HwEncoder {
 // refcount behind the pointer is interlocked (thread-safe). After
 // `H264Encoder::attach_hardware` hands this to the encode worker, only that
 // one thread touches it; nothing here is shared or cloned across threads.
+#[cfg(windows)]
 unsafe impl Send for HwEncoder {}
 
+#[cfg(windows)]
 impl HwEncoder {
     /// Finds a hardware H.264 encoder and prepares it.
     ///
@@ -468,6 +485,7 @@ impl HwEncoder {
     }
 }
 
+#[cfg(windows)]
 impl Drop for HwEncoder {
     fn drop(&mut self) {
         // The transform holds the D3D device, and Media Foundation is
@@ -484,11 +502,37 @@ impl Drop for HwEncoder {
     }
 }
 
+#[cfg(not(windows))]
+pub struct HwEncoder;
+
+#[cfg(not(windows))]
+impl HwEncoder {
+    // shortcut: Media Foundation is Windows-only; Linux falls back to openh264 until VAAPI is needed
+    pub fn new(_fps: f32, _bitrate: u32) -> Result<Self, String> {
+        Err("hardware encoding is not available on Linux".to_string())
+    }
+
+    pub fn name(&self) -> &str {
+        ""
+    }
+
+    pub fn encode(
+        &mut self,
+        _yuv: &[u8],
+        _width: u32,
+        _height: u32,
+        _keyframe: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        Err("hardware encoding is not available on Linux".to_string())
+    }
+}
+
 /// Asks the platform for a hardware H.264 encoder.
 ///
 /// The output type filter is doing real work: `MFT_CATEGORY_VIDEO_ENCODER`
 /// also holds HEVC and AV1 encoders, and a stream in either would be one the
 /// far side's `openh264` decoder cannot open.
+#[cfg(windows)]
 fn pick_encoder() -> Result<IMFActivate, String> {
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -527,6 +571,7 @@ fn pick_encoder() -> Result<IMFActivate, String> {
 }
 
 /// The vendor's name for its encoder, or a generic one.
+#[cfg(windows)]
 fn friendly_name(activate: &IMFActivate) -> String {
     let mut text = windows::core::PWSTR::default();
     let mut length = 0u32;
@@ -542,6 +587,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
 }
 
 /// The input format the encoder accepts, from the ones Argos can produce.
+#[cfg(windows)]
 fn pick_input_format(
     transform: &IMFTransform,
     name: &str,
@@ -574,6 +620,7 @@ fn pick_input_format(
 /// Its own device rather than the capture's: the capture device is used by
 /// another thread, and an MFT that outlives a capture session must not take
 /// that device down with it.
+#[cfg(windows)]
 fn d3d_manager() -> Result<(ID3D11Device, IMFDXGIDeviceManager), String> {
     let mut device: Option<ID3D11Device> = None;
     unsafe {
@@ -608,6 +655,7 @@ fn d3d_manager() -> Result<(ID3D11Device, IMFDXGIDeviceManager), String> {
 /// Writes an attribute holding two UINT32s, which is how Media Foundation
 /// stores a frame size or a frame rate. The typed setters for these are not
 /// part of the generated bindings, and a blob is the same thing on the wire.
+#[cfg(windows)]
 fn set_pair(
     attributes: &IMFMediaType,
     key: *const windows::core::GUID,
@@ -620,6 +668,7 @@ fn set_pair(
     unsafe { attributes.SetBlob(key, &bytes) }
 }
 
+#[cfg(windows)]
 fn frame_duration(fps: f32) -> i64 {
     let frames = fps.round().max(1.0) as i64;
     10_000_000 / frames
@@ -631,6 +680,7 @@ fn frame_duration(fps: f32) -> i64 {
 /// NV12 is the usual answer and is a repack rather than a conversion: the Y
 /// plane is copied whole and the two chroma planes are interleaved. YV12 is
 /// I420 with U and V exchanged, which is a swap of two same-sized halves.
+#[cfg(windows)]
 pub fn pack_input(
     yuv: &[u8],
     width: usize,
@@ -708,11 +758,13 @@ pub fn to_annex_b(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Whether an output sample is a sync point, which is what a key frame request
 /// was asking for.
+#[cfg(windows)]
 fn sample_is_clean(sample: &IMFSample) -> bool {
     unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.is_ok_and(|value| value != 0)
 }
 
 /// Copies an encoded sample out of the transform.
+#[cfg(windows)]
 fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>, String> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|error| format!("could not read the encoded frame: {error}"))?;
@@ -733,11 +785,15 @@ fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_input, to_annex_b, HwEncoder};
+    #[cfg(windows)]
+    use super::pack_input;
+    use super::{to_annex_b, HwEncoder};
+    #[cfg(windows)]
     use windows::Win32::Media::MediaFoundation::{MFVideoFormat_I420, MFVideoFormat_NV12};
 
     /// The NV12 repack is a layout change and nothing else: Y untouched,
     /// chroma interleaved. Any arithmetic in here would be a bug.
+    #[cfg(windows)]
     #[test]
     fn nv12_repack_interleaves_chroma_and_keeps_luma() {
         let width = 4;
@@ -762,6 +818,7 @@ mod tests {
     }
 
     /// I420 is already the layout the conversion produces, so it is a copy.
+    #[cfg(windows)]
     #[test]
     fn planar_input_is_copied_unchanged() {
         let yuv: Vec<u8> = (0..96u8).collect();
@@ -772,6 +829,7 @@ mod tests {
 
     /// A frame that does not match its planes must fail loudly rather than
     /// read past the end.
+    #[cfg(windows)]
     #[test]
     fn planar_input_rejects_a_buffer_of_the_wrong_size() {
         let yuv = vec![0u8; 10];

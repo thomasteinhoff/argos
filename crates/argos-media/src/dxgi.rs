@@ -14,15 +14,13 @@
 //!   recorder never waits on the consumer; a consumer that is behind simply
 //!   loses frames, which the controller can then react to.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // use argos_core::lan::CursorUpdate; // kept for type compatibility in Control
 
-use argos_core::metrics::SenderMetrics;
 use windows::core::{Interface, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -42,7 +40,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
-use crate::capture::{Frame, MonitorInfo};
+use crate::capture::{due_at, Control, Frame, MonitorInfo};
 
 /// How long a single `AcquireNextFrame` may wait for a frame to appear. Capping
 /// it keeps the idle poll cheap and the stop/shutdown latency bounded; a
@@ -55,17 +53,6 @@ const INACTIVE_SLEEP: Duration = Duration::from_millis(20);
 /// same device for the lifetime of the duplication.
 pub struct Recorder {
     join: Option<JoinHandle<bool>>,
-}
-
-/// Session-owned state the recorder shares: teardown, pause, target cadence and
-/// the metrics sink. Bundled so creating a recorder stays a three-argument call.
-pub struct Control {
-    pub stop: Arc<AtomicBool>,
-    pub active: Arc<AtomicBool>,
-    pub interval: Arc<AtomicU64>,
-    pub metrics: Arc<SenderMetrics>,
-    /// Cursor state published for forwarding to viewers (share side only).
-    pub cursor: Arc<std::sync::Mutex<Option<argos_core::lan::CursorUpdate>>>,
 }
 
 impl Recorder {
@@ -231,35 +218,6 @@ fn run(
             }
         }
     }
-}
-
-/// Reports whether a frame is due on a fixed cadence grid, advancing the grid.
-///
-/// `next_due` moves by exactly one interval per frame sent, never by the moment
-/// the frame actually went out, and the deadline is judged against the instant
-/// the picture became available. That makes the grid immune to the two things
-/// measured pinning a stream below its configured rate:
-///
-/// * Its own work. Charging the clock after the readback added the readback to
-///   every interval, so a target equal to the display's interval refused every
-///   second present and streamed a 60 Hz desktop at a flat 30 fps.
-/// * The desktop's present grid, which rarely divides the target. At 30 fps on a
-///   ~110 Hz display the gate can only send 3 or 4 presents apart: measured from
-///   the last send that is 27 fps, while carrying the remainder on an
-///   accumulating deadline averages the target exactly.
-///
-/// A grid left more than one interval behind — a stall, a display mode switch, a
-/// session that just resumed — resyncs to `now` rather than replaying its
-/// backlog, so a catch-up burst cannot happen.
-fn due_at(next_due: &mut Instant, now: Instant, target: Duration) -> bool {
-    if now < *next_due {
-        return false;
-    }
-    *next_due += target;
-    if now.saturating_duration_since(*next_due) > target {
-        *next_due = now + target;
-    }
-    true
 }
 
 fn readback(
@@ -496,65 +454,5 @@ fn create_duplication(monitor: HMONITOR) -> Result<Duplication, String> {
                 .map_err(|error| format!("DuplicateOutput: {error}"))?;
             return Ok((device, context, duplication));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::due_at;
-    use std::time::{Duration, Instant};
-
-    /// 110 Hz presents against a 30 fps target: the grid can only land on
-    /// presents, so frames must go out 3 or 4 of them apart and still average 30.
-    #[test]
-    fn a_fixed_grid_averages_the_target_on_a_display_that_does_not_divide_it() {
-        let start = Instant::now();
-        let target = Duration::from_micros(1_000_000 / 30);
-        let present = Duration::from_micros(1_000_000 / 110);
-        let mut next_due = start;
-        let mut sent = 0u32;
-        for step in 0..=2200 {
-            if due_at(&mut next_due, start + present * step, target) {
-                sent += 1;
-            }
-        }
-        // 20 s of presents. Measuring each interval from the last send gave 27 fps.
-        assert!((598..=602).contains(&sent), "sent {sent} in 20 s");
-    }
-
-    /// An early present is refused, and the refusal does not drag the grid
-    /// forward: a frame arriving late is charged to its own slot instead of
-    /// adding its lateness to every interval that follows.
-    #[test]
-    fn an_early_present_does_not_drift_the_grid() {
-        let start = Instant::now();
-        let target = Duration::from_micros(16_666);
-        let mut next_due = start;
-        assert!(due_at(&mut next_due, start, target));
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        assert!(!due_at(&mut next_due, at(9), target));
-        assert!(due_at(&mut next_due, at(19), target));
-        assert!(!due_at(&mut next_due, at(28), target));
-        assert!(due_at(&mut next_due, at(38), target));
-        assert!(!due_at(&mut next_due, at(45), target));
-        assert!(due_at(&mut next_due, at(55), target));
-    }
-
-    /// After a stall the grid is a whole interval or more behind. It resyncs
-    /// instead of replaying, so recovery sends one frame rather than sixty.
-    #[test]
-    fn a_stalled_grid_resyncs_instead_of_bursting() {
-        let start = Instant::now();
-        let target = Duration::from_micros(16_666);
-        let mut next_due = start;
-        assert!(due_at(&mut next_due, start, target));
-        let resumed = start + Duration::from_secs(1);
-        assert!(due_at(&mut next_due, resumed, target));
-        assert!(!due_at(
-            &mut next_due,
-            resumed + Duration::from_millis(1),
-            target
-        ));
-        assert!(due_at(&mut next_due, resumed + target, target));
     }
 }

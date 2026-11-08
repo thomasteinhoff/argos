@@ -4,24 +4,36 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Screen capture goes through our own Desktop Duplication implementation. The
-# previous `xcap`-based backend was kept alongside it for a one-release A-B
-# comparison; it never gained a test and was never built by a documented command,
-# so it is gone rather than being a fallback nobody had exercised.
+# Screen capture goes through our own Desktop Duplication implementation on
+# Windows and XDG Portal / X11 on Linux.
 default = ["capture-native"]
-capture-native = [
-    "windows/Win32_Graphics_Direct3D",
-    "windows/Win32_Graphics_Direct3D11",
-    "windows/Win32_Graphics_Dxgi",
-    "windows/Win32_Graphics_Dxgi_Common",
-    "windows/Win32_Graphics_Gdi",
-    "windows/Win32_UI_WindowsAndMessaging",
-]
+capture-native = []
 
 [dependencies]
 argos-core = { path = "../argos-core" }
 openh264 = "0.9.8"
-wasapi = "0.24.0"
 opus-rs = "0.1.33"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.24.0"
 # Same crate version already pulled in by wasapi; only the process-enumeration feature is added.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+libloading = "0.8"
+serde.workspace = true
+serde_json = "1"
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
+zbus = "5"

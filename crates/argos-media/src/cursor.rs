@@ -14,17 +14,23 @@
 //! arrow, I-beam, resize grips) have no color bitmap; their mask is twice as
 //! tall, an XOR plane above an AND plane, spelled out in [`decode_mono`].
 
+#[cfg(windows)]
 use argos_core::lan::CursorUpdate;
+#[cfg(windows)]
 use windows::Win32::Foundation::RECT;
+#[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorInfo, CURSORINFO, CURSOR_SHOWING, HCURSOR, ICONINFO,
 };
 
+#[cfg(windows)]
 #[derive(Clone)]
 struct RasterShape {
     width: u16,
@@ -34,6 +40,7 @@ struct RasterShape {
     rgba: Vec<u8>,
 }
 
+#[cfg(windows)]
 #[derive(Default)]
 pub struct CursorShadow {
     fingerprint: isize,
@@ -42,6 +49,7 @@ pub struct CursorShadow {
     last: Option<CursorUpdate>,
 }
 
+#[cfg(windows)]
 impl CursorShadow {
     pub fn new() -> Self {
         Self::default()
@@ -118,6 +126,7 @@ impl CursorShadow {
 }
 
 /// Rasterizes an icon handle into its RGBA pixels and hotspot.
+#[cfg(windows)]
 fn raster_shape(cursor: HCURSOR) -> Option<RasterShape> {
     unsafe {
         let mut icon = ICONINFO::default();
@@ -153,6 +162,7 @@ fn raster_shape(cursor: HCURSOR) -> Option<RasterShape> {
     }
 }
 
+#[cfg(windows)]
 fn bitmap_info(bitmap: HBITMAP) -> Option<BITMAP> {
     let mut info = std::mem::MaybeUninit::<BITMAP>::zeroed();
     let copied = unsafe {
@@ -170,6 +180,7 @@ fn bitmap_info(bitmap: HBITMAP) -> Option<BITMAP> {
 
 /// Reads a color cursor's pixels (BGRA from the color bitmap, transparency
 /// from the AND plane) as RGBA.
+#[cfg(windows)]
 fn read_color(
     hbm_color: HBITMAP,
     color: &BITMAP,
@@ -189,6 +200,7 @@ fn read_color(
 }
 
 /// Reads a monochrome cursor's mask (top half XOR, bottom half AND) as RGBA.
+#[cfg(windows)]
 fn mono_from_mask(hbm_mask: HBITMAP, mask: &BITMAP, width: u32) -> Option<(Vec<u8>, u32)> {
     let height = (mask.bmHeight as u32) / 2;
     if height == 0 {
@@ -204,6 +216,7 @@ fn mono_from_mask(hbm_mask: HBITMAP, mask: &BITMAP, width: u32) -> Option<(Vec<u
 
 /// Reads `height` top-down rows of a `bit_count` bits-per-pixel bitmap into
 /// `out` (DWORD-padded rows, exactly as [`GetDIBits`] lays them out).
+#[cfg(windows)]
 fn read_bits(hbm: HBITMAP, bit_count: u16, width: u32, height: u32, out: &mut [u8]) -> Option<()> {
     unsafe {
         let hdc = GetDC(None);
@@ -240,11 +253,13 @@ fn read_bits(hbm: HBITMAP, bit_count: u16, width: u32, height: u32, out: &mut [u
 }
 
 /// Bytes in one DWORD-aligned row of a 1-bit-per-pixel plane.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn plane_bytes(width: u32, rows: u32) -> usize {
     (width.div_ceil(32) * 4) as usize * rows as usize
 }
 
 /// Whether the 1bpp bit at `(x, y)` is set in a top-down, DWORD-padded plane.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn plane_bit(plane: &[u8], width: u32, x: u32, y: u32) -> bool {
     let stride = width.div_ceil(32) * 4;
     let byte = plane[(y * stride + x / 8) as usize];
@@ -257,6 +272,7 @@ fn plane_bit(plane: &[u8], width: u32, x: u32, y: u32) -> bool {
 /// This is the two-tone decode most screen-sharing tools ship. True XOR
 /// semantics would invert against whatever the viewer draws underneath,
 /// which a fixed stream cannot know.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn decode_mono(xor: &[u8], and: &[u8], width: u32, height: u32, out: &mut [u8]) {
     for y in 0..height {
         for x in 0..width {
@@ -273,6 +289,7 @@ fn decode_mono(xor: &[u8], and: &[u8], width: u32, height: u32, out: &mut [u8]) 
 }
 
 /// Color cursor pixels: BGRA source with the AND plane as the alpha channel.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn blend_color(bgra: &[u8], and: &[u8], width: u32, height: u32, out: &mut [u8]) {
     for y in 0..height {
         for x in 0..width {

@@ -242,10 +242,16 @@ name = "argos-media"
 version = "1.4.2"
 dependencies = [
  "argos-core",
+ "libc",
+ "libloading",
  "openh264",
  "opus-rs",
+ "serde",
+ "serde_json",
  "wasapi",
  "windows 0.62.2",
+ "x11rb",
+ "zbus",
 ]
 
 [[package]]

@@ -1,6 +1,24 @@
-# Building Argos (Windows)
+# Building Argos (Windows & Linux)
 
-Argos is Windows-only. A few dependencies need native tools at build time, so a
+## Linux
+
+Run the automated installer to install runtime packages (`pipewire`, `pipewire-gstreamer`, `xdg-desktop-portal`, `libpulse`), build the release binary, and install the desktop entry:
+
+```bash
+./scripts/install-linux.sh
+```
+
+Or build directly with Cargo (requires `gcc` / `g++` for `openh264`):
+
+```bash
+cargo build --release -p argos-app
+```
+
+---
+
+## Windows
+
+A few dependencies need native tools at build time, so a
 C compiler, a linker, and the Windows SDK's `rc.exe` are needed — but nothing
 else:
 

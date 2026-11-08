@@ -1387,7 +1387,9 @@ pub struct ArgosApp {
     pending_view: Option<PendingView>,
     /// When the sharer last swept its viewer slots for finished connections.
     last_viewer_sweep: Instant,
+    #[cfg_attr(not(windows), allow(dead_code))]
     radmin_exe: Option<std::path::PathBuf>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     radmin_error: Option<String>,
 }
 
@@ -2961,21 +2963,33 @@ impl ArgosApp {
                 ui.label(RichText::new(format!("This PC on your network: {ip}")).weak());
             }
             None => {
-                ui.label(
-                    RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
-                        .color(theme::WARN),
-                );
-                if self.radmin_exe.is_some() {
-                    if ui.button("Launch Radmin VPN").clicked() {
-                        self.launch_radmin();
-                    }
-                } else {
+                #[cfg(windows)]
+                {
                     ui.label(
-                        RichText::new("Install Radmin VPN to share with friends online.").weak(),
+                        RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
+                            .color(theme::WARN),
                     );
+                    if self.radmin_exe.is_some() {
+                        if ui.button("Launch Radmin VPN").clicked() {
+                            self.launch_radmin();
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Install Radmin VPN to share with friends online.").weak(),
+                        );
+                    }
+                    if let Some(error) = &self.radmin_error {
+                        ui.label(RichText::new(error).color(theme::ERR));
+                    }
                 }
-                if let Some(error) = &self.radmin_error {
-                    ui.label(RichText::new(error).color(theme::ERR));
+                #[cfg(not(windows))]
+                {
+                    ui.label(
+                        RichText::new(
+                            "VPN / LAN not detected — connect to ZeroTier or your local network.",
+                        )
+                        .color(theme::WARN),
+                    );
                 }
             }
         }
@@ -2984,6 +2998,7 @@ impl ArgosApp {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn launch_radmin(&mut self) {
         match crate::radmin::launch() {
             Ok(()) => self.radmin_error = None,

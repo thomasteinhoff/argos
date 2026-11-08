@@ -5,18 +5,18 @@ the same network sees them appear in the list and clicks their name to watch.
 No accounts, no servers, no cloud — the two machines talk to each other
 directly.
 
-Windows only, and deliberately so: capture goes through the Desktop Duplication
-API, which is Windows-specific and has no equivalent elsewhere.
+Runs on Windows and Linux. Capture uses the Desktop Duplication API on Windows
+and PipeWire through the desktop portal (Wayland or X11) on Linux.
 
 ## Requirements
 
-- Windows, practically 10 or later. Capture uses the Desktop Duplication API,
-  which has existed since Windows 8, but nothing older has been tried.
+- Windows 10 or later, or Linux with PipeWire and xdg-desktop-portal.
 - A network both machines already share. The intended one is a private VPN
   overlay, which gives each machine a stable private IP and hides the peers from
   everyone else — see [Security](#security) for why that matters.
 - A build toolchain, if you're building from source rather than taking a
-  prebuilt binary. See [BUILDING.md](BUILDING.md).
+  prebuilt binary: `cargo build --release -p argos-app`. Linux users can run
+  `./scripts/install-linux.sh` instead.
 
 Argos can launch your VPN tool for you from the sidebar if it is installed.
 
@@ -78,7 +78,7 @@ Three crates, roughly in dependency order:
 | Crate | What lives there |
 | --- | --- |
 | `argos-core` | Peer connections, the H.264/Opus RTP packetizer, link-quality maths, and the LAN signalling channel |
-| `argos-media` | Everything touching Windows: Desktop Duplication capture, OpenH264 encoding, WASAPI audio capture and playback |
+| `argos-media` | Capture, encoding and audio: Desktop Duplication and WASAPI on Windows, PipeWire on Linux, plus OpenH264 encoding |
 | `argos-app` | The interface |
 
 Two channels run between the machines:
@@ -148,7 +148,7 @@ test that existed used a 6-byte NAL that never fragments.
 
 ## Known limitations
 
-- Windows only. Not portable, not intended to be.
+- Linux support targets Wayland/X11 with PipeWire; other setups are untested.
 - H.264 is fixed at baseline profile (`42e01f`). Both peers hardcode it, so they
   must be the same build.
 - No chat, no file transfer, no input forwarding. It is a screen and the sound
